@@ -1,0 +1,31 @@
+[package]
+name = "polymarket-copy-bot"
+version = "0.1.0"
+edition = "2024"
+description = "Low-latency single-wallet copy trading bot for Polymarket."
+license = "MIT"
+
+[dependencies]
+alloy = { version = "1.7.3", default-features = false, features = ["std", "essentials", "reqwest-rustls-tls", "signer-local"] }
+anyhow = "1.0.100"
+arc-swap = "1.7.1"
+async-trait = "0.1.89"
+axum = { version = "0.8.6", features = ["json"] }
+chrono = { version = "0.4.42", features = ["serde"] }
+crossbeam-queue = "0.3.12"
+dotenvy = "0.15.7"
+futures-util = "0.3.31"
+polymarket-client-sdk = { version = "0.4.3", default-features = false, features = ["clob"] }
+reqwest = { version = "0.12.23", default-features = false, features = ["brotli", "charset", "deflate", "gzip", "http2", "json", "rustls-tls"] }
+rustls = { version = "0.23.37", features = ["ring"] }
+rust_decimal = { version = "1.39.0", features = ["serde", "serde-with-float"] }
+rust_decimal_macros = "1.39.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tokio = { version = "1.48.0", features = ["full"] }
+tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "json"] }
+
+[dev-dependencies]
+tempfile = "3.23.0"

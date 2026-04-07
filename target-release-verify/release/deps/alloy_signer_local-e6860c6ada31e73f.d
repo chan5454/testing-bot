@@ -1,0 +1,10 @@
+D:\RandomProjects\CopyTradeBotV2\target-release-verify\release\deps\alloy_signer_local-e6860c6ada31e73f.d: C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\alloy-signer-local-1.7.3\src\lib.rs C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\alloy-signer-local-1.7.3\src\error.rs C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\alloy-signer-local-1.7.3\src\private_key.rs C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\alloy-signer-local-1.7.3\src\../README.md
+
+D:\RandomProjects\CopyTradeBotV2\target-release-verify\release\deps\liballoy_signer_local-e6860c6ada31e73f.rlib: C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\alloy-signer-local-1.7.3\src\lib.rs C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\alloy-signer-local-1.7.3\src\error.rs C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\alloy-signer-local-1.7.3\src\private_key.rs C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\alloy-signer-local-1.7.3\src\../README.md
+
+D:\RandomProjects\CopyTradeBotV2\target-release-verify\release\deps\liballoy_signer_local-e6860c6ada31e73f.rmeta: C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\alloy-signer-local-1.7.3\src\lib.rs C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\alloy-signer-local-1.7.3\src\error.rs C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\alloy-signer-local-1.7.3\src\private_key.rs C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\alloy-signer-local-1.7.3\src\../README.md
+
+C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\alloy-signer-local-1.7.3\src\lib.rs:
+C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\alloy-signer-local-1.7.3\src\error.rs:
+C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\alloy-signer-local-1.7.3\src\private_key.rs:
+C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\alloy-signer-local-1.7.3\src\../README.md:

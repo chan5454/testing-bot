@@ -1,0 +1,14 @@
+D:\RandomProjects\CopyTradeBotV2\target-release-verify\release\deps\serde-67442d375cbbeb71.d: C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs D:\RandomProjects\CopyTradeBotV2\target-release-verify\release\build\serde-bd32b9b4b3cb18a5\out/private.rs
+
+D:\RandomProjects\CopyTradeBotV2\target-release-verify\release\deps\libserde-67442d375cbbeb71.rlib: C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs D:\RandomProjects\CopyTradeBotV2\target-release-verify\release\build\serde-bd32b9b4b3cb18a5\out/private.rs
+
+D:\RandomProjects\CopyTradeBotV2\target-release-verify\release\deps\libserde-67442d375cbbeb71.rmeta: C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs D:\RandomProjects\CopyTradeBotV2\target-release-verify\release\build\serde-bd32b9b4b3cb18a5\out/private.rs
+
+C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs:
+C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs:
+C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs:
+C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs:
+C:\Users\Chan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs:
+D:\RandomProjects\CopyTradeBotV2\target-release-verify\release\build\serde-bd32b9b4b3cb18a5\out/private.rs:
+
+# env-dep:OUT_DIR=D:\\RandomProjects\\CopyTradeBotV2\\target-release-verify\\release\\build\\serde-bd32b9b4b3cb18a5\\out

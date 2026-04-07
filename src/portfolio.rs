@@ -1,0 +1,1209 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, TimeZone, Utc};
+use reqwest::Client;
+use rust_decimal::Decimal;
+use serde_json::Value;
+use tokio::sync::RwLock;
+use tracing::warn;
+
+use crate::config::{ExecutionMode, Settings};
+use crate::execution::{ExecutionSide, ExecutionStatus, ExecutionSuccess};
+use crate::models::{
+    ActivityEntry, PortfolioPosition, PortfolioSnapshot, PositionEntry, PositionKey, PositionState,
+};
+use crate::orderbook::orderbook_state::{MarketSnapshot, OrderBookState};
+
+#[derive(Clone)]
+pub struct PortfolioService {
+    mode: ExecutionMode,
+    client: Client,
+    data_api: String,
+    profile_address: Option<String>,
+    snapshot_path: PathBuf,
+    cache: Arc<RwLock<Option<PortfolioSnapshot>>>,
+    start_capital_usd: Decimal,
+    paper_orderbooks: Option<Arc<OrderBookState>>,
+    max_position_age_hours: u64,
+}
+
+impl PortfolioService {
+    pub fn new(settings: Settings, paper_orderbooks: Option<Arc<OrderBookState>>) -> Self {
+        let client = Client::builder()
+            .connect_timeout(settings.http_timeout / 2)
+            .timeout(settings.http_timeout)
+            .pool_max_idle_per_host(4)
+            .pool_idle_timeout(Duration::from_secs(30))
+            .tcp_keepalive(Duration::from_secs(30))
+            .http2_adaptive_window(true)
+            .user_agent("polymarket-copy-bot/0.1.0")
+            .build()
+            .expect("reqwest client");
+
+        Self {
+            mode: settings.execution_mode,
+            client,
+            data_api: settings.polymarket_data_api,
+            profile_address: settings.polymarket_profile_address,
+            snapshot_path: settings.data_dir.join("portfolio-summary.json"),
+            cache: Arc::new(RwLock::new(None)),
+            start_capital_usd: settings.start_capital_usd,
+            paper_orderbooks,
+            max_position_age_hours: settings.max_position_age_hours,
+        }
+    }
+
+    pub async fn snapshot(&self) -> Option<PortfolioSnapshot> {
+        self.cache.read().await.clone()
+    }
+
+    pub async fn refresh_snapshot(&self) -> Result<PortfolioSnapshot> {
+        self.refresh_snapshot_with_layout_hint(None).await
+    }
+
+    pub async fn refresh_snapshot_with_layout_hint(
+        &self,
+        layout_hint: Option<&PortfolioSnapshot>,
+    ) -> Result<PortfolioSnapshot> {
+        let mut snapshot = match self.mode {
+            ExecutionMode::Live => {
+                let mut fetched = self.fetch_live_positions().await?;
+                let layout = match layout_hint {
+                    Some(layout) => Some(layout.clone()),
+                    None => self.load_wallet_layout_snapshot().await?,
+                };
+                if let Some(layout) = layout.as_ref() {
+                    rehydrate_live_wallet_positions(&mut fetched, layout);
+                    restore_live_accounting_from_layout(&mut fetched, layout);
+                    if layout_hint.is_some()
+                        && preserve_projected_layout_if_live_refresh_stale(&mut fetched, layout)
+                    {
+                        warn!(
+                            "live portfolio refresh returned stale tracked-position sizes; preserving projected layout"
+                        );
+                    }
+                }
+                fetched
+            }
+            ExecutionMode::Paper => self.load_or_initialize_paper_snapshot().await?,
+        };
+        self.revalue_snapshot(&mut snapshot).await;
+        snapshot.cleanup_stale_positions(self.max_position_age_hours);
+        *self.cache.write().await = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    pub async fn refresh_and_persist(&self) -> Result<PortfolioSnapshot> {
+        self.refresh_and_persist_with_layout_hint(None).await
+    }
+
+    pub async fn refresh_and_persist_with_layout_hint(
+        &self,
+        layout_hint: Option<&PortfolioSnapshot>,
+    ) -> Result<PortfolioSnapshot> {
+        let snapshot = self.refresh_snapshot_with_layout_hint(layout_hint).await?;
+        self.store_snapshot(snapshot.clone()).await?;
+        Ok(snapshot)
+    }
+
+    pub async fn store_snapshot(
+        &self,
+        mut snapshot: PortfolioSnapshot,
+    ) -> Result<PortfolioSnapshot> {
+        normalize_snapshot(&mut snapshot);
+        snapshot.cleanup_stale_positions(self.max_position_age_hours);
+        *self.cache.write().await = Some(snapshot.clone());
+        self.persist_snapshot(&snapshot).await?;
+        Ok(snapshot)
+    }
+
+    pub fn project_fill_on_snapshot(
+        &self,
+        snapshot: &PortfolioSnapshot,
+        source: &ActivityEntry,
+        result: &ExecutionSuccess,
+    ) -> Result<PortfolioSnapshot> {
+        let mut projected = snapshot.clone();
+        apply_position_fill(&mut projected, source, result, false)?;
+        projected.cleanup_stale_positions(self.max_position_age_hours);
+        Ok(projected)
+    }
+
+    pub async fn apply_paper_fill(
+        &self,
+        source: &ActivityEntry,
+        result: &ExecutionSuccess,
+    ) -> Result<PortfolioSnapshot> {
+        if self.mode != ExecutionMode::Paper {
+            return Err(anyhow!("paper fill requested while running in live mode"));
+        }
+
+        let mut snapshot = match self.snapshot().await {
+            Some(snapshot) => snapshot,
+            None => self.load_or_initialize_paper_snapshot().await?,
+        };
+        apply_paper_trade(&mut snapshot, source, result)?;
+        self.revalue_snapshot(&mut snapshot).await;
+        snapshot.cleanup_stale_positions(self.max_position_age_hours);
+        *self.cache.write().await = Some(snapshot.clone());
+        self.persist_snapshot(&snapshot).await?;
+        Ok(snapshot)
+    }
+
+    async fn fetch_live_positions(&self) -> Result<PortfolioSnapshot> {
+        let profile_address = self
+            .profile_address
+            .as_deref()
+            .ok_or_else(|| anyhow!("POLYMARKET_PROFILE_ADDRESS is required in live mode"))?;
+        let value_response = self
+            .client
+            .get(format!("{}/value", self.data_api))
+            .query(&[("user", profile_address)])
+            .send()
+            .await
+            .context("requesting value endpoint")?
+            .error_for_status()
+            .context("value endpoint returned error")?
+            .json::<Value>()
+            .await
+            .context("decoding value response")?;
+
+        let total_value = match value_response {
+            Value::Array(items) => items
+                .first()
+                .and_then(|entry| entry.get("value"))
+                .and_then(|field| field.as_f64())
+                .and_then(Decimal::from_f64_retain)
+                .unwrap_or(Decimal::ZERO),
+            Value::Object(object) => object
+                .get("value")
+                .and_then(|field| field.as_f64())
+                .and_then(Decimal::from_f64_retain)
+                .unwrap_or(Decimal::ZERO),
+            _ => Decimal::ZERO,
+        };
+
+        let positions = self
+            .client
+            .get(format!("{}/positions", self.data_api))
+            .query(&[
+                ("user", profile_address),
+                ("limit", "500"),
+                ("sortBy", "CURRENT"),
+                ("sortDirection", "DESC"),
+                ("sizeThreshold", "0"),
+            ])
+            .send()
+            .await
+            .context("requesting positions endpoint")?
+            .error_for_status()
+            .context("positions endpoint returned error")?
+            .json::<Vec<PositionEntry>>()
+            .await
+            .context("decoding positions response")?;
+
+        let mut exposure = Decimal::ZERO;
+        let mut normalized = Vec::with_capacity(positions.len());
+        for position in positions {
+            let current_value = position.current_value_decimal()?;
+            let size = position.size_decimal()?;
+            exposure += current_value;
+            let current_price = decimal_price_from_value(size, current_value);
+            normalized.push(PortfolioPosition {
+                asset: position.asset,
+                condition_id: position.condition_id,
+                title: position.title,
+                outcome: position.outcome,
+                source_wallet: String::new(),
+                state: PositionState::Open,
+                size,
+                current_value,
+                average_entry_price: current_price,
+                current_price,
+                cost_basis: current_value,
+                unrealized_pnl: Decimal::ZERO,
+                opened_at: None,
+                source_trade_timestamp_unix: 0,
+                closing_started_at: None,
+            });
+        }
+
+        Ok(PortfolioSnapshot {
+            fetched_at: Utc::now(),
+            total_value,
+            total_exposure: exposure,
+            cash_balance: (total_value - exposure).max(Decimal::ZERO),
+            realized_pnl: Decimal::ZERO,
+            unrealized_pnl: Decimal::ZERO,
+            positions: normalized,
+        })
+    }
+
+    async fn load_or_initialize_paper_snapshot(&self) -> Result<PortfolioSnapshot> {
+        match tokio::fs::read_to_string(&self.snapshot_path).await {
+            Ok(contents) => serde_json::from_str::<PortfolioSnapshot>(&contents)
+                .with_context(|| format!("parsing {}", self.snapshot_path.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(initial_paper_snapshot(self.start_capital_usd))
+            }
+            Err(error) => {
+                Err(error).with_context(|| format!("reading {}", self.snapshot_path.display()))
+            }
+        }
+    }
+
+    pub async fn persist_snapshot(&self, snapshot: &PortfolioSnapshot) -> Result<()> {
+        if let Some(parent) = self.snapshot_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let body = serde_json::to_string_pretty(snapshot)?;
+        tokio::fs::write(&self.snapshot_path, body)
+            .await
+            .with_context(|| format!("writing {}", self.snapshot_path.display()))?;
+        Ok(())
+    }
+
+    async fn load_wallet_layout_snapshot(&self) -> Result<Option<PortfolioSnapshot>> {
+        if let Some(snapshot) = self.snapshot().await {
+            return Ok(Some(snapshot));
+        }
+
+        match tokio::fs::read_to_string(&self.snapshot_path).await {
+            Ok(contents) => serde_json::from_str::<PortfolioSnapshot>(&contents)
+                .map(Some)
+                .with_context(|| format!("parsing {}", self.snapshot_path.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => {
+                Err(error).with_context(|| format!("reading {}", self.snapshot_path.display()))
+            }
+        }
+    }
+}
+
+fn initial_paper_snapshot(start_capital_usd: Decimal) -> PortfolioSnapshot {
+    PortfolioSnapshot {
+        fetched_at: Utc::now(),
+        total_value: start_capital_usd,
+        total_exposure: Decimal::ZERO,
+        cash_balance: start_capital_usd,
+        realized_pnl: Decimal::ZERO,
+        unrealized_pnl: Decimal::ZERO,
+        positions: Vec::new(),
+    }
+}
+
+fn apply_paper_trade(
+    snapshot: &mut PortfolioSnapshot,
+    source: &ActivityEntry,
+    result: &ExecutionSuccess,
+) -> Result<()> {
+    apply_position_fill(snapshot, source, result, true)
+}
+
+fn apply_position_fill(
+    snapshot: &mut PortfolioSnapshot,
+    source: &ActivityEntry,
+    result: &ExecutionSuccess,
+    enforce_cash_balance: bool,
+) -> Result<()> {
+    if matches!(result.status, ExecutionStatus::NoFill) || result.filled_size <= Decimal::ZERO {
+        return Ok(());
+    }
+
+    if matches!(result.status, ExecutionStatus::Rejected) {
+        return Err(anyhow!(
+            "cannot apply rejected execution result order_id={} status={}",
+            result.order_id,
+            result.status
+        ));
+    }
+
+    match result.order_request.side {
+        ExecutionSide::Buy => {
+            if enforce_cash_balance && snapshot.cash_balance < result.filled_notional {
+                return Err(anyhow!(
+                    "insufficient paper cash: need {}, have {}",
+                    result.filled_notional,
+                    snapshot.cash_balance
+                ));
+            }
+
+            snapshot.cash_balance -= result.filled_notional;
+            let position_key = source.position_key();
+            if let Some(position) = snapshot
+                .positions
+                .iter_mut()
+                .find(|position| position.position_key() == position_key)
+            {
+                let existing_cost_basis = position.average_entry_price * position.size;
+                let new_size = position.size + result.filled_size;
+                let new_cost_basis = existing_cost_basis + result.filled_notional;
+                let opened_at = source_trade_opened_at(source);
+                position.size = new_size;
+                position.average_entry_price = if new_size.is_zero() {
+                    Decimal::ZERO
+                } else {
+                    new_cost_basis / new_size
+                };
+                position.current_price = result.filled_price;
+                position.cost_basis = new_cost_basis;
+                position.current_value = position.size * position.current_price;
+                position.unrealized_pnl = position.current_value - position.cost_basis;
+                position.state = PositionState::Open;
+                position.closing_started_at = None;
+                position.opened_at = match (position.opened_at, opened_at) {
+                    (Some(existing), Some(candidate)) => Some(existing.min(candidate)),
+                    (Some(existing), None) => Some(existing),
+                    (None, candidate) => candidate,
+                };
+                if position.source_trade_timestamp_unix == 0 {
+                    position.source_trade_timestamp_unix = source.timestamp;
+                }
+            } else {
+                snapshot.positions.push(PortfolioPosition {
+                    asset: result.order_request.token_id.clone(),
+                    condition_id: source.condition_id.clone(),
+                    title: source.title.clone(),
+                    outcome: source.outcome.clone(),
+                    source_wallet: normalize_wallet(&source.proxy_wallet),
+                    state: PositionState::Open,
+                    size: result.filled_size,
+                    average_entry_price: result.filled_price,
+                    current_price: result.filled_price,
+                    cost_basis: result.filled_notional,
+                    current_value: result.filled_size * result.filled_price,
+                    unrealized_pnl: Decimal::ZERO,
+                    opened_at: source_trade_opened_at(source),
+                    source_trade_timestamp_unix: source.timestamp,
+                    closing_started_at: None,
+                });
+            }
+        }
+        ExecutionSide::Sell => {
+            let (index, _used_fallback) =
+                resolve_exit_index(snapshot, source, Some(&result.order_request.token_id))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "cannot sell asset {} for wallet {} without a matching position",
+                            result.order_request.token_id,
+                            normalize_wallet(&source.proxy_wallet)
+                        )
+                    })?;
+            let position = &mut snapshot.positions[index];
+            if position.size < result.filled_size {
+                return Err(anyhow!(
+                    "paper sell size {} exceeds held size {}",
+                    result.filled_size,
+                    position.size
+                ));
+            }
+
+            let realized_pnl =
+                (result.filled_price - position.average_entry_price) * result.filled_size;
+            snapshot.realized_pnl += realized_pnl;
+            position.state = PositionState::Closing;
+            position.closing_started_at = Some(Utc::now());
+            position.size -= result.filled_size;
+            position.current_price = result.filled_price;
+            position.cost_basis = position.size * position.average_entry_price;
+            position.current_value = position.size * position.current_price;
+            position.unrealized_pnl = position.current_value - position.cost_basis;
+            snapshot.cash_balance += result.filled_notional;
+
+            if position.size.is_zero() {
+                position.state = PositionState::Closed;
+                snapshot.positions.remove(index);
+            } else {
+                position.state = PositionState::Open;
+                position.closing_started_at = None;
+            }
+        }
+    }
+
+    recalculate_snapshot_totals(snapshot);
+    Ok(())
+}
+
+impl PortfolioService {
+    async fn revalue_snapshot(&self, snapshot: &mut PortfolioSnapshot) {
+        normalize_snapshot(snapshot);
+        if self.mode == ExecutionMode::Paper {
+            if let Some(orderbooks) = &self.paper_orderbooks {
+                for position in &mut snapshot.positions {
+                    if let Some(mark_price) = position_mark_price(
+                        orderbooks.market_snapshot(&position.asset).await,
+                        position.current_price,
+                    ) {
+                        position.current_price = mark_price;
+                    }
+                    position.current_value = position.size * position.current_price;
+                    position.cost_basis = position.size * position.average_entry_price;
+                    position.unrealized_pnl = position.current_value - position.cost_basis;
+                }
+            }
+        }
+        recalculate_snapshot_totals(snapshot);
+    }
+}
+
+fn rehydrate_live_wallet_positions(snapshot: &mut PortfolioSnapshot, layout: &PortfolioSnapshot) {
+    let mut layout_by_contract: HashMap<(String, String), Vec<&PortfolioPosition>> = HashMap::new();
+    for position in &layout.positions {
+        layout_by_contract
+            .entry(position_contract_key(
+                &position.condition_id,
+                &position.outcome,
+            ))
+            .or_default()
+            .push(position);
+    }
+
+    let mut merged = Vec::with_capacity(snapshot.positions.len());
+    for live_position in snapshot.positions.drain(..) {
+        let contract_key =
+            position_contract_key(&live_position.condition_id, &live_position.outcome);
+        let Some(previous_positions) = layout_by_contract.get(&contract_key) else {
+            merged.push(live_position);
+            continue;
+        };
+
+        let mut remaining_size = live_position.size;
+        for previous_position in previous_positions {
+            if remaining_size <= Decimal::ZERO {
+                break;
+            }
+
+            let allocated_size = previous_position.size.min(remaining_size);
+            if allocated_size <= Decimal::ZERO {
+                continue;
+            }
+
+            let mut merged_position = (*previous_position).clone();
+            merged_position.condition_id = live_position.condition_id.clone();
+            merged_position.title = live_position.title.clone();
+            merged_position.outcome = live_position.outcome.clone();
+            merged_position.state = previous_position.state;
+            merged_position.size = allocated_size;
+            merged_position.current_price = live_position.current_price;
+            merged_position.current_value = allocated_size * merged_position.current_price;
+            merged_position.cost_basis = allocated_size * merged_position.average_entry_price;
+            merged_position.unrealized_pnl =
+                merged_position.current_value - merged_position.cost_basis;
+            merged.push(merged_position);
+            remaining_size -= allocated_size;
+        }
+
+        if remaining_size > Decimal::ZERO {
+            let mut anonymous_position = live_position.clone();
+            anonymous_position.size = remaining_size;
+            anonymous_position.source_wallet = String::new();
+            anonymous_position.current_value = remaining_size * anonymous_position.current_price;
+            anonymous_position.average_entry_price = anonymous_position.current_price;
+            anonymous_position.cost_basis = anonymous_position.current_value;
+            anonymous_position.unrealized_pnl = Decimal::ZERO;
+            anonymous_position.opened_at = None;
+            anonymous_position.source_trade_timestamp_unix = 0;
+            anonymous_position.state = PositionState::Stale;
+            anonymous_position.closing_started_at = None;
+            merged.push(anonymous_position);
+        }
+    }
+
+    snapshot.positions = merged;
+}
+
+fn restore_live_accounting_from_layout(
+    snapshot: &mut PortfolioSnapshot,
+    layout: &PortfolioSnapshot,
+) {
+    snapshot.realized_pnl = layout.realized_pnl;
+}
+
+fn preserve_projected_layout_if_live_refresh_stale(
+    fetched: &mut PortfolioSnapshot,
+    layout: &PortfolioSnapshot,
+) -> bool {
+    if live_refresh_size_mismatch_count(fetched, layout) == 0 {
+        return false;
+    }
+
+    let latest_prices = fetched
+        .positions
+        .iter()
+        .filter(|position| !position.current_price.is_zero())
+        .map(|position| (position.asset.clone(), position.current_price))
+        .collect::<HashMap<_, _>>();
+
+    *fetched = layout.clone();
+    for position in &mut fetched.positions {
+        if let Some(price) = latest_prices.get(&position.asset) {
+            position.current_price = *price;
+            position.current_value = position.size * position.current_price;
+            position.cost_basis = position.size * position.average_entry_price;
+            position.unrealized_pnl = position.current_value - position.cost_basis;
+        }
+    }
+    fetched.fetched_at = Utc::now();
+    true
+}
+
+fn live_refresh_size_mismatch_count(
+    fetched: &PortfolioSnapshot,
+    layout: &PortfolioSnapshot,
+) -> usize {
+    let tolerance = Decimal::new(1, 6);
+    let fetched_sizes = position_sizes_by_key(fetched);
+    let layout_sizes = position_sizes_by_key(layout);
+
+    layout_sizes
+        .iter()
+        .filter(|(key, expected_size)| {
+            let observed_size = fetched_sizes.get(*key).copied().unwrap_or(Decimal::ZERO);
+            (observed_size - **expected_size).abs() > tolerance
+        })
+        .count()
+}
+
+fn position_sizes_by_key(snapshot: &PortfolioSnapshot) -> HashMap<PositionKey, Decimal> {
+    let mut sizes = HashMap::new();
+    for position in &snapshot.positions {
+        let key = position.position_key();
+        *sizes.entry(key).or_insert(Decimal::ZERO) += position.size;
+    }
+    sizes
+}
+
+fn normalize_snapshot(snapshot: &mut PortfolioSnapshot) {
+    for position in &mut snapshot.positions {
+        position.source_wallet = normalize_wallet(&position.source_wallet);
+        if position.current_price.is_zero() {
+            position.current_price =
+                decimal_price_from_value(position.size, position.current_value);
+        }
+        if position.average_entry_price.is_zero() {
+            position.average_entry_price =
+                if !position.cost_basis.is_zero() && !position.size.is_zero() {
+                    position.cost_basis / position.size
+                } else {
+                    position.current_price
+                };
+        }
+        if position.cost_basis.is_zero() {
+            position.cost_basis = position.average_entry_price * position.size;
+        }
+        if position.current_value.is_zero() && !position.current_price.is_zero() {
+            position.current_value = position.size * position.current_price;
+        }
+        if position.size.is_zero() && position.state != PositionState::Closed {
+            position.state = PositionState::Closed;
+        }
+        position.unrealized_pnl = position.current_value - position.cost_basis;
+    }
+}
+
+fn recalculate_snapshot_totals(snapshot: &mut PortfolioSnapshot) {
+    snapshot.fetched_at = Utc::now();
+    snapshot.total_exposure = snapshot
+        .positions
+        .iter()
+        .map(|position| position.current_value)
+        .sum();
+    snapshot.unrealized_pnl = snapshot
+        .positions
+        .iter()
+        .map(|position| position.unrealized_pnl)
+        .sum();
+    snapshot.total_value = snapshot.cash_balance + snapshot.total_exposure;
+}
+
+fn decimal_price_from_value(size: Decimal, value: Decimal) -> Decimal {
+    if size.is_zero() {
+        Decimal::ZERO
+    } else {
+        value / size
+    }
+}
+
+fn source_trade_opened_at(source: &ActivityEntry) -> Option<DateTime<Utc>> {
+    if source.timestamp <= 0 {
+        return None;
+    }
+
+    if source.timestamp >= 10_000_000_000 {
+        Utc.timestamp_millis_opt(source.timestamp).single()
+    } else {
+        Utc.timestamp_opt(source.timestamp, 0).single()
+    }
+}
+
+fn position_mark_price(snapshot: Option<MarketSnapshot>, fallback: Decimal) -> Option<Decimal> {
+    let snapshot = snapshot?;
+    snapshot
+        .mid_price
+        .or(snapshot.last_trade_price)
+        .or(snapshot.best_bid)
+        .or(snapshot.best_ask)
+        .and_then(Decimal::from_f64_retain)
+        .map(|price| price.round_dp(6))
+        .or_else(|| (!fallback.is_zero()).then_some(fallback))
+}
+
+fn normalize_wallet(wallet: &str) -> String {
+    wallet.trim().to_ascii_lowercase()
+}
+
+fn position_contract_key(condition_id: &str, outcome: &str) -> (String, String) {
+    (condition_id.to_owned(), outcome.trim().to_ascii_uppercase())
+}
+
+fn resolve_exit_index(
+    snapshot: &PortfolioSnapshot,
+    source: &ActivityEntry,
+    asset_hint: Option<&str>,
+) -> Option<(usize, bool)> {
+    let requested_key = source.position_key();
+    if let Some(index) = snapshot
+        .positions
+        .iter()
+        .position(|position| position.is_active() && position.position_key() == requested_key)
+    {
+        return Some((index, false));
+    }
+
+    snapshot
+        .positions
+        .iter()
+        .enumerate()
+        .filter(|(_, position)| {
+            position.is_active() && position.condition_id == source.condition_id
+        })
+        .min_by_key(|(_, position)| {
+            let position_outcome = position.outcome.trim().to_ascii_uppercase();
+            let source_outcome = source.outcome.trim().to_ascii_uppercase();
+            let same_outcome = position_outcome == source_outcome;
+            let complementary_outcome = matches!(
+                (position_outcome.as_str(), source_outcome.as_str()),
+                ("YES", "NO") | ("NO", "YES")
+            );
+            let same_asset = asset_hint.is_some_and(|asset| position.asset == asset);
+            let same_wallet =
+                normalize_wallet(&position.source_wallet) == normalize_wallet(&source.proxy_wallet);
+            (
+                if same_outcome {
+                    0_u8
+                } else if complementary_outcome {
+                    1
+                } else {
+                    2
+                },
+                if same_asset { 0_u8 } else { 1 },
+                if same_wallet { 0_u8 } else { 1 },
+            )
+        })
+        .map(|(index, _)| (index, true))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use chrono::Utc;
+
+    use super::*;
+    use crate::config::ExecutionMode;
+    use crate::execution::{ExecutionRequest, ExecutionSuccess};
+    use crate::models::{BookLevel, OrderBookResponse};
+    use crate::orderbook::orderbook_state::{AssetCatalog, AssetMetadata, OrderBookState};
+    use rust_decimal_macros::dec;
+
+    fn sample_activity(side: &str) -> ActivityEntry {
+        sample_activity_with_wallet(side, "0xsource")
+    }
+
+    fn sample_activity_with_wallet(side: &str, wallet: &str) -> ActivityEntry {
+        ActivityEntry {
+            proxy_wallet: wallet.to_owned(),
+            timestamp: 1,
+            condition_id: "condition-1".to_owned(),
+            type_name: "TRADE".to_owned(),
+            size: 10.0,
+            usdc_size: 5.0,
+            transaction_hash: "0xhash".to_owned(),
+            price: 0.5,
+            asset: "asset-1".to_owned(),
+            side: side.to_owned(),
+            outcome_index: 0,
+            title: "Sample market".to_owned(),
+            slug: "sample-market".to_owned(),
+            event_slug: "sample-event".to_owned(),
+            outcome: "YES".to_owned(),
+        }
+    }
+
+    fn sample_result(side: ExecutionSide, size: Decimal, price: Decimal) -> ExecutionSuccess {
+        ExecutionSuccess {
+            mode: ExecutionMode::Paper,
+            order_request: ExecutionRequest {
+                token_id: "asset-1".to_owned(),
+                side,
+                size,
+                limit_price: price,
+                requested_notional: size * price,
+                source_trade_id: "paper-trade".to_owned(),
+            },
+            order_id: "paper-order".to_owned(),
+            success: true,
+            transaction_hashes: Vec::new(),
+            filled_price: price,
+            filled_size: size,
+            requested_size: size,
+            requested_price: price,
+            status: crate::execution::ExecutionStatus::Filled,
+            filled_notional: size * price,
+        }
+    }
+
+    fn sample_settings(data_dir: std::path::PathBuf) -> Settings {
+        Settings {
+            execution_mode: ExecutionMode::Paper,
+            polymarket_host: "https://clob.polymarket.com".to_owned(),
+            polymarket_data_api: "https://data-api.polymarket.com".to_owned(),
+            polymarket_gamma_api: "https://gamma-api.polymarket.com".to_owned(),
+            polymarket_market_ws: "wss://example.com/ws/market".to_owned(),
+            polymarket_user_ws: "wss://example.com/ws/user".to_owned(),
+            polymarket_activity_ws: "wss://example.com/ws/activity".to_owned(),
+            polymarket_chain_id: 137,
+            polymarket_signature_type: 0,
+            polymarket_private_key: None,
+            polymarket_funder_address: None,
+            polymarket_profile_address: None,
+            polygon_rpc_url: "https://polygon-rpc.com".to_owned(),
+            polygon_rpc_fallback_urls: Vec::new(),
+            rpc_latency_threshold: Duration::from_millis(300),
+            rpc_confirmation_timeout: Duration::from_secs(10),
+            min_required_matic: dec!(0.1),
+            min_required_usdc: dec!(25),
+            polymarket_usdc_address: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174".to_owned(),
+            polymarket_spender_address: "0x0000000000000000000000000000000000000001".to_owned(),
+            auto_approve_usdc_allowance: false,
+            usdc_approval_amount: dec!(1000),
+            target_activity_ws_api_key: None,
+            target_activity_ws_secret: None,
+            target_activity_ws_passphrase: None,
+            target_profile_addresses: vec!["0xabc".to_owned()],
+            start_capital_usd: dec!(200),
+            paper_execution_delay: Duration::ZERO,
+            copy_only_new_trades: true,
+            source_trades_limit: 50,
+            http_timeout: Duration::from_secs(2),
+            market_cache_ttl: Duration::from_secs(10),
+            market_raw_ring_capacity: 8192,
+            market_parser_workers: 1,
+            market_subscription_batch_size: 100,
+            market_subscription_delay: Duration::from_millis(40),
+            wallet_ring_capacity: 1024,
+            wallet_parser_workers: 1,
+            wallet_subscription_batch_size: 250,
+            wallet_subscription_delay: Duration::from_millis(20),
+            liquidity_sweep_threshold: dec!(1),
+            imbalance_threshold: dec!(2),
+            delta_price_move_bps: 40,
+            delta_size_drop_ratio: dec!(0.25),
+            delta_min_size_drop: dec!(1),
+            inference_confirmation_window: Duration::from_millis(400),
+            activity_stream_enabled: true,
+            activity_match_window: Duration::from_millis(200),
+            activity_price_tolerance: dec!(0.01),
+            activity_size_tolerance_ratio: dec!(0.5),
+            activity_cache_ttl: Duration::from_millis(1500),
+            fallback_market_request_interval: Duration::from_millis(1000),
+            fallback_global_requests_per_minute: 30,
+            activity_correlation_window: Duration::from_millis(400),
+            attribution_lookback: Duration::from_millis(2500),
+            attribution_trades_limit: 100,
+            copy_scale_above_five_usd: dec!(0.25),
+            min_copy_notional_usd: dec!(1),
+            max_copy_notional_usd: dec!(25),
+            max_total_exposure_usd: dec!(150),
+            max_market_exposure_usd: dec!(40),
+            min_source_trade_usdc: dec!(0),
+            max_market_spread_bps: 500,
+            min_top_of_book_ratio: dec!(1.25),
+            max_slippage_bps: 300,
+            max_source_price_slippage_bps: 200,
+            latency_fail_safe_enabled: true,
+            max_latency: Duration::from_millis(500),
+            average_latency_threshold: Duration::from_millis(350),
+            latency_monitor_interval: Duration::from_millis(50),
+            latency_reconnect_settle: Duration::from_millis(750),
+            prediction_validation_timeout: Duration::from_millis(1500),
+            log_attribution_events: true,
+            activity_parser_debug: false,
+            log_latency_events: true,
+            log_skipped_trades: true,
+            enable_log_rotation: true,
+            log_max_lines: 30_000,
+            enable_time_rotation: true,
+            log_rotate_hours: 6,
+            enable_log_clearing: false,
+            allow_buy: true,
+            allow_sell: true,
+            allow_hedging: false,
+            enable_price_bands: true,
+            enable_realistic_paper: true,
+            min_edge_threshold: dec!(0.05),
+            max_copy_delay_ms: 1_500,
+            min_liquidity: dec!(50),
+            min_wallet_score: dec!(0.6),
+            max_position_age_hours: 6,
+            max_hold_time_seconds: 1_800,
+            enable_exit_retry: true,
+            telegram_bot_token: "token".to_owned(),
+            telegram_chat_id: "chat".to_owned(),
+            health_port: 3000,
+            data_dir,
+        }
+    }
+
+    #[test]
+    fn paper_buy_updates_cash_and_position() {
+        let mut snapshot = initial_paper_snapshot(dec!(200));
+        apply_paper_trade(
+            &mut snapshot,
+            &sample_activity("BUY"),
+            &sample_result(ExecutionSide::Buy, dec!(10), dec!(0.4)),
+        )
+        .expect("paper buy should succeed");
+
+        assert_eq!(snapshot.cash_balance, dec!(196));
+        assert_eq!(snapshot.total_exposure, dec!(4));
+        assert_eq!(snapshot.total_value, dec!(200));
+        assert_eq!(snapshot.realized_pnl, Decimal::ZERO);
+        assert_eq!(snapshot.unrealized_pnl, Decimal::ZERO);
+        assert_eq!(snapshot.positions.len(), 1);
+        assert_eq!(snapshot.positions[0].size, dec!(10));
+        assert_eq!(snapshot.positions[0].source_wallet, "0xsource");
+        assert_eq!(snapshot.positions[0].average_entry_price, dec!(0.4));
+        assert_eq!(snapshot.positions[0].cost_basis, dec!(4));
+    }
+
+    #[test]
+    fn paper_sell_reduces_position_and_restores_cash() {
+        let mut snapshot = initial_paper_snapshot(dec!(200));
+        apply_paper_trade(
+            &mut snapshot,
+            &sample_activity("BUY"),
+            &sample_result(ExecutionSide::Buy, dec!(10), dec!(0.4)),
+        )
+        .expect("paper buy should succeed");
+        apply_paper_trade(
+            &mut snapshot,
+            &sample_activity("SELL"),
+            &sample_result(ExecutionSide::Sell, dec!(4), dec!(0.6)),
+        )
+        .expect("paper sell should succeed");
+
+        assert_eq!(snapshot.cash_balance, dec!(198.4));
+        assert_eq!(snapshot.total_exposure, dec!(3.6));
+        assert_eq!(snapshot.total_value, dec!(202.0));
+        assert_eq!(snapshot.realized_pnl, dec!(0.8));
+        assert_eq!(snapshot.positions[0].size, dec!(6));
+        assert_eq!(snapshot.positions[0].source_wallet, "0xsource");
+        assert_eq!(snapshot.positions[0].average_entry_price, dec!(0.4));
+    }
+
+    #[test]
+    fn paper_positions_split_by_wallet_and_sell_uses_matching_lot() {
+        let mut snapshot = initial_paper_snapshot(dec!(200));
+        apply_paper_trade(
+            &mut snapshot,
+            &sample_activity_with_wallet("BUY", "0xwallet-a"),
+            &sample_result(ExecutionSide::Buy, dec!(10), dec!(0.4)),
+        )
+        .expect("first buy should succeed");
+        apply_paper_trade(
+            &mut snapshot,
+            &sample_activity_with_wallet("BUY", "0xwallet-b"),
+            &sample_result(ExecutionSide::Buy, dec!(8), dec!(0.5)),
+        )
+        .expect("second buy should succeed");
+        apply_paper_trade(
+            &mut snapshot,
+            &sample_activity_with_wallet("SELL", "0xwallet-a"),
+            &sample_result(ExecutionSide::Sell, dec!(4), dec!(0.6)),
+        )
+        .expect("wallet-specific sell should succeed");
+
+        assert_eq!(snapshot.positions.len(), 2);
+        assert_eq!(snapshot.asset_size("asset-1"), dec!(14));
+        assert_eq!(
+            snapshot.asset_size_for_wallet("asset-1", "0xwallet-a"),
+            dec!(6)
+        );
+        assert_eq!(
+            snapshot.asset_size_for_wallet("asset-1", "0xwallet-b"),
+            dec!(8)
+        );
+        assert_eq!(snapshot.positions[0].source_wallet, "0xwallet-a");
+        assert_eq!(snapshot.positions[0].size, dec!(6));
+        assert_eq!(snapshot.positions[1].source_wallet, "0xwallet-b");
+        assert_eq!(snapshot.positions[1].size, dec!(8));
+    }
+
+    #[test]
+    fn live_rehydration_preserves_wallet_layout_and_realized_pnl() {
+        let mut fetched = PortfolioSnapshot {
+            fetched_at: Utc::now(),
+            total_value: dec!(200),
+            total_exposure: dec!(6.4),
+            cash_balance: dec!(193.6),
+            realized_pnl: Decimal::ZERO,
+            unrealized_pnl: Decimal::ZERO,
+            positions: vec![PortfolioPosition {
+                asset: "asset-1".to_owned(),
+                condition_id: "condition-1".to_owned(),
+                title: "Live market".to_owned(),
+                outcome: "YES".to_owned(),
+                source_wallet: String::new(),
+                state: PositionState::Open,
+                size: dec!(8),
+                current_value: dec!(6.4),
+                average_entry_price: dec!(0.8),
+                current_price: dec!(0.8),
+                cost_basis: dec!(6.4),
+                unrealized_pnl: Decimal::ZERO,
+                opened_at: None,
+                source_trade_timestamp_unix: 0,
+                closing_started_at: None,
+            }],
+        };
+        let layout = PortfolioSnapshot {
+            fetched_at: Utc::now(),
+            total_value: dec!(207.5),
+            total_exposure: dec!(4.4),
+            cash_balance: dec!(203.1),
+            realized_pnl: dec!(7.5),
+            unrealized_pnl: Decimal::ZERO,
+            positions: vec![
+                PortfolioPosition {
+                    asset: "asset-1".to_owned(),
+                    condition_id: "condition-1".to_owned(),
+                    title: "Tracked lot A".to_owned(),
+                    outcome: "YES".to_owned(),
+                    source_wallet: "0xwallet-a".to_owned(),
+                    state: PositionState::Open,
+                    size: dec!(6),
+                    current_value: dec!(2.4),
+                    average_entry_price: dec!(0.4),
+                    current_price: dec!(0.4),
+                    cost_basis: dec!(2.4),
+                    unrealized_pnl: Decimal::ZERO,
+                    opened_at: None,
+                    source_trade_timestamp_unix: 0,
+                    closing_started_at: None,
+                },
+                PortfolioPosition {
+                    asset: "asset-1".to_owned(),
+                    condition_id: "condition-1".to_owned(),
+                    title: "Tracked lot B".to_owned(),
+                    outcome: "YES".to_owned(),
+                    source_wallet: "0xwallet-b".to_owned(),
+                    state: PositionState::Open,
+                    size: dec!(4),
+                    current_value: dec!(2),
+                    average_entry_price: dec!(0.5),
+                    current_price: dec!(0.5),
+                    cost_basis: dec!(2),
+                    unrealized_pnl: Decimal::ZERO,
+                    opened_at: None,
+                    source_trade_timestamp_unix: 0,
+                    closing_started_at: None,
+                },
+            ],
+        };
+
+        rehydrate_live_wallet_positions(&mut fetched, &layout);
+        restore_live_accounting_from_layout(&mut fetched, &layout);
+        recalculate_snapshot_totals(&mut fetched);
+
+        assert_eq!(fetched.realized_pnl, dec!(7.5));
+        assert_eq!(fetched.positions.len(), 2);
+        assert_eq!(fetched.positions[0].source_wallet, "0xwallet-a");
+        assert_eq!(fetched.positions[0].size, dec!(6));
+        assert_eq!(fetched.positions[0].average_entry_price, dec!(0.4));
+        assert_eq!(fetched.positions[0].current_price, dec!(0.8));
+        assert_eq!(fetched.positions[1].source_wallet, "0xwallet-b");
+        assert_eq!(fetched.positions[1].size, dec!(2));
+        assert_eq!(fetched.positions[1].average_entry_price, dec!(0.5));
+        assert_eq!(fetched.total_exposure, dec!(6.4));
+        assert_eq!(fetched.unrealized_pnl, dec!(3.0));
+        assert_eq!(fetched.total_value, dec!(200.0));
+    }
+
+    #[test]
+    fn stale_live_refresh_preserves_projected_layout_sizes() {
+        let mut fetched = PortfolioSnapshot {
+            fetched_at: Utc::now(),
+            total_value: dec!(200),
+            total_exposure: dec!(4),
+            cash_balance: dec!(196),
+            realized_pnl: Decimal::ZERO,
+            unrealized_pnl: Decimal::ZERO,
+            positions: vec![PortfolioPosition {
+                asset: "asset-1".to_owned(),
+                condition_id: "condition-1".to_owned(),
+                title: "Live market".to_owned(),
+                outcome: "YES".to_owned(),
+                source_wallet: String::new(),
+                state: PositionState::Open,
+                size: dec!(5),
+                current_value: dec!(4),
+                average_entry_price: dec!(0.8),
+                current_price: dec!(0.8),
+                cost_basis: dec!(4),
+                unrealized_pnl: Decimal::ZERO,
+                opened_at: None,
+                source_trade_timestamp_unix: 0,
+                closing_started_at: None,
+            }],
+        };
+        let layout = PortfolioSnapshot {
+            fetched_at: Utc::now(),
+            total_value: dec!(200),
+            total_exposure: dec!(8),
+            cash_balance: dec!(192),
+            realized_pnl: dec!(1.2),
+            unrealized_pnl: Decimal::ZERO,
+            positions: vec![PortfolioPosition {
+                asset: "asset-1".to_owned(),
+                condition_id: "condition-1".to_owned(),
+                title: "Projected lot".to_owned(),
+                outcome: "YES".to_owned(),
+                source_wallet: "0xwallet-a".to_owned(),
+                state: PositionState::Open,
+                size: dec!(10),
+                current_value: dec!(5),
+                average_entry_price: dec!(0.5),
+                current_price: dec!(0.5),
+                cost_basis: dec!(5),
+                unrealized_pnl: Decimal::ZERO,
+                opened_at: None,
+                source_trade_timestamp_unix: 0,
+                closing_started_at: None,
+            }],
+        };
+
+        rehydrate_live_wallet_positions(&mut fetched, &layout);
+        restore_live_accounting_from_layout(&mut fetched, &layout);
+
+        assert!(preserve_projected_layout_if_live_refresh_stale(
+            &mut fetched,
+            &layout
+        ));
+        recalculate_snapshot_totals(&mut fetched);
+
+        assert_eq!(fetched.realized_pnl, dec!(1.2));
+        assert_eq!(fetched.positions.len(), 1);
+        assert_eq!(fetched.positions[0].source_wallet, "0xwallet-a");
+        assert_eq!(fetched.positions[0].size, dec!(10));
+        assert_eq!(fetched.positions[0].average_entry_price, dec!(0.5));
+        assert_eq!(fetched.positions[0].current_price, dec!(0.8));
+        assert_eq!(fetched.positions[0].current_value, dec!(8));
+        assert_eq!(fetched.positions[0].unrealized_pnl, dec!(3));
+        assert_eq!(fetched.cash_balance, dec!(192));
+        assert_eq!(fetched.total_value, dec!(200));
+    }
+
+    #[test]
+    fn position_mark_price_prefers_mid_price_then_fallbacks() {
+        let midpoint_snapshot = MarketSnapshot {
+            spread_ratio: Some(0.02),
+            visible_total_volume: 100.0,
+            mid_price: Some(0.53),
+            best_bid: Some(0.52),
+            best_ask: Some(0.54),
+            last_trade_price: Some(0.51),
+        };
+        assert_eq!(
+            position_mark_price(Some(midpoint_snapshot), dec!(0.4)).expect("mark"),
+            dec!(0.53)
+        );
+
+        let fallback_snapshot = MarketSnapshot {
+            spread_ratio: None,
+            visible_total_volume: 0.0,
+            mid_price: None,
+            best_bid: None,
+            best_ask: None,
+            last_trade_price: None,
+        };
+        assert_eq!(
+            position_mark_price(Some(fallback_snapshot), dec!(0.4)).expect("fallback"),
+            dec!(0.4)
+        );
+    }
+
+    #[tokio::test]
+    async fn paper_snapshot_marks_to_market_with_orderbook_price() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "copytrade-portfolio-test-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let settings = sample_settings(temp_dir.clone());
+        let catalog = AssetCatalog::new(vec![AssetMetadata {
+            asset_id: "asset-1".to_owned(),
+            condition_id: "condition-1".to_owned(),
+            title: "Sample market".to_owned(),
+            slug: "sample-market".to_owned(),
+            event_slug: "sample-event".to_owned(),
+            outcome: "YES".to_owned(),
+            outcome_index: 0,
+        }]);
+        let orderbooks = Arc::new(OrderBookState::new(&settings, catalog).expect("orderbooks"));
+        orderbooks
+            .apply_book_snapshot(
+                OrderBookResponse {
+                    market: "condition-1".to_owned(),
+                    asset_id: "asset-1".to_owned(),
+                    bids: vec![BookLevel {
+                        price: "0.60".to_owned(),
+                        size: "100".to_owned(),
+                    }],
+                    asks: vec![BookLevel {
+                        price: "0.62".to_owned(),
+                        size: "100".to_owned(),
+                    }],
+                    min_order_size: "1".to_owned(),
+                    tick_size: "0.01".to_owned(),
+                    neg_risk: false,
+                },
+                Instant::now(),
+                Utc::now(),
+            )
+            .await
+            .expect("snapshot");
+        let portfolio = PortfolioService::new(settings, Some(orderbooks));
+        let refreshed = portfolio
+            .apply_paper_fill(
+                &sample_activity("BUY"),
+                &sample_result(ExecutionSide::Buy, dec!(10), dec!(0.4)),
+            )
+            .await
+            .expect("paper fill");
+
+        assert_eq!(refreshed.positions[0].average_entry_price, dec!(0.4));
+        assert_eq!(refreshed.positions[0].current_price, dec!(0.61));
+        assert_eq!(refreshed.positions[0].cost_basis, dec!(4));
+        assert_eq!(refreshed.positions[0].current_value, dec!(6.1));
+        assert_eq!(refreshed.positions[0].unrealized_pnl, dec!(2.1));
+        assert_eq!(refreshed.unrealized_pnl, dec!(2.1));
+        assert_eq!(refreshed.total_value, dec!(202.1));
+    }
+}

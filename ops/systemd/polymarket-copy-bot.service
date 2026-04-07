@@ -1,0 +1,20 @@
+[Unit]
+Description=Polymarket Copy Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bot
+Group=bot
+WorkingDirectory=/opt/polymarket-copy-bot
+EnvironmentFile=/opt/polymarket-copy-bot/.env
+ExecStart=/opt/polymarket-copy-bot/target/release/polymarket-copy-bot
+Restart=always
+RestartSec=2
+LimitNOFILE=65535
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
