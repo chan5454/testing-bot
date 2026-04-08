@@ -6,12 +6,13 @@ use anyhow::Result;
 use chrono::Utc;
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use tracing::warn;
 
 use crate::config::Settings;
 use crate::log_retention::{RetentionOutcome, enforce_jsonl_retention};
 use crate::log_rotation::RotatingLogger;
+use crate::runtime::backpressure::RuntimeBackpressure;
 use crate::wallet::activity_stream::PublicActivityParseReport;
 
 #[derive(Clone)]
@@ -20,10 +21,21 @@ pub struct RawActivityLogger {
     path: PathBuf,
     rotating_logger: Option<Arc<Mutex<RotatingLogger>>>,
     write_lock: Arc<Mutex<()>>,
+    line_tx: Option<mpsc::Sender<Vec<u8>>>,
+    backpressure: RuntimeBackpressure,
 }
 
 impl RawActivityLogger {
+    #[allow(dead_code)]
     pub fn new(settings: &Settings) -> Self {
+        let backpressure = RuntimeBackpressure::new(
+            settings.hot_path_queue_capacity,
+            settings.cold_path_queue_capacity,
+        );
+        Self::with_backpressure(settings, backpressure)
+    }
+
+    pub fn with_backpressure(settings: &Settings, backpressure: RuntimeBackpressure) -> Self {
         let rotating_logger = if settings.enable_log_rotation
             || settings.enable_time_rotation
             || settings.enable_log_clearing
@@ -55,11 +67,29 @@ impl RawActivityLogger {
             None
         };
 
+        let path = settings.data_dir.join("raw-activity.jsonl");
+        let write_lock = Arc::new(Mutex::new(()));
+        let line_tx = if settings.activity_parser_debug {
+            let (line_tx, line_rx) = mpsc::channel(settings.cold_path_queue_capacity.max(1));
+            spawn_writer(
+                line_rx,
+                path.clone(),
+                rotating_logger.clone(),
+                write_lock.clone(),
+                backpressure.clone(),
+            );
+            Some(line_tx)
+        } else {
+            None
+        };
+
         Self {
             enabled: settings.activity_parser_debug,
-            path: settings.data_dir.join("raw-activity.jsonl"),
+            path,
             rotating_logger,
-            write_lock: Arc::new(Mutex::new(())),
+            write_lock,
+            line_tx,
+            backpressure,
         }
     }
 
@@ -153,33 +183,30 @@ impl RawActivityLogger {
         if !self.enabled {
             return;
         }
-        if let Err(error) = self.write_json_line(value).await {
-            warn!(
-                ?error,
-                context, "failed to persist raw activity debug record"
-            );
+        if self.backpressure.should_shed_diagnostics() {
+            self.backpressure.note_diagnostic_drop();
+            return;
+        }
+        match serde_json::to_vec(value) {
+            Ok(line) => self.enqueue_line(line, context).await,
+            Err(error) => warn!(?error, context, "failed to encode raw activity debug record"),
         }
     }
 
-    async fn write_json_line<T: Serialize>(&self, value: &T) -> Result<()> {
-        let json = serde_json::to_vec(value)?;
-
-        if let Some(logger) = &self.rotating_logger {
-            let mut logger = logger.lock().await;
-            logger.write_line(&String::from_utf8_lossy(&json))?;
-            return Ok(());
+    async fn enqueue_line(&self, line: Vec<u8>, context: &'static str) {
+        let Some(line_tx) = &self.line_tx else {
+            return;
+        };
+        self.backpressure.increment_cold_path_depth();
+        match line_tx.try_send(line) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+            | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.backpressure.decrement_cold_path_depth();
+                self.backpressure.note_diagnostic_drop();
+                warn!(context, "dropping raw activity debug record due to cold-path backpressure");
+            }
         }
-
-        let _guard = self.write_lock.lock().await;
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .await?;
-        file.write_all(&json).await?;
-        file.write_all(b"\n").await?;
-        file.flush().await?;
-        Ok(())
     }
 
     async fn current_path(&self) -> PathBuf {
@@ -189,6 +216,48 @@ impl RawActivityLogger {
         }
         self.path.clone()
     }
+}
+
+fn spawn_writer(
+    mut line_rx: mpsc::Receiver<Vec<u8>>,
+    path: PathBuf,
+    rotating_logger: Option<Arc<Mutex<RotatingLogger>>>,
+    write_lock: Arc<Mutex<()>>,
+    backpressure: RuntimeBackpressure,
+) {
+    tokio::spawn(async move {
+        while let Some(line) = line_rx.recv().await {
+            if let Err(error) = write_line(&path, rotating_logger.as_ref(), &write_lock, &line).await
+            {
+                warn!(?error, "failed to persist raw activity debug record");
+            }
+            backpressure.decrement_cold_path_depth();
+        }
+    });
+}
+
+async fn write_line(
+    path: &PathBuf,
+    rotating_logger: Option<&Arc<Mutex<RotatingLogger>>>,
+    write_lock: &Arc<Mutex<()>>,
+    line: &[u8],
+) -> Result<()> {
+    if let Some(logger) = rotating_logger {
+        let mut logger = logger.lock().await;
+        logger.write_line(&String::from_utf8_lossy(line))?;
+        return Ok(());
+    }
+
+    let _guard = write_lock.lock().await;
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    file.write_all(line).await?;
+    file.write_all(b"\n").await?;
+    file.flush().await?;
+    Ok(())
 }
 
 #[derive(Serialize)]

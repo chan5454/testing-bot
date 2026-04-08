@@ -32,8 +32,11 @@ const MARKET_SUBSCRIPTION_SAFE_MAX_BATCH_SIZE: usize = 100;
 const MARKET_SUBSCRIPTION_RETRY_BATCH_SIZE: usize = 50;
 const MARKET_SUBSCRIPTION_SEVERE_RETRY_BATCH_SIZE: usize = 25;
 const MARKET_SUBSCRIPTION_MIN_DELAY: Duration = Duration::from_millis(40);
+const MARKET_SUBSCRIPTION_HOT_PATH_MIN_DELAY: Duration = Duration::from_millis(10);
 const MARKET_SUBSCRIPTION_RETRY_DELAY: Duration = Duration::from_millis(100);
+const MARKET_SUBSCRIPTION_HOT_PATH_RETRY_DELAY: Duration = Duration::from_millis(50);
 const MARKET_SUBSCRIPTION_SEVERE_RETRY_DELAY: Duration = Duration::from_millis(150);
+const MARKET_SUBSCRIPTION_HOT_PATH_SEVERE_RETRY_DELAY: Duration = Duration::from_millis(75);
 const MARKET_DATA_STALE_AFTER: Duration = Duration::from_secs(30);
 const MARKET_DATA_STALE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const MARKET_INITIAL_DATA_GRACE_MIN: Duration = Duration::from_secs(45);
@@ -526,21 +529,34 @@ where
 }
 
 fn market_subscription_plan(settings: &Settings, reconnect_attempt: u32) -> MarketSubscriptionPlan {
+    let min_delay = if settings.hot_path_mode {
+        MARKET_SUBSCRIPTION_HOT_PATH_MIN_DELAY
+    } else {
+        MARKET_SUBSCRIPTION_MIN_DELAY
+    };
+    let retry_delay = if settings.hot_path_mode {
+        MARKET_SUBSCRIPTION_HOT_PATH_RETRY_DELAY
+    } else {
+        MARKET_SUBSCRIPTION_RETRY_DELAY
+    };
+    let severe_retry_delay = if settings.hot_path_mode {
+        MARKET_SUBSCRIPTION_HOT_PATH_SEVERE_RETRY_DELAY
+    } else {
+        MARKET_SUBSCRIPTION_SEVERE_RETRY_DELAY
+    };
     let mut batch_size = settings
         .market_subscription_batch_size
         .max(1)
         .min(MARKET_SUBSCRIPTION_SAFE_MAX_BATCH_SIZE);
-    let mut delay = settings
-        .market_subscription_delay
-        .max(MARKET_SUBSCRIPTION_MIN_DELAY);
+    let mut delay = settings.market_subscription_delay.max(min_delay);
 
     if reconnect_attempt >= 2 {
         batch_size = batch_size.min(MARKET_SUBSCRIPTION_RETRY_BATCH_SIZE);
-        delay = delay.max(MARKET_SUBSCRIPTION_RETRY_DELAY);
+        delay = delay.max(retry_delay);
     }
     if reconnect_attempt >= 4 {
         batch_size = batch_size.min(MARKET_SUBSCRIPTION_SEVERE_RETRY_BATCH_SIZE);
-        delay = delay.max(MARKET_SUBSCRIPTION_SEVERE_RETRY_DELAY);
+        delay = delay.max(severe_retry_delay);
     }
 
     MarketSubscriptionPlan { batch_size, delay }
@@ -854,6 +870,17 @@ mod tests {
             wallet_parser_workers: 1,
             wallet_subscription_batch_size: 250,
             wallet_subscription_delay: Duration::from_millis(20),
+            hot_path_mode: true,
+            hot_path_queue_capacity: 128,
+            cold_path_queue_capacity: 512,
+            attribution_fast_cache_capacity: 256,
+            persistence_flush_interval: Duration::from_millis(250),
+            analytics_flush_interval: Duration::from_millis(500),
+            telegram_async_only: true,
+            fast_risk_only_on_hot_path: true,
+            exit_priority_strict: true,
+            parse_tasks_market: 1,
+            parse_tasks_wallet: 1,
             liquidity_sweep_threshold: Decimal::ONE,
             imbalance_threshold: Decimal::ONE,
             delta_price_move_bps: 40,
@@ -907,6 +934,10 @@ mod tests {
             max_position_age_hours: 6,
             max_hold_time_seconds: 1_800,
             enable_exit_retry: true,
+            exit_retry_window: Duration::from_secs(30),
+            exit_retry_interval: Duration::from_millis(500),
+            closing_max_age: Duration::from_secs(30),
+            force_exit_on_closing_timeout: true,
             telegram_bot_token: "token".to_owned(),
             telegram_chat_id: "chat".to_owned(),
             health_port: 8080,
@@ -922,21 +953,21 @@ mod tests {
             market_subscription_plan(&settings, 0),
             MarketSubscriptionPlan {
                 batch_size: 100,
-                delay: Duration::from_millis(40),
+                delay: Duration::from_millis(20),
             }
         );
         assert_eq!(
             market_subscription_plan(&settings, 2),
             MarketSubscriptionPlan {
                 batch_size: 50,
-                delay: Duration::from_millis(100),
+                delay: Duration::from_millis(50),
             }
         );
         assert_eq!(
             market_subscription_plan(&settings, 4),
             MarketSubscriptionPlan {
                 batch_size: 25,
-                delay: Duration::from_millis(150),
+                delay: Duration::from_millis(75),
             }
         );
     }

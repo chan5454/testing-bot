@@ -12,6 +12,7 @@ use tokio::sync::RwLock;
 
 use crate::config::ExecutionMode;
 use crate::models::HealthSnapshot;
+use crate::runtime::backpressure::BackpressureSnapshot;
 
 #[derive(Clone)]
 pub struct HealthState {
@@ -76,6 +77,16 @@ impl HealthState {
     pub async fn set_average_latency(&self, average_ms: u64) {
         let mut health = self.inner.write().await;
         health.average_latency_ms = average_ms;
+        health.last_update_iso = Some(Utc::now());
+    }
+
+    pub async fn set_backpressure(&self, snapshot: BackpressureSnapshot) {
+        let mut health = self.inner.write().await;
+        health.hot_entry_queue_depth = snapshot.hot_entry_queue_depth;
+        health.hot_exit_queue_depth = snapshot.hot_exit_queue_depth;
+        health.cold_path_queue_depth = snapshot.cold_path_queue_depth;
+        health.dropped_diagnostics = snapshot.dropped_diagnostics;
+        health.degradation_mode = snapshot.degradation_mode;
         health.last_update_iso = Some(Utc::now());
     }
 

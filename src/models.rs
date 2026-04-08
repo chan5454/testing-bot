@@ -94,21 +94,52 @@ pub enum PositionState {
 pub struct TradeStageTimestamps {
     pub websocket_event_received_at: Instant,
     pub websocket_event_received_at_utc: DateTime<Utc>,
+    pub parse_completed_at: Instant,
+    pub parse_completed_at_utc: DateTime<Utc>,
     pub detection_triggered_at: Instant,
     pub detection_triggered_at_utc: DateTime<Utc>,
+    pub attribution_completed_at: Option<Instant>,
+    pub attribution_completed_at_utc: Option<DateTime<Utc>>,
+    pub fast_risk_completed_at: Option<Instant>,
+    pub fast_risk_completed_at_utc: Option<DateTime<Utc>>,
 }
 
 impl TradeStageTimestamps {
+    pub fn parse_latency_ms(&self) -> u64 {
+        self.parse_completed_at
+            .duration_since(self.websocket_event_received_at)
+            .as_millis() as u64
+    }
+
+    pub fn attribution_latency_ms(&self) -> Option<u64> {
+        self.attribution_completed_at.map(|attribution_completed_at| {
+            attribution_completed_at
+                .duration_since(self.parse_completed_at)
+                .as_millis() as u64
+        })
+    }
+
     pub fn detection_latency_ms(&self) -> u64 {
         self.detection_triggered_at
             .duration_since(self.websocket_event_received_at)
             .as_millis() as u64
     }
 
+    pub fn fast_risk_latency_ms(&self) -> Option<u64> {
+        let baseline = self
+            .attribution_completed_at
+            .unwrap_or(self.detection_triggered_at);
+        self.fast_risk_completed_at
+            .map(|fast_risk_completed_at| {
+                fast_risk_completed_at
+                    .duration_since(baseline)
+                    .as_millis() as u64
+            })
+    }
+
     pub fn execution_latency_ms(&self, submitted_at: Instant) -> u64 {
-        submitted_at
-            .duration_since(self.detection_triggered_at)
-            .as_millis() as u64
+        let baseline = self.fast_risk_completed_at.unwrap_or(self.detection_triggered_at);
+        submitted_at.duration_since(baseline).as_millis() as u64
     }
 
     pub fn total_latency_ms(&self, submitted_at: Instant) -> u64 {
@@ -227,6 +258,18 @@ pub struct PortfolioPosition {
     pub source_trade_timestamp_unix: i64,
     #[serde(default)]
     pub closing_started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub closing_reason: Option<String>,
+    #[serde(default)]
+    pub last_close_attempt_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub close_attempts: u32,
+    #[serde(default)]
+    pub close_failure_reason: Option<String>,
+    #[serde(default)]
+    pub closing_escalation_level: u8,
+    #[serde(default)]
+    pub stale_reason: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -238,6 +281,7 @@ pub struct ResolvedPosition {
     pub size: Decimal,
     pub current_value: Decimal,
     pub used_fallback: bool,
+    pub fallback_reason: Option<String>,
 }
 
 impl PortfolioPosition {
@@ -262,6 +306,19 @@ impl PortfolioPosition {
     pub fn age(&self, now: DateTime<Utc>) -> Option<TimeDelta> {
         self.reference_time()
             .map(|opened_at| now.signed_duration_since(opened_at))
+    }
+
+    pub fn closing_age(&self, now: DateTime<Utc>) -> Option<TimeDelta> {
+        self.closing_started_at
+            .map(|started_at| now.signed_duration_since(started_at))
+    }
+
+    pub fn close_retry_due(&self, now: DateTime<Utc>, retry_interval: TimeDelta) -> bool {
+        self.state == PositionState::Closing
+            && self
+                .last_close_attempt_at
+                .map(|last_attempt_at| now.signed_duration_since(last_attempt_at) >= retry_interval)
+                .unwrap_or(true)
     }
 
     pub fn should_force_exit(&self, now: DateTime<Utc>, max_hold_time_seconds: i64) -> bool {
@@ -379,6 +436,12 @@ impl PortfolioSnapshot {
             .find(|position| position.position_key() == *key)
     }
 
+    pub fn position_mut_by_key(&mut self, key: &PositionKey) -> Option<&mut PortfolioPosition> {
+        self.positions
+            .iter_mut()
+            .find(|position| position.position_key() == *key && position.size > Decimal::ZERO)
+    }
+
     #[allow(dead_code)]
     pub fn condition_position(&self, condition_id: &str) -> Option<&PortfolioPosition> {
         self.active_positions()
@@ -425,35 +488,23 @@ impl PortfolioSnapshot {
                 size: position.size,
                 current_value: position.current_value,
                 used_fallback: false,
+                fallback_reason: None,
             });
         }
 
-        self.active_positions()
+        let requested_wallet = wallet_hint
+            .map(normalize_portfolio_wallet)
+            .unwrap_or_else(|| requested_key.source_wallet.clone());
+        let candidates = self
+            .active_positions()
             .into_iter()
-            .filter(|position| position.condition_id == requested_key.condition_id)
-            .min_by_key(|position| {
-                let position_outcome = normalize_position_outcome(&position.outcome);
-                let same_outcome = position_outcome == requested_key.outcome;
-                let complementary_outcome =
-                    is_complementary_outcome(&position_outcome, &requested_key.outcome);
-                let same_asset = asset_hint.is_some_and(|asset| position.asset == asset);
-                let same_wallet = wallet_hint.is_some_and(|wallet| {
-                    normalize_portfolio_wallet(&position.source_wallet)
-                        == normalize_portfolio_wallet(wallet)
-                });
-                (
-                    if same_outcome {
-                        0_u8
-                    } else if complementary_outcome {
-                        1
-                    } else {
-                        2
-                    },
-                    if same_asset { 0_u8 } else { 1 },
-                    if same_wallet { 0_u8 } else { 1 },
-                )
+            .filter(|position| {
+                position.condition_id == requested_key.condition_id
+                    && normalize_portfolio_wallet(&position.source_wallet) == requested_wallet
             })
-            .map(|position| ResolvedPosition {
+            .collect::<Vec<_>>();
+        select_safe_exit_fallback(candidates, asset_hint).map(|(position, fallback_reason)| {
+            ResolvedPosition {
                 key: position.position_key(),
                 asset: position.asset.clone(),
                 outcome: position.outcome.clone(),
@@ -461,29 +512,76 @@ impl PortfolioSnapshot {
                 size: position.size,
                 current_value: position.current_value,
                 used_fallback: true,
-            })
+                fallback_reason: Some(fallback_reason),
+            }
+        })
     }
 
-    pub fn mark_position_closing(&mut self, key: &PositionKey) -> bool {
+    pub fn position_is_closing(&self, key: &PositionKey) -> bool {
+        self.positions
+            .iter()
+            .any(|position| position.position_key() == *key && position.state == PositionState::Closing)
+    }
+
+    pub fn close_retry_due(
+        &self,
+        key: &PositionKey,
+        now: DateTime<Utc>,
+        retry_interval: TimeDelta,
+    ) -> bool {
+        self.position_by_key(key)
+            .map(|position| position.close_retry_due(now, retry_interval))
+            .unwrap_or(true)
+    }
+
+    pub fn mark_position_closing(&mut self, key: &PositionKey, reason: &str) -> bool {
         let now = Utc::now();
-        if let Some(position) = self
-            .positions
-            .iter_mut()
-            .find(|position| position.position_key() == *key && position.is_active())
-        {
+        if let Some(position) = self.position_mut_by_key(key) {
             position.state = PositionState::Closing;
-            position.closing_started_at = Some(now);
+            position.closing_started_at = position.closing_started_at.or(Some(now));
+            position.closing_reason = Some(reason.to_owned());
+            position.stale_reason = None;
             return true;
         }
         false
     }
 
-    pub fn restore_position_open(&mut self, key: &PositionKey) -> bool {
-        if let Some(position) = self.positions.iter_mut().find(|position| {
-            position.position_key() == *key && position.state == PositionState::Closing
-        }) {
-            position.state = PositionState::Open;
-            position.closing_started_at = None;
+    pub fn note_close_attempt(&mut self, key: &PositionKey) -> bool {
+        let now = Utc::now();
+        if let Some(position) = self.position_mut_by_key(key) {
+            position.state = PositionState::Closing;
+            position.closing_started_at = position.closing_started_at.or(Some(now));
+            position.last_close_attempt_at = Some(now);
+            position.close_attempts = position.close_attempts.saturating_add(1);
+            position.close_failure_reason = None;
+            position.stale_reason = None;
+            return true;
+        }
+        false
+    }
+
+    pub fn note_close_failure(&mut self, key: &PositionKey, reason: &str) -> bool {
+        if let Some(position) = self.position_mut_by_key(key) {
+            position.state = PositionState::Closing;
+            position.close_failure_reason = Some(reason.to_owned());
+            return true;
+        }
+        false
+    }
+
+    pub fn set_closing_escalation_level(&mut self, key: &PositionKey, level: u8) -> Option<u8> {
+        let position = self.position_mut_by_key(key)?;
+        let previous = position.closing_escalation_level;
+        if level > previous {
+            position.closing_escalation_level = level;
+        }
+        Some(previous)
+    }
+
+    pub fn mark_position_stale(&mut self, key: &PositionKey, reason: &str) -> bool {
+        if let Some(position) = self.position_mut_by_key(key) {
+            position.state = PositionState::Stale;
+            position.stale_reason = Some(reason.to_owned());
             return true;
         }
         false
@@ -492,18 +590,19 @@ impl PortfolioSnapshot {
     pub fn cleanup_stale_positions(&mut self, max_position_age_hours: u64) {
         let now = Utc::now();
         let max_age = TimeDelta::hours(max_position_age_hours.min(i64::MAX as u64) as i64);
-        let closing_timeout = TimeDelta::seconds(3);
 
         for position in &mut self.positions {
-            let timed_out_while_closing = position.state == PositionState::Closing
-                && position.closing_started_at.is_some_and(|started_at| {
-                    now.signed_duration_since(started_at) >= closing_timeout
-                });
+            if position.state == PositionState::Closing {
+                continue;
+            }
             let legacy_or_unknown_position = position.source_trade_timestamp_unix == 0;
             let aged_out = position.age(now).is_some_and(|age| age >= max_age);
 
-            if legacy_or_unknown_position || aged_out || timed_out_while_closing {
+            if legacy_or_unknown_position || aged_out {
                 position.state = PositionState::Stale;
+                if position.stale_reason.is_none() {
+                    position.stale_reason = Some("stale_without_seen_exit".to_owned());
+                }
             }
         }
     }
@@ -555,14 +654,31 @@ fn normalize_position_outcome(outcome: &str) -> String {
     outcome.trim().to_ascii_uppercase()
 }
 
-fn is_complementary_outcome(left: &str, right: &str) -> bool {
-    matches!(
-        (
-            normalize_position_outcome(left).as_str(),
-            normalize_position_outcome(right).as_str()
-        ),
-        ("YES", "NO") | ("NO", "YES")
-    )
+fn select_safe_exit_fallback<'a>(
+    candidates: Vec<&'a PortfolioPosition>,
+    asset_hint: Option<&str>,
+) -> Option<(&'a PortfolioPosition, String)> {
+    if candidates.len() == 1 {
+        return Some((
+            candidates[0],
+            "same_wallet_same_condition_single_candidate".to_owned(),
+        ));
+    }
+
+    if let Some(asset) = asset_hint {
+        let asset_matches = candidates
+            .into_iter()
+            .filter(|position| position.asset == asset)
+            .collect::<Vec<_>>();
+        if asset_matches.len() == 1 {
+            return Some((
+                asset_matches[0],
+                "same_wallet_same_condition_asset_hint".to_owned(),
+            ));
+        }
+    }
+
+    None
 }
 
 fn portfolio_timestamp_to_datetime(timestamp: i64) -> Option<DateTime<Utc>> {
@@ -653,6 +769,12 @@ pub struct ExecutionAnalyticsState {
     pub skipped_entry_by_reason: BTreeMap<String, u64>,
     #[serde(default)]
     pub skipped_exit_by_reason: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub exit_event_counts: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub stale_position_counts: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub close_failed_by_reason: BTreeMap<String, u64>,
     pub raw_copy_rate: Decimal,
     pub executable_entry_copy_rate: Decimal,
     pub executable_total_copy_rate: Decimal,
@@ -693,6 +815,9 @@ impl Default for ExecutionAnalyticsState {
             skipped_exit_events: 0,
             skipped_entry_by_reason: BTreeMap::new(),
             skipped_exit_by_reason: BTreeMap::new(),
+            exit_event_counts: BTreeMap::new(),
+            stale_position_counts: BTreeMap::new(),
+            close_failed_by_reason: BTreeMap::new(),
             raw_copy_rate: Decimal::ZERO,
             executable_entry_copy_rate: Decimal::ZERO,
             executable_total_copy_rate: Decimal::ZERO,
@@ -726,6 +851,11 @@ pub struct HealthSnapshot {
     pub last_execution_ms: u64,
     pub last_total_latency_ms: u64,
     pub average_latency_ms: u64,
+    pub hot_entry_queue_depth: usize,
+    pub hot_exit_queue_depth: usize,
+    pub cold_path_queue_depth: usize,
+    pub dropped_diagnostics: u64,
+    pub degradation_mode: bool,
     pub last_skip_processing_ms: u64,
     pub last_skip_reason_code: Option<String>,
     pub trading_paused: bool,

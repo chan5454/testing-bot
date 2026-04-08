@@ -17,6 +17,8 @@ pub struct LastTradeConfirmation {
     pub size: Option<f64>,
     pub observed_at: Instant,
     pub observed_at_utc: DateTime<Utc>,
+    pub parse_completed_at: Instant,
+    pub parse_completed_at_utc: DateTime<Utc>,
     pub generation: u64,
 }
 
@@ -95,8 +97,14 @@ impl TradeInferenceEngine {
             stage_timestamps: TradeStageTimestamps {
                 websocket_event_received_at: confirmation.observed_at,
                 websocket_event_received_at_utc: confirmation.observed_at_utc,
+                parse_completed_at: confirmation.parse_completed_at,
+                parse_completed_at_utc: confirmation.parse_completed_at_utc,
                 detection_triggered_at: confirmation.observed_at,
                 detection_triggered_at_utc: confirmation.observed_at_utc,
+                attribution_completed_at: None,
+                attribution_completed_at_utc: None,
+                fast_risk_completed_at: None,
+                fast_risk_completed_at_utc: None,
             },
             confirmed_at: confirmation.observed_at_utc,
             generation: confirmation.generation,
@@ -126,8 +134,14 @@ mod tests {
                 stage_timestamps: TradeStageTimestamps {
                     websocket_event_received_at: observed_at,
                     websocket_event_received_at_utc: Utc::now(),
+                    parse_completed_at: observed_at,
+                    parse_completed_at_utc: Utc::now(),
                     detection_triggered_at: observed_at,
                     detection_triggered_at_utc: Utc::now(),
+                    attribution_completed_at: None,
+                    attribution_completed_at_utc: None,
+                    fast_risk_completed_at: None,
+                    fast_risk_completed_at_utc: None,
                 },
                 score: 3,
             },
@@ -143,6 +157,8 @@ mod tests {
             size: Some(12.0),
             observed_at,
             observed_at_utc: Utc::now(),
+            parse_completed_at: observed_at,
+            parse_completed_at_utc: Utc::now(),
             generation: 1,
         });
 
@@ -167,6 +183,8 @@ mod tests {
             size: Some(42.0),
             observed_at,
             observed_at_utc,
+            parse_completed_at: observed_at,
+            parse_completed_at_utc: observed_at_utc,
             generation: 7,
         });
 

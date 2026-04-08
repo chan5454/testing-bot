@@ -113,6 +113,10 @@ pub struct ActivityTradeEvent {
     pub observed_at: Instant,
     #[serde(skip_serializing)]
     pub observed_at_utc: DateTime<Utc>,
+    #[serde(skip_serializing)]
+    pub parse_completed_at: Instant,
+    #[serde(skip_serializing)]
+    pub parse_completed_at_utc: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug)]
@@ -327,8 +331,14 @@ pub fn build_wallet_triggered_trade(
         stage_timestamps: TradeStageTimestamps {
             websocket_event_received_at: event.observed_at,
             websocket_event_received_at_utc: event.observed_at_utc,
+            parse_completed_at: event.parse_completed_at,
+            parse_completed_at_utc: event.parse_completed_at_utc,
             detection_triggered_at,
             detection_triggered_at_utc,
+            attribution_completed_at: None,
+            attribution_completed_at_utc: None,
+            fast_risk_completed_at: None,
+            fast_risk_completed_at_utc: None,
         },
         confirmed_at,
         generation: event.generation,
@@ -493,6 +503,17 @@ mod tests {
             wallet_parser_workers: 1,
             wallet_subscription_batch_size: 10,
             wallet_subscription_delay: Duration::ZERO,
+            hot_path_mode: true,
+            hot_path_queue_capacity: 128,
+            cold_path_queue_capacity: 512,
+            attribution_fast_cache_capacity: 256,
+            persistence_flush_interval: Duration::from_millis(250),
+            analytics_flush_interval: Duration::from_millis(500),
+            telegram_async_only: true,
+            fast_risk_only_on_hot_path: true,
+            exit_priority_strict: true,
+            parse_tasks_market: 1,
+            parse_tasks_wallet: 1,
             liquidity_sweep_threshold: dec!(1),
             imbalance_threshold: dec!(2),
             delta_price_move_bps: 40,
@@ -546,6 +567,10 @@ mod tests {
             max_position_age_hours: 6,
             max_hold_time_seconds: 1_800,
             enable_exit_retry: true,
+            exit_retry_window: Duration::from_secs(30),
+            exit_retry_interval: Duration::from_millis(500),
+            closing_max_age: Duration::from_secs(30),
+            force_exit_on_closing_timeout: true,
             telegram_bot_token: "token".to_owned(),
             telegram_chat_id: "chat".to_owned(),
             health_port: 3000,
@@ -565,8 +590,14 @@ mod tests {
             stage_timestamps: TradeStageTimestamps {
                 websocket_event_received_at: now,
                 websocket_event_received_at_utc: Utc::now(),
+                parse_completed_at: now,
+                parse_completed_at_utc: Utc::now(),
                 detection_triggered_at: now,
                 detection_triggered_at_utc: Utc::now(),
+                attribution_completed_at: Some(now),
+                attribution_completed_at_utc: Some(Utc::now()),
+                fast_risk_completed_at: Some(now),
+                fast_risk_completed_at_utc: Some(Utc::now()),
             },
             confirmed_at: Utc::now(),
             generation: 1,
@@ -591,6 +622,8 @@ mod tests {
             source: ActivitySource::ActivityStream,
             observed_at,
             observed_at_utc,
+            parse_completed_at: observed_at,
+            parse_completed_at_utc: observed_at_utc,
         }
     }
 

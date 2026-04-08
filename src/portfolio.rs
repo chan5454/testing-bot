@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -8,7 +9,8 @@ use chrono::{DateTime, TimeZone, Utc};
 use reqwest::Client;
 use rust_decimal::Decimal;
 use serde_json::Value;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
+use tokio::time::{MissedTickBehavior, interval};
 use tracing::warn;
 
 use crate::config::{ExecutionMode, Settings};
@@ -26,6 +28,8 @@ pub struct PortfolioService {
     profile_address: Option<String>,
     snapshot_path: PathBuf,
     cache: Arc<RwLock<Option<PortfolioSnapshot>>>,
+    persistence_dirty: Arc<AtomicBool>,
+    flush_notify: Arc<Notify>,
     start_capital_usd: Decimal,
     paper_orderbooks: Option<Arc<OrderBookState>>,
     max_position_age_hours: u64,
@@ -44,17 +48,21 @@ impl PortfolioService {
             .build()
             .expect("reqwest client");
 
-        Self {
+        let service = Self {
             mode: settings.execution_mode,
             client,
             data_api: settings.polymarket_data_api,
             profile_address: settings.polymarket_profile_address,
             snapshot_path: settings.data_dir.join("portfolio-summary.json"),
             cache: Arc::new(RwLock::new(None)),
+            persistence_dirty: Arc::new(AtomicBool::new(false)),
+            flush_notify: Arc::new(Notify::new()),
             start_capital_usd: settings.start_capital_usd,
             paper_orderbooks,
             max_position_age_hours: settings.max_position_age_hours,
-        }
+        };
+        service.spawn_flusher(settings.persistence_flush_interval);
+        service
     }
 
     pub async fn snapshot(&self) -> Option<PortfolioSnapshot> {
@@ -117,7 +125,7 @@ impl PortfolioService {
         normalize_snapshot(&mut snapshot);
         snapshot.cleanup_stale_positions(self.max_position_age_hours);
         *self.cache.write().await = Some(snapshot.clone());
-        self.persist_snapshot(&snapshot).await?;
+        self.schedule_persist();
         Ok(snapshot)
     }
 
@@ -126,9 +134,10 @@ impl PortfolioService {
         snapshot: &PortfolioSnapshot,
         source: &ActivityEntry,
         result: &ExecutionSuccess,
+        position_key_hint: Option<&PositionKey>,
     ) -> Result<PortfolioSnapshot> {
         let mut projected = snapshot.clone();
-        apply_position_fill(&mut projected, source, result, false)?;
+        apply_position_fill(&mut projected, source, result, false, position_key_hint)?;
         projected.cleanup_stale_positions(self.max_position_age_hours);
         Ok(projected)
     }
@@ -137,6 +146,7 @@ impl PortfolioService {
         &self,
         source: &ActivityEntry,
         result: &ExecutionSuccess,
+        position_key_hint: Option<&PositionKey>,
     ) -> Result<PortfolioSnapshot> {
         if self.mode != ExecutionMode::Paper {
             return Err(anyhow!("paper fill requested while running in live mode"));
@@ -146,11 +156,11 @@ impl PortfolioService {
             Some(snapshot) => snapshot,
             None => self.load_or_initialize_paper_snapshot().await?,
         };
-        apply_paper_trade(&mut snapshot, source, result)?;
+        apply_paper_trade(&mut snapshot, source, result, position_key_hint)?;
         self.revalue_snapshot(&mut snapshot).await;
         snapshot.cleanup_stale_positions(self.max_position_age_hours);
         *self.cache.write().await = Some(snapshot.clone());
-        self.persist_snapshot(&snapshot).await?;
+        self.schedule_persist();
         Ok(snapshot)
     }
 
@@ -229,6 +239,12 @@ impl PortfolioService {
                 opened_at: None,
                 source_trade_timestamp_unix: 0,
                 closing_started_at: None,
+                closing_reason: None,
+                last_close_attempt_at: None,
+                close_attempts: 0,
+                close_failure_reason: None,
+                closing_escalation_level: 0,
+                stale_reason: None,
             });
         }
 
@@ -269,6 +285,16 @@ impl PortfolioService {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn flush_persistence(&self) -> Result<()> {
+        let snapshot = self.cache.read().await.clone();
+        if let Some(snapshot) = snapshot {
+            self.persist_snapshot(&snapshot).await?;
+        }
+        self.persistence_dirty.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
     async fn load_wallet_layout_snapshot(&self) -> Result<Option<PortfolioSnapshot>> {
         if let Some(snapshot) = self.snapshot().await {
             return Ok(Some(snapshot));
@@ -284,6 +310,59 @@ impl PortfolioService {
             }
         }
     }
+
+    fn schedule_persist(&self) {
+        self.persistence_dirty.store(true, Ordering::Relaxed);
+        self.flush_notify.notify_one();
+    }
+
+    fn spawn_flusher(&self, flush_interval: Duration) {
+        let cache = self.cache.clone();
+        let snapshot_path = self.snapshot_path.clone();
+        let dirty = self.persistence_dirty.clone();
+        let flush_notify = self.flush_notify.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            let mut ticker = interval(flush_interval.max(Duration::from_millis(50)));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = flush_notify.notified() => {}
+                }
+                if !dirty.swap(false, Ordering::Relaxed) {
+                    continue;
+                }
+                let snapshot = cache.read().await.clone();
+                let Some(snapshot) = snapshot else {
+                    continue;
+                };
+                if let Err(error) = persist_portfolio_snapshot(&snapshot_path, &snapshot).await {
+                    warn!(
+                        ?error,
+                        path = %snapshot_path.display(),
+                        "failed to persist portfolio snapshot"
+                    );
+                    dirty.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+    }
+}
+
+async fn persist_portfolio_snapshot(path: &PathBuf, snapshot: &PortfolioSnapshot) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let body = serde_json::to_string_pretty(snapshot)?;
+    tokio::fs::write(path, body)
+        .await
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }
 
 fn initial_paper_snapshot(start_capital_usd: Decimal) -> PortfolioSnapshot {
@@ -302,8 +381,9 @@ fn apply_paper_trade(
     snapshot: &mut PortfolioSnapshot,
     source: &ActivityEntry,
     result: &ExecutionSuccess,
+    position_key_hint: Option<&PositionKey>,
 ) -> Result<()> {
-    apply_position_fill(snapshot, source, result, true)
+    apply_position_fill(snapshot, source, result, true, position_key_hint)
 }
 
 fn apply_position_fill(
@@ -311,6 +391,7 @@ fn apply_position_fill(
     source: &ActivityEntry,
     result: &ExecutionSuccess,
     enforce_cash_balance: bool,
+    position_key_hint: Option<&PositionKey>,
 ) -> Result<()> {
     if matches!(result.status, ExecutionStatus::NoFill) || result.filled_size <= Decimal::ZERO {
         return Ok(());
@@ -382,17 +463,24 @@ fn apply_position_fill(
                     opened_at: source_trade_opened_at(source),
                     source_trade_timestamp_unix: source.timestamp,
                     closing_started_at: None,
+                    closing_reason: None,
+                    last_close_attempt_at: None,
+                    close_attempts: 0,
+                    close_failure_reason: None,
+                    closing_escalation_level: 0,
+                    stale_reason: None,
                 });
             }
         }
         ExecutionSide::Sell => {
+            let requested_key = position_key_hint.cloned().unwrap_or_else(|| source.position_key());
             let (index, _used_fallback) =
-                resolve_exit_index(snapshot, source, Some(&result.order_request.token_id))
+                resolve_exit_index(snapshot, &requested_key, Some(&result.order_request.token_id))
                     .ok_or_else(|| {
                         anyhow!(
                             "cannot sell asset {} for wallet {} without a matching position",
                             result.order_request.token_id,
-                            normalize_wallet(&source.proxy_wallet)
+                            requested_key.source_wallet
                         )
                     })?;
             let position = &mut snapshot.positions[index];
@@ -420,8 +508,21 @@ fn apply_position_fill(
                 position.state = PositionState::Closed;
                 snapshot.positions.remove(index);
             } else {
-                position.state = PositionState::Open;
-                position.closing_started_at = None;
+                let has_remaining_close_intent = result.filled_size < result.order_request.size
+                    || matches!(result.status, ExecutionStatus::PartiallyFilled);
+                if has_remaining_close_intent {
+                    position.state = PositionState::Closing;
+                    position.close_failure_reason = Some("partial_fill_remaining".to_owned());
+                } else {
+                    position.state = PositionState::Open;
+                    position.closing_started_at = None;
+                    position.closing_reason = None;
+                    position.last_close_attempt_at = None;
+                    position.close_attempts = 0;
+                    position.close_failure_reason = None;
+                    position.closing_escalation_level = 0;
+                    position.stale_reason = None;
+                }
             }
         }
     }
@@ -511,6 +612,12 @@ fn rehydrate_live_wallet_positions(snapshot: &mut PortfolioSnapshot, layout: &Po
             anonymous_position.source_trade_timestamp_unix = 0;
             anonymous_position.state = PositionState::Stale;
             anonymous_position.closing_started_at = None;
+            anonymous_position.closing_reason = None;
+            anonymous_position.last_close_attempt_at = None;
+            anonymous_position.close_attempts = 0;
+            anonymous_position.close_failure_reason = None;
+            anonymous_position.closing_escalation_level = 0;
+            anonymous_position.stale_reason = Some("stale_without_seen_exit".to_owned());
             merged.push(anonymous_position);
         }
     }
@@ -664,49 +771,38 @@ fn position_contract_key(condition_id: &str, outcome: &str) -> (String, String) 
 
 fn resolve_exit_index(
     snapshot: &PortfolioSnapshot,
-    source: &ActivityEntry,
+    requested_key: &PositionKey,
     asset_hint: Option<&str>,
 ) -> Option<(usize, bool)> {
-    let requested_key = source.position_key();
     if let Some(index) = snapshot
         .positions
         .iter()
-        .position(|position| position.is_active() && position.position_key() == requested_key)
+        .position(|position| position.is_active() && position.position_key() == *requested_key)
     {
         return Some((index, false));
     }
 
-    snapshot
+    let candidates = snapshot
         .positions
         .iter()
         .enumerate()
         .filter(|(_, position)| {
-            position.is_active() && position.condition_id == source.condition_id
+            position.is_active()
+                && position.condition_id == requested_key.condition_id
+                && normalize_wallet(&position.source_wallet) == requested_key.source_wallet
         })
-        .min_by_key(|(_, position)| {
-            let position_outcome = position.outcome.trim().to_ascii_uppercase();
-            let source_outcome = source.outcome.trim().to_ascii_uppercase();
-            let same_outcome = position_outcome == source_outcome;
-            let complementary_outcome = matches!(
-                (position_outcome.as_str(), source_outcome.as_str()),
-                ("YES", "NO") | ("NO", "YES")
-            );
-            let same_asset = asset_hint.is_some_and(|asset| position.asset == asset);
-            let same_wallet =
-                normalize_wallet(&position.source_wallet) == normalize_wallet(&source.proxy_wallet);
-            (
-                if same_outcome {
-                    0_u8
-                } else if complementary_outcome {
-                    1
-                } else {
-                    2
-                },
-                if same_asset { 0_u8 } else { 1 },
-                if same_wallet { 0_u8 } else { 1 },
-            )
-        })
-        .map(|(index, _)| (index, true))
+        .collect::<Vec<_>>();
+    if candidates.len() == 1 {
+        return Some((candidates[0].0, true));
+    }
+
+    asset_hint.and_then(|asset| {
+        let asset_matches = candidates
+            .into_iter()
+            .filter(|(_, position)| position.asset == asset)
+            .collect::<Vec<_>>();
+        (asset_matches.len() == 1).then_some((asset_matches[0].0, true))
+    })
 }
 
 #[cfg(test)]
@@ -812,6 +908,17 @@ mod tests {
             wallet_parser_workers: 1,
             wallet_subscription_batch_size: 250,
             wallet_subscription_delay: Duration::from_millis(20),
+            hot_path_mode: true,
+            hot_path_queue_capacity: 128,
+            cold_path_queue_capacity: 512,
+            attribution_fast_cache_capacity: 256,
+            persistence_flush_interval: Duration::from_millis(250),
+            analytics_flush_interval: Duration::from_millis(500),
+            telegram_async_only: true,
+            fast_risk_only_on_hot_path: true,
+            exit_priority_strict: true,
+            parse_tasks_market: 1,
+            parse_tasks_wallet: 1,
             liquidity_sweep_threshold: dec!(1),
             imbalance_threshold: dec!(2),
             delta_price_move_bps: 40,
@@ -865,6 +972,10 @@ mod tests {
             max_position_age_hours: 6,
             max_hold_time_seconds: 1_800,
             enable_exit_retry: true,
+            exit_retry_window: Duration::from_secs(30),
+            exit_retry_interval: Duration::from_millis(500),
+            closing_max_age: Duration::from_secs(30),
+            force_exit_on_closing_timeout: true,
             telegram_bot_token: "token".to_owned(),
             telegram_chat_id: "chat".to_owned(),
             health_port: 3000,
@@ -879,6 +990,7 @@ mod tests {
             &mut snapshot,
             &sample_activity("BUY"),
             &sample_result(ExecutionSide::Buy, dec!(10), dec!(0.4)),
+            None,
         )
         .expect("paper buy should succeed");
 
@@ -901,12 +1013,14 @@ mod tests {
             &mut snapshot,
             &sample_activity("BUY"),
             &sample_result(ExecutionSide::Buy, dec!(10), dec!(0.4)),
+            None,
         )
         .expect("paper buy should succeed");
         apply_paper_trade(
             &mut snapshot,
             &sample_activity("SELL"),
             &sample_result(ExecutionSide::Sell, dec!(4), dec!(0.6)),
+            None,
         )
         .expect("paper sell should succeed");
 
@@ -926,18 +1040,21 @@ mod tests {
             &mut snapshot,
             &sample_activity_with_wallet("BUY", "0xwallet-a"),
             &sample_result(ExecutionSide::Buy, dec!(10), dec!(0.4)),
+            None,
         )
         .expect("first buy should succeed");
         apply_paper_trade(
             &mut snapshot,
             &sample_activity_with_wallet("BUY", "0xwallet-b"),
             &sample_result(ExecutionSide::Buy, dec!(8), dec!(0.5)),
+            None,
         )
         .expect("second buy should succeed");
         apply_paper_trade(
             &mut snapshot,
             &sample_activity_with_wallet("SELL", "0xwallet-a"),
             &sample_result(ExecutionSide::Sell, dec!(4), dec!(0.6)),
+            None,
         )
         .expect("wallet-specific sell should succeed");
 
@@ -982,6 +1099,12 @@ mod tests {
                 opened_at: None,
                 source_trade_timestamp_unix: 0,
                 closing_started_at: None,
+                closing_reason: None,
+                last_close_attempt_at: None,
+                close_attempts: 0,
+                close_failure_reason: None,
+                closing_escalation_level: 0,
+                stale_reason: None,
             }],
         };
         let layout = PortfolioSnapshot {
@@ -1008,6 +1131,12 @@ mod tests {
                     opened_at: None,
                     source_trade_timestamp_unix: 0,
                     closing_started_at: None,
+                    closing_reason: None,
+                    last_close_attempt_at: None,
+                    close_attempts: 0,
+                    close_failure_reason: None,
+                    closing_escalation_level: 0,
+                    stale_reason: None,
                 },
                 PortfolioPosition {
                     asset: "asset-1".to_owned(),
@@ -1025,6 +1154,12 @@ mod tests {
                     opened_at: None,
                     source_trade_timestamp_unix: 0,
                     closing_started_at: None,
+                    closing_reason: None,
+                    last_close_attempt_at: None,
+                    close_attempts: 0,
+                    close_failure_reason: None,
+                    closing_escalation_level: 0,
+                    stale_reason: None,
                 },
             ],
         };
@@ -1072,6 +1207,12 @@ mod tests {
                 opened_at: None,
                 source_trade_timestamp_unix: 0,
                 closing_started_at: None,
+                closing_reason: None,
+                last_close_attempt_at: None,
+                close_attempts: 0,
+                close_failure_reason: None,
+                closing_escalation_level: 0,
+                stale_reason: None,
             }],
         };
         let layout = PortfolioSnapshot {
@@ -1097,6 +1238,12 @@ mod tests {
                 opened_at: None,
                 source_trade_timestamp_unix: 0,
                 closing_started_at: None,
+                closing_reason: None,
+                last_close_attempt_at: None,
+                close_attempts: 0,
+                close_failure_reason: None,
+                closing_escalation_level: 0,
+                stale_reason: None,
             }],
         };
 
@@ -1186,6 +1333,8 @@ mod tests {
                 },
                 Instant::now(),
                 Utc::now(),
+                Instant::now(),
+                Utc::now(),
             )
             .await
             .expect("snapshot");
@@ -1194,6 +1343,7 @@ mod tests {
             .apply_paper_fill(
                 &sample_activity("BUY"),
                 &sample_result(ExecutionSide::Buy, dec!(10), dec!(0.4)),
+                None,
             )
             .await
             .expect("paper fill");
@@ -1205,5 +1355,33 @@ mod tests {
         assert_eq!(refreshed.positions[0].unrealized_pnl, dec!(2.1));
         assert_eq!(refreshed.unrealized_pnl, dec!(2.1));
         assert_eq!(refreshed.total_value, dec!(202.1));
+    }
+
+    #[tokio::test]
+    async fn store_snapshot_flushes_in_background_without_blocking_cache_updates() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut settings = sample_settings(temp_dir.path().to_path_buf());
+        settings.persistence_flush_interval = Duration::from_millis(250);
+        let portfolio = PortfolioService::new(settings, None);
+        let snapshot = initial_paper_snapshot(dec!(200));
+
+        let stored = portfolio
+            .store_snapshot(snapshot.clone())
+            .await
+            .expect("store snapshot");
+
+        assert_eq!(stored.total_value, dec!(200));
+        assert_eq!(
+            portfolio
+                .snapshot()
+                .await
+                .expect("cached snapshot")
+                .total_value,
+            dec!(200)
+        );
+        assert!(!temp_dir.path().join("portfolio-summary.json").exists());
+
+        portfolio.flush_persistence().await.expect("flush persistence");
+        assert!(temp_dir.path().join("portfolio-summary.json").exists());
     }
 }

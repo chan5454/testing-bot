@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use tracing::warn;
 
 use crate::config::Settings;
@@ -14,6 +14,7 @@ use crate::detection::trade_inference::ConfirmedTradeSignal;
 use crate::log_retention::{RetentionOutcome, enforce_jsonl_retention};
 use crate::log_rotation::RotatingLogger;
 use crate::models::{ActivityEntry, HealthSnapshot};
+use crate::runtime::backpressure::RuntimeBackpressure;
 
 #[derive(Clone)]
 pub struct AttributionLogger {
@@ -21,10 +22,21 @@ pub struct AttributionLogger {
     path: PathBuf,
     rotating_logger: Option<Arc<Mutex<RotatingLogger>>>,
     write_lock: Arc<Mutex<()>>,
+    line_tx: Option<mpsc::Sender<Vec<u8>>>,
+    backpressure: RuntimeBackpressure,
 }
 
 impl AttributionLogger {
+    #[allow(dead_code)]
     pub fn new(settings: Settings) -> Self {
+        let backpressure = RuntimeBackpressure::new(
+            settings.hot_path_queue_capacity,
+            settings.cold_path_queue_capacity,
+        );
+        Self::with_backpressure(settings, backpressure)
+    }
+
+    pub fn with_backpressure(settings: Settings, backpressure: RuntimeBackpressure) -> Self {
         let rotating_logger = if settings.enable_log_rotation
             || settings.enable_time_rotation
             || settings.enable_log_clearing
@@ -56,11 +68,29 @@ impl AttributionLogger {
             None
         };
 
+        let path = settings.data_dir.join("attribution-events.jsonl");
+        let write_lock = Arc::new(Mutex::new(()));
+        let line_tx = if settings.log_attribution_events {
+            let (line_tx, line_rx) = mpsc::channel(settings.cold_path_queue_capacity.max(1));
+            spawn_writer(
+                line_rx,
+                path.clone(),
+                rotating_logger.clone(),
+                write_lock.clone(),
+                backpressure.clone(),
+            );
+            Some(line_tx)
+        } else {
+            None
+        };
+
         Self {
             enabled: settings.log_attribution_events,
-            path: settings.data_dir.join("attribution-events.jsonl"),
+            path,
             rotating_logger,
-            write_lock: Arc::new(Mutex::new(())),
+            write_lock,
+            line_tx,
+            backpressure,
         }
     }
 
@@ -310,42 +340,82 @@ impl AttributionLogger {
         if !self.enabled {
             return;
         }
-        if let Err(error) = self.write_event(event).await {
-            warn!(?error, event = label, "failed to persist attribution event");
+        if self.backpressure.should_shed_diagnostics() {
+            self.backpressure.note_diagnostic_drop();
+            return;
+        }
+        match serde_json::to_vec(event) {
+            Ok(line) => self.enqueue_line(line, label).await,
+            Err(error) => warn!(?error, event = label, "failed to encode attribution event"),
         }
     }
 
-    async fn write_event<T>(&self, event: &T) -> Result<()>
-    where
-        T: Serialize,
-    {
-        if !self.enabled {
-            return Ok(());
+    async fn enqueue_line(&self, line: Vec<u8>, label: &'static str) {
+        let Some(line_tx) = &self.line_tx else {
+            return;
+        };
+        self.backpressure.increment_cold_path_depth();
+        match line_tx.try_send(line) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+            | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.backpressure.decrement_cold_path_depth();
+                self.backpressure.note_diagnostic_drop();
+                warn!(event = label, "dropping attribution event due to cold-path backpressure");
+            }
         }
-
-        if let Some(logger) = &self.rotating_logger {
-            let line = serde_json::to_string(event)?;
-            let mut logger = logger.lock().await;
-            logger.write_line(&line)?;
-            return Ok(());
-        }
-
-        let _guard = self.write_lock.lock().await;
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .await
-            .with_context(|| format!("opening {}", self.path.display()))?;
-        let line = serde_json::to_string(event)?;
-        file.write_all(line.as_bytes())
-            .await
-            .with_context(|| format!("writing {}", self.path.display()))?;
-        file.write_all(b"\n")
-            .await
-            .with_context(|| format!("writing newline to {}", self.path.display()))?;
-        Ok(())
     }
+}
+
+fn spawn_writer(
+    mut line_rx: mpsc::Receiver<Vec<u8>>,
+    path: PathBuf,
+    rotating_logger: Option<Arc<Mutex<RotatingLogger>>>,
+    write_lock: Arc<Mutex<()>>,
+    backpressure: RuntimeBackpressure,
+) {
+    tokio::spawn(async move {
+        while let Some(line) = line_rx.recv().await {
+            if let Err(error) = write_line(&path, rotating_logger.as_ref(), &write_lock, &line).await
+            {
+                warn!(?error, "failed to persist attribution event");
+            }
+            backpressure.decrement_cold_path_depth();
+        }
+    });
+}
+
+async fn write_line(
+    path: &PathBuf,
+    rotating_logger: Option<&Arc<Mutex<RotatingLogger>>>,
+    write_lock: &Arc<Mutex<()>>,
+    line: &[u8],
+) -> Result<()> {
+    if let Some(logger) = rotating_logger {
+        let mut logger = logger.lock().await;
+        logger.write_line(&String::from_utf8_lossy(line))?;
+        return Ok(());
+    }
+
+    let _guard = write_lock.lock().await;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+        .with_context(|| format!("opening {}", path.display()))?;
+    file.write_all(line)
+        .await
+        .with_context(|| format!("writing {}", path.display()))?;
+    file.write_all(b"\n")
+        .await
+        .with_context(|| format!("writing newline to {}", path.display()))?;
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -547,6 +617,17 @@ mod tests {
             wallet_parser_workers: 1,
             wallet_subscription_batch_size: 250,
             wallet_subscription_delay: std::time::Duration::from_millis(20),
+            hot_path_mode: true,
+            hot_path_queue_capacity: 128,
+            cold_path_queue_capacity: 512,
+            attribution_fast_cache_capacity: 256,
+            persistence_flush_interval: std::time::Duration::from_millis(250),
+            analytics_flush_interval: std::time::Duration::from_millis(500),
+            telegram_async_only: true,
+            fast_risk_only_on_hot_path: true,
+            exit_priority_strict: true,
+            parse_tasks_market: 1,
+            parse_tasks_wallet: 1,
             liquidity_sweep_threshold: dec!(1),
             imbalance_threshold: dec!(2),
             delta_price_move_bps: 40,
@@ -600,6 +681,10 @@ mod tests {
             max_position_age_hours: 6,
             max_hold_time_seconds: 1_800,
             enable_exit_retry: true,
+            exit_retry_window: Duration::from_secs(30),
+            exit_retry_interval: Duration::from_millis(500),
+            closing_max_age: Duration::from_secs(30),
+            force_exit_on_closing_timeout: true,
             telegram_bot_token: "token".to_owned(),
             telegram_chat_id: "chat".to_owned(),
             health_port: 3000,
@@ -620,8 +705,14 @@ mod tests {
             stage_timestamps: TradeStageTimestamps {
                 websocket_event_received_at: instant,
                 websocket_event_received_at_utc: now,
+                parse_completed_at: instant,
+                parse_completed_at_utc: now,
                 detection_triggered_at: instant,
                 detection_triggered_at_utc: now,
+                attribution_completed_at: Some(instant),
+                attribution_completed_at_utc: Some(now),
+                fast_risk_completed_at: Some(instant),
+                fast_risk_completed_at_utc: Some(now),
             },
             confirmed_at: now,
             generation: 7,
@@ -664,6 +755,7 @@ mod tests {
                 Some("direct"),
             )
             .await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         let contents =
             tokio::fs::read_to_string(temp_dir.path().join("attribution-events_0.jsonl"))
@@ -691,6 +783,11 @@ mod tests {
                     last_execution_ms: 99,
                     last_total_latency_ms: 141,
                     average_latency_ms: 140,
+                    hot_entry_queue_depth: 0,
+                    hot_exit_queue_depth: 0,
+                    cold_path_queue_depth: 0,
+                    dropped_diagnostics: 0,
+                    degradation_mode: false,
                     last_skip_processing_ms: 17,
                     last_skip_reason_code: None,
                     trading_paused: false,
@@ -711,6 +808,7 @@ mod tests {
                 Some(1200),
             )
             .await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         let contents =
             tokio::fs::read_to_string(temp_dir.path().join("attribution-events_0.jsonl"))

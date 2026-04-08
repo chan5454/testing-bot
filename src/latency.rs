@@ -6,13 +6,14 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::config::Settings;
 use crate::execution::{ExecutionRequest, ExecutionSuccess};
 use crate::latency_monitor::LatencyMeasurement;
 use crate::log_retention::{RetentionOutcome, enforce_jsonl_retention};
 use crate::models::{ActivityEntry, TradeStageTimestamps};
+use crate::runtime::backpressure::RuntimeBackpressure;
 use crate::risk::SkipReason;
 
 const TIMESTAMP_MILLIS_THRESHOLD: i64 = 10_000_000_000;
@@ -23,15 +24,37 @@ pub struct LatencyLogger {
     execution_mode: String,
     path: PathBuf,
     write_lock: Arc<Mutex<()>>,
+    line_tx: Option<mpsc::Sender<Vec<u8>>>,
+    backpressure: RuntimeBackpressure,
 }
 
 impl LatencyLogger {
+    #[allow(dead_code)]
     pub fn new(settings: Settings) -> Self {
+        let backpressure = RuntimeBackpressure::new(
+            settings.hot_path_queue_capacity,
+            settings.cold_path_queue_capacity,
+        );
+        Self::with_backpressure(settings, backpressure)
+    }
+
+    pub fn with_backpressure(settings: Settings, backpressure: RuntimeBackpressure) -> Self {
+        let path = settings.data_dir.join("latency-events.jsonl");
+        let write_lock = Arc::new(Mutex::new(()));
+        let line_tx = if settings.log_latency_events {
+            let (line_tx, line_rx) = mpsc::channel(settings.cold_path_queue_capacity.max(1));
+            spawn_writer(line_rx, path.clone(), write_lock.clone(), backpressure.clone());
+            Some(line_tx)
+        } else {
+            None
+        };
         Self {
             enabled: settings.log_latency_events,
             execution_mode: settings.execution_mode.as_str().to_owned(),
-            path: settings.data_dir.join("latency-events.jsonl"),
-            write_lock: Arc::new(Mutex::new(())),
+            path,
+            write_lock,
+            line_tx,
+            backpressure,
         }
     }
 
@@ -50,6 +73,8 @@ impl LatencyLogger {
         }
 
         let source_timestamp = source_timestamp_metadata(source.timestamp)?;
+        let order_submit_started_at =
+            submission_completed_at - chrono::TimeDelta::milliseconds(submit_order_ms as i64);
         let event = ProcessedTradeLatencyEvent {
             event_type: "processed_trade",
             execution_mode: result.mode.as_str().to_owned(),
@@ -57,8 +82,15 @@ impl LatencyLogger {
             source_trade_timestamp_unix: source_timestamp.value,
             source_timestamp_resolution: source_timestamp.resolution,
             websocket_event_received_at: stage_timestamps.websocket_event_received_at_utc,
+            parse_completed_at: stage_timestamps.parse_completed_at_utc,
             trade_detected_at: stage_timestamps.detection_triggered_at_utc,
+            attribution_completed_at: stage_timestamps.attribution_completed_at_utc,
+            fast_risk_completed_at: stage_timestamps.fast_risk_completed_at_utc,
+            order_submit_started_at,
             submission_completed_at,
+            websocket_to_parse_ms: stage_timestamps.parse_latency_ms(),
+            parse_to_attribution_ms: stage_timestamps.attribution_latency_ms(),
+            attribution_to_fast_risk_ms: stage_timestamps.fast_risk_latency_ms(),
             source_to_detection_ms: stage_timestamps
                 .detection_triggered_at_utc
                 .signed_duration_since(source_timestamp.at)
@@ -114,8 +146,14 @@ impl LatencyLogger {
             source_trade_timestamp_unix: source_timestamp.value,
             source_timestamp_resolution: source_timestamp.resolution,
             websocket_event_received_at: stage_timestamps.websocket_event_received_at_utc,
+            parse_completed_at: stage_timestamps.parse_completed_at_utc,
             trade_detected_at: stage_timestamps.detection_triggered_at_utc,
+            attribution_completed_at: stage_timestamps.attribution_completed_at_utc,
+            fast_risk_completed_at: stage_timestamps.fast_risk_completed_at_utc,
             skipped_at,
+            websocket_to_parse_ms: stage_timestamps.parse_latency_ms(),
+            parse_to_attribution_ms: stage_timestamps.attribution_latency_ms(),
+            attribution_to_fast_risk_ms: stage_timestamps.fast_risk_latency_ms(),
             source_to_detection_ms: stage_timestamps
                 .detection_triggered_at_utc
                 .signed_duration_since(source_timestamp.at)
@@ -164,9 +202,21 @@ impl LatencyLogger {
             event_type: "prediction_validation",
             execution_mode: self.execution_mode.clone(),
             market_event_at,
+            parse_completed_at: signal.stage_timestamps.parse_completed_at_utc,
             trade_detected_at: signal.stage_timestamps.detection_triggered_at_utc,
+            attribution_completed_at: signal.stage_timestamps.attribution_completed_at_utc,
+            fast_risk_completed_at: signal.stage_timestamps.fast_risk_completed_at_utc,
             submission_completed_at,
             confirmation_received_at,
+            market_to_parse_ms: signal.stage_timestamps.parse_latency_ms() as i64,
+            parse_to_attribution_ms: signal
+                .stage_timestamps
+                .attribution_latency_ms()
+                .map(|value| value as i64),
+            attribution_to_fast_risk_ms: signal
+                .stage_timestamps
+                .fast_risk_latency_ms()
+                .map(|value| value as i64),
             market_to_detection_ms: signal
                 .stage_timestamps
                 .detection_triggered_at_utc
@@ -210,23 +260,64 @@ impl LatencyLogger {
         if !self.enabled {
             return Ok(());
         }
+        if self.backpressure.should_shed_diagnostics() {
+            self.backpressure.note_diagnostic_drop();
+            return Ok(());
+        }
 
-        let _guard = self.write_lock.lock().await;
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .await
-            .with_context(|| format!("opening {}", self.path.display()))?;
-        let line = serde_json::to_string(event)?;
-        file.write_all(line.as_bytes())
-            .await
-            .with_context(|| format!("writing {}", self.path.display()))?;
-        file.write_all(b"\n")
-            .await
-            .with_context(|| format!("writing newline to {}", self.path.display()))?;
-        Ok(())
+        let line = serde_json::to_vec(event)?;
+        let Some(line_tx) = &self.line_tx else {
+            return write_line(&self.path, &self.write_lock, &line).await;
+        };
+        self.backpressure.increment_cold_path_depth();
+        match line_tx.try_send(line) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+            | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.backpressure.decrement_cold_path_depth();
+                self.backpressure.note_diagnostic_drop();
+                Ok(())
+            }
+        }
     }
+}
+
+fn spawn_writer(
+    mut line_rx: mpsc::Receiver<Vec<u8>>,
+    path: PathBuf,
+    write_lock: Arc<Mutex<()>>,
+    backpressure: RuntimeBackpressure,
+) {
+    tokio::spawn(async move {
+        while let Some(line) = line_rx.recv().await {
+            if let Err(error) = write_line(&path, &write_lock, &line).await {
+                tracing::warn!(?error, "failed to persist latency event");
+            }
+            backpressure.decrement_cold_path_depth();
+        }
+    });
+}
+
+async fn write_line(path: &PathBuf, write_lock: &Arc<Mutex<()>>, line: &[u8]) -> Result<()> {
+    let _guard = write_lock.lock().await;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+        .with_context(|| format!("opening {}", path.display()))?;
+    file.write_all(line)
+        .await
+        .with_context(|| format!("writing {}", path.display()))?;
+    file.write_all(b"\n")
+        .await
+        .with_context(|| format!("writing newline to {}", path.display()))?;
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -237,8 +328,15 @@ struct ProcessedTradeLatencyEvent {
     source_trade_timestamp_unix: i64,
     source_timestamp_resolution: &'static str,
     websocket_event_received_at: DateTime<Utc>,
+    parse_completed_at: DateTime<Utc>,
     trade_detected_at: DateTime<Utc>,
+    attribution_completed_at: Option<DateTime<Utc>>,
+    fast_risk_completed_at: Option<DateTime<Utc>>,
+    order_submit_started_at: DateTime<Utc>,
     submission_completed_at: DateTime<Utc>,
+    websocket_to_parse_ms: u64,
+    parse_to_attribution_ms: Option<u64>,
+    attribution_to_fast_risk_ms: Option<u64>,
     source_to_detection_ms: i64,
     websocket_to_detection_ms: u64,
     detection_to_submission_ms: u64,
@@ -272,8 +370,14 @@ struct SkippedTradeLatencyEvent {
     source_trade_timestamp_unix: i64,
     source_timestamp_resolution: &'static str,
     websocket_event_received_at: DateTime<Utc>,
+    parse_completed_at: DateTime<Utc>,
     trade_detected_at: DateTime<Utc>,
+    attribution_completed_at: Option<DateTime<Utc>>,
+    fast_risk_completed_at: Option<DateTime<Utc>>,
     skipped_at: DateTime<Utc>,
+    websocket_to_parse_ms: u64,
+    parse_to_attribution_ms: Option<u64>,
+    attribution_to_fast_risk_ms: Option<u64>,
     source_to_detection_ms: i64,
     websocket_to_detection_ms: u64,
     detection_to_skip_ms: u64,
@@ -303,9 +407,15 @@ struct PredictionValidationLatencyEvent {
     event_type: &'static str,
     execution_mode: String,
     market_event_at: DateTime<Utc>,
+    parse_completed_at: DateTime<Utc>,
     trade_detected_at: DateTime<Utc>,
+    attribution_completed_at: Option<DateTime<Utc>>,
+    fast_risk_completed_at: Option<DateTime<Utc>>,
     submission_completed_at: DateTime<Utc>,
     confirmation_received_at: DateTime<Utc>,
+    market_to_parse_ms: i64,
+    parse_to_attribution_ms: Option<i64>,
+    attribution_to_fast_risk_ms: Option<i64>,
     market_to_detection_ms: i64,
     market_to_execution_ms: i64,
     execution_to_confirmation_ms: i64,
@@ -401,17 +511,36 @@ mod tests {
     }
 
     fn sample_stage_timestamps() -> TradeStageTimestamps {
+        let websocket_event_received_at = Instant::now();
+        let parse_completed_at = websocket_event_received_at + Duration::from_millis(25);
+        let detection_triggered_at = websocket_event_received_at + Duration::from_millis(50);
+        let attribution_completed_at = parse_completed_at;
+        let fast_risk_completed_at = websocket_event_received_at + Duration::from_millis(100);
+        let parse_completed_at_utc = Utc
+            .timestamp_opt(1_773_673_035, 975_000_000)
+            .single()
+            .expect("parse time");
+        let fast_risk_completed_at_utc = Utc
+            .timestamp_opt(1_773_673_036, 50_000_000)
+            .single()
+            .expect("fast risk time");
         TradeStageTimestamps {
-            websocket_event_received_at: Instant::now(),
+            websocket_event_received_at,
             websocket_event_received_at_utc: Utc
                 .timestamp_opt(1_773_673_035, 950_000_000)
                 .single()
                 .expect("ws time"),
-            detection_triggered_at: Instant::now(),
+            parse_completed_at,
+            parse_completed_at_utc,
+            detection_triggered_at,
             detection_triggered_at_utc: Utc
                 .timestamp_opt(1_773_673_036, 0)
                 .single()
                 .expect("detection time"),
+            attribution_completed_at: Some(attribution_completed_at),
+            attribution_completed_at_utc: Some(parse_completed_at_utc),
+            fast_risk_completed_at: Some(fast_risk_completed_at),
+            fast_risk_completed_at_utc: Some(fast_risk_completed_at_utc),
         }
     }
 
@@ -423,6 +552,8 @@ mod tests {
             execution_mode: ExecutionMode::Paper.as_str().to_owned(),
             path: temp_dir.path().join("latency-events.jsonl"),
             write_lock: Arc::new(Mutex::new(())),
+            line_tx: None,
+            backpressure: RuntimeBackpressure::default(),
         };
 
         logger
@@ -448,6 +579,9 @@ mod tests {
             .await
             .expect("read latency log");
         assert!(contents.contains("\"source_to_submission_ms\":11200"));
+        assert!(contents.contains("\"websocket_to_parse_ms\":25"));
+        assert!(contents.contains("\"parse_to_attribution_ms\":0"));
+        assert!(contents.contains("\"order_submit_started_at\""));
         assert!(contents.contains("\"websocket_to_detection_ms\":50"));
         assert!(contents.contains("\"detection_to_submission_ms\":181"));
     }
@@ -460,6 +594,8 @@ mod tests {
             execution_mode: ExecutionMode::Paper.as_str().to_owned(),
             path: temp_dir.path().join("latency-events.jsonl"),
             write_lock: Arc::new(Mutex::new(())),
+            line_tx: None,
+            backpressure: RuntimeBackpressure::default(),
         };
 
         logger
@@ -479,6 +615,7 @@ mod tests {
             .await
             .expect("read latency log");
         assert!(contents.contains("\"event_type\":\"skipped_trade\""));
+        assert!(contents.contains("\"parse_completed_at\""));
         assert!(contents.contains("\"detection_to_skip_ms\":120"));
         assert!(contents.contains("\"skip_reason_code\":\"market_spread_exceeded\""));
     }
@@ -491,6 +628,8 @@ mod tests {
             execution_mode: ExecutionMode::Paper.as_str().to_owned(),
             path: temp_dir.path().join("latency-events.jsonl"),
             write_lock: Arc::new(Mutex::new(())),
+            line_tx: None,
+            backpressure: RuntimeBackpressure::default(),
         };
         let mut source = sample_source();
         source.timestamp = 1_773_673_025_950;
@@ -523,6 +662,8 @@ mod tests {
             execution_mode: ExecutionMode::Paper.as_str().to_owned(),
             path: temp_dir.path().join("latency-events.jsonl"),
             write_lock: Arc::new(Mutex::new(())),
+            line_tx: None,
+            backpressure: RuntimeBackpressure::default(),
         };
         let stage_timestamps = sample_stage_timestamps();
         let signal = crate::detection::trade_inference::ConfirmedTradeSignal {
@@ -560,8 +701,53 @@ mod tests {
         let contents = tokio::fs::read_to_string(temp_dir.path().join("latency-events.jsonl"))
             .await
             .expect("read latency log");
+        assert!(contents.contains("\"market_to_parse_ms\":25"));
         assert!(contents.contains("\"event_type\":\"prediction_validation\""));
         assert!(contents.contains("\"market_to_execution_ms\":250"));
         assert!(contents.contains("\"execution_to_confirmation_ms\":120"));
+    }
+
+    #[tokio::test]
+    async fn cold_path_overflow_drops_diagnostics_without_blocking() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let (tx, _held_rx) = mpsc::channel(1);
+        let backpressure = RuntimeBackpressure::new(8, 1);
+        let logger = LatencyLogger {
+            enabled: true,
+            execution_mode: ExecutionMode::Paper.as_str().to_owned(),
+            path: temp_dir.path().join("latency-events.jsonl"),
+            write_lock: Arc::new(Mutex::new(())),
+            line_tx: Some(tx),
+            backpressure: backpressure.clone(),
+        };
+
+        logger
+            .record_skipped_trade(
+                &sample_source(),
+                &sample_stage_timestamps(),
+                Utc.timestamp_opt(1_773_673_036, 120_000_000)
+                    .single()
+                    .expect("skipped time"),
+                120,
+                &SkipReason::new("market_spread_exceeded", "spread too wide"),
+            )
+            .await
+            .expect("first queueing succeeds");
+        logger
+            .record_skipped_trade(
+                &sample_source(),
+                &sample_stage_timestamps(),
+                Utc.timestamp_opt(1_773_673_036, 120_000_000)
+                    .single()
+                    .expect("skipped time"),
+                120,
+                &SkipReason::new("market_spread_exceeded", "spread too wide"),
+            )
+            .await
+            .expect("overflow is dropped");
+
+        let snapshot = backpressure.snapshot();
+        assert_eq!(snapshot.dropped_diagnostics, 1);
+        assert_eq!(snapshot.cold_path_queue_depth, 1);
     }
 }

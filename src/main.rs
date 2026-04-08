@@ -1,6 +1,8 @@
+mod attribution_fast;
 mod attribution_logger;
 mod config;
 mod detection;
+mod exits;
 mod execution;
 mod health;
 mod latency;
@@ -27,12 +29,14 @@ mod websocket;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use attribution_logger::AttributionLogger;
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use detection::trade_inference::ConfirmedTradeSignal;
+use exits::resolution::{ExitResolutionBuffer, SourceExitResolution};
 use execution::{
     ExecutionRequest, ExecutionSide, ExecutionStatus, ExecutionSuccess, TradeExecutor,
 };
@@ -52,7 +56,7 @@ use risk::{CopyDecision, RiskEngine, SkipReason};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 use tracing::{error, info, warn};
 use wallet::activity_stream::{ActivityCommand, WalletActivityStream};
@@ -66,6 +70,8 @@ use websocket::stream_router::StreamRouterHandle;
 use crate::config::Settings;
 use crate::health::{HealthState, spawn_health_server};
 use crate::runtime::control::RuntimeControl;
+use crate::runtime::backpressure::RuntimeBackpressure;
+use crate::runtime::hot_path::{HotPathEnqueue, HotPathQueue, HotPathTaskKind};
 use crate::storage::StateStore;
 
 const MAX_EXECUTION_SIGNAL_KEYS: usize = 4096;
@@ -76,8 +82,6 @@ const QUOTE_RETRY_ATTEMPTS: usize = 2;
 const QUOTE_SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(250);
 const HIGH_CONFIDENCE_QUOTE_FALLBACK_THRESHOLD: f64 = 0.90;
 const LIVE_POST_TRADE_REFRESH_DELAY: Duration = Duration::from_millis(350);
-const EXIT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
-const EXIT_RETRY_WINDOW: Duration = Duration::from_secs(3);
 const EXIT_MANAGER_SWEEP_INTERVAL: Duration = Duration::from_millis(200);
 const EMERGENCY_EXIT_STAGE_TWO_AFTER: Duration = Duration::from_secs(3);
 const EMERGENCY_EXIT_STAGE_THREE_AFTER: Duration = Duration::from_secs(6);
@@ -95,6 +99,8 @@ struct ExecutionAnalyticsTracker {
     path: PathBuf,
     start_capital_usd: Decimal,
     state: Arc<Mutex<ExecutionAnalyticsState>>,
+    dirty: Arc<AtomicBool>,
+    flush_notify: Arc<Notify>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,11 +137,15 @@ impl ExecutionAnalyticsTracker {
             Err(error) => return Err(error.into()),
         };
 
-        Ok(Self {
+        let tracker = Self {
             path,
             start_capital_usd: settings.start_capital_usd,
             state: Arc::new(Mutex::new(state)),
-        })
+            dirty: Arc::new(AtomicBool::new(false)),
+            flush_notify: Arc::new(Notify::new()),
+        };
+        tracker.spawn_flusher(settings.analytics_flush_interval);
+        Ok(tracker)
     }
 
     async fn record_skip(
@@ -199,6 +209,7 @@ impl ExecutionAnalyticsTracker {
         entry: &ActivityEntry,
         result: &ExecutionSuccess,
         portfolio: Option<&models::PortfolioSnapshot>,
+        position_key: Option<&PositionKey>,
     ) {
         let snapshot = {
             let mut state = self.state.lock().await;
@@ -232,13 +243,53 @@ impl ExecutionAnalyticsTracker {
                 SourceTradeClass::EligibleExit => {
                     state.eligible_exit_events += 1;
                     state.processed_exit_events += 1;
-                    apply_exit_to_trade_cohorts(&mut state.cohorts, entry, result);
+                    apply_exit_to_trade_cohorts(
+                        &mut state.cohorts,
+                        position_key.unwrap_or(&entry.position_key()),
+                        result,
+                    );
                 }
                 SourceTradeClass::OrphanExit
                 | SourceTradeClass::EntryRejected
                 | SourceTradeClass::ExitRejected => {}
             }
             recompute_analytics_rates(&mut state);
+            if let Some(portfolio) = portfolio {
+                refresh_analytics_from_portfolio(&mut state, portfolio, self.start_capital_usd);
+            }
+            state.clone()
+        };
+        self.persist_snapshot(snapshot);
+    }
+
+    async fn record_exit_event(
+        &self,
+        event_name: &str,
+        portfolio: Option<&models::PortfolioSnapshot>,
+    ) {
+        let snapshot = {
+            let mut state = self.state.lock().await;
+            state.summary_generated_at = Utc::now();
+            state.trade_day = Utc::now().date_naive().to_string();
+            increment_string_counter(&mut state.exit_event_counts, event_name);
+            if let Some(portfolio) = portfolio {
+                refresh_analytics_from_portfolio(&mut state, portfolio, self.start_capital_usd);
+            }
+            state.clone()
+        };
+        self.persist_snapshot(snapshot);
+    }
+
+    async fn record_close_failure_reason(
+        &self,
+        reason: &str,
+        portfolio: Option<&models::PortfolioSnapshot>,
+    ) {
+        let snapshot = {
+            let mut state = self.state.lock().await;
+            state.summary_generated_at = Utc::now();
+            state.trade_day = Utc::now().date_naive().to_string();
+            increment_string_counter(&mut state.close_failed_by_reason, reason);
             if let Some(portfolio) = portfolio {
                 refresh_analytics_from_portfolio(&mut state, portfolio, self.start_capital_usd);
             }
@@ -260,15 +311,39 @@ impl ExecutionAnalyticsTracker {
     }
 
     fn persist_snapshot(&self, snapshot: ExecutionAnalyticsState) {
+        drop(snapshot);
+        self.dirty.store(true, Ordering::Relaxed);
+        self.flush_notify.notify_one();
+    }
+
+    fn spawn_flusher(&self, flush_interval: Duration) {
         let path = self.path.clone();
+        let state = self.state.clone();
+        let dirty = self.dirty.clone();
+        let flush_notify = self.flush_notify.clone();
         tokio::spawn(async move {
-            match serde_json::to_string_pretty(&snapshot) {
-                Ok(body) => {
-                    if let Err(error) = tokio::fs::write(&path, body).await {
-                        warn!(?error, path = %path.display(), "failed to persist execution analytics summary");
-                    }
+            let mut ticker = interval(flush_interval.max(Duration::from_millis(50)));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = flush_notify.notified() => {}
                 }
-                Err(error) => warn!(?error, "failed to encode execution analytics summary"),
+
+                if !dirty.swap(false, Ordering::Relaxed) {
+                    continue;
+                }
+
+                let snapshot = state.lock().await.clone();
+                match serde_json::to_string_pretty(&snapshot) {
+                    Ok(body) => {
+                        if let Err(error) = tokio::fs::write(&path, body).await {
+                            warn!(?error, path = %path.display(), "failed to persist execution analytics summary");
+                        }
+                    }
+                    Err(error) => warn!(?error, "failed to encode execution analytics summary"),
+                }
             }
         });
     }
@@ -281,6 +356,10 @@ fn recompute_analytics_rates(state: &mut ExecutionAnalyticsState) {
     state.executable_entry_copy_rate =
         ratio_decimal(state.processed_entry_events, state.eligible_entry_events);
     state.executable_total_copy_rate = ratio_decimal(processed_total, eligible_total);
+}
+
+fn increment_string_counter(map: &mut BTreeMap<String, u64>, key: impl Into<String>) {
+    *map.entry(key.into()).or_insert(0) += 1;
 }
 
 fn refresh_analytics_from_portfolio(
@@ -302,6 +381,7 @@ fn refresh_analytics_from_portfolio(
     state.pnl_all_open_positions = Decimal::ZERO;
     state.pnl_by_source_wallet = BTreeMap::new();
     state.pnl_by_trade_day = BTreeMap::new();
+    state.stale_position_counts = BTreeMap::new();
     state.current_window_trade_count = 0;
     state.winning_current_window_trades = 0;
     state.losing_current_window_trades = 0;
@@ -346,6 +426,20 @@ fn refresh_analytics_from_portfolio(
                 state.losing_current_window_trades += 1;
             }
         }
+    }
+
+    for position in portfolio
+        .positions
+        .iter()
+        .filter(|position| position.state == models::PositionState::Stale)
+    {
+        increment_string_counter(
+            &mut state.stale_position_counts,
+            position
+                .stale_reason
+                .clone()
+                .unwrap_or_else(|| "stale_without_seen_exit".to_owned()),
+        );
     }
 
     state.current_window_win_rate = ratio_decimal(
@@ -394,13 +488,12 @@ fn refresh_open_cohort_marks(cohorts: &mut [TradeCohort], portfolio: &models::Po
 
 fn apply_exit_to_trade_cohorts(
     cohorts: &mut [TradeCohort],
-    entry: &ActivityEntry,
+    position_key: &PositionKey,
     result: &ExecutionSuccess,
 ) {
     let mut remaining_size = result.filled_size;
-    let exit_key = entry.position_key();
     for cohort in cohorts.iter_mut().filter(|cohort| {
-        cohort.status == TradeCohortStatus::Open && cohort_position_key(cohort) == exit_key
+        cohort.status == TradeCohortStatus::Open && cohort_position_key(cohort) == *position_key
     }) {
         if remaining_size <= Decimal::ZERO {
             break;
@@ -495,7 +588,10 @@ async fn main() -> Result<()> {
         && settings.target_activity_ws_secret.is_some()
         && settings.target_activity_ws_passphrase.is_some();
 
-    let state_store = Arc::new(StateStore::load(&settings.data_dir).await?);
+    let state_store = Arc::new(
+        StateStore::load_with_flush(&settings.data_dir, settings.persistence_flush_interval)
+            .await?,
+    );
     if settings.copy_only_new_trades {
         info!("websocket-only activity mode skips REST startup priming");
     }
@@ -510,15 +606,29 @@ async fn main() -> Result<()> {
     let health = Arc::new(HealthState::new(settings.execution_mode));
     health.mark_ready(false).await;
     let runtime_control = Arc::new(RuntimeControl::new(false));
+    let backpressure = RuntimeBackpressure::new(
+        settings.hot_path_queue_capacity,
+        settings.cold_path_queue_capacity,
+    );
 
     let notifier = Arc::new(TelegramNotifier::new(settings.clone()));
-    let attribution_logger = Arc::new(AttributionLogger::new(settings.clone()));
-    let latency_logger = Arc::new(LatencyLogger::new(settings.clone()));
-    let raw_activity_logger = Arc::new(RawActivityLogger::new(&settings));
+    let attribution_logger = Arc::new(AttributionLogger::with_backpressure(
+        settings.clone(),
+        backpressure.clone(),
+    ));
+    let latency_logger = Arc::new(LatencyLogger::with_backpressure(
+        settings.clone(),
+        backpressure.clone(),
+    ));
+    let raw_activity_logger = Arc::new(RawActivityLogger::with_backpressure(
+        &settings,
+        backpressure.clone(),
+    ));
     let wallet_activity_logger = WalletActivityLogger::new(&settings);
     let wallet_score_logger = WalletScoreLogger::new(&settings);
     let latency_monitor = Arc::new(LatencyMonitor::new(&settings));
     let analytics = Arc::new(ExecutionAnalyticsTracker::load_or_new(&settings).await?);
+    let exit_resolution = Arc::new(ExitResolutionBuffer::load(&settings)?);
     attribution_logger
         .record_runtime_started(&settings, user_stream_enabled)
         .await;
@@ -552,6 +662,12 @@ async fn main() -> Result<()> {
         settings.clone(),
         Some(orderbooks.clone()),
     ));
+    let (hot_path_queue, hot_path_rx) = HotPathQueue::new(
+        settings.hot_path_queue_capacity,
+        settings.exit_priority_strict,
+        backpressure.clone(),
+    );
+    let (hot_path_result_tx, mut hot_path_result_rx) = mpsc::unbounded_channel();
     let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
     let (matched_trade_tx, mut matched_trade_rx) = mpsc::unbounded_channel();
     let activity_stream = WalletActivityStream::spawn(
@@ -596,7 +712,15 @@ async fn main() -> Result<()> {
     warm_start(&portfolio, &health, &position_registry).await;
     if let Some(snapshot) = portfolio.snapshot().await {
         analytics.sync_with_portfolio(&snapshot).await;
-        if let Err(error) = notifier.send_startup_summary(&snapshot).await {
+        if notifier.async_only() {
+            let notifier = notifier.clone();
+            let snapshot = snapshot.clone();
+            tokio::spawn(async move {
+                if let Err(error) = notifier.send_startup_summary(&snapshot).await {
+                    warn!(?error, "failed to send startup daily portfolio summary");
+                }
+            });
+        } else if let Err(error) = notifier.send_startup_summary(&snapshot).await {
             warn!(?error, "failed to send startup daily portfolio summary");
         }
     }
@@ -626,6 +750,30 @@ async fn main() -> Result<()> {
         latency_logger.clone(),
         raw_activity_logger.clone(),
     ));
+    tokio::spawn(spawn_backpressure_sampler(
+        backpressure.clone(),
+        health.clone(),
+        Duration::from_millis(100),
+    ));
+    if settings.hot_path_mode {
+        tokio::spawn(run_hot_path_executor(
+            hot_path_rx,
+            hot_path_result_tx,
+            risk.clone(),
+            portfolio.clone(),
+            position_registry.clone(),
+            exit_resolution.clone(),
+            executor.clone(),
+            orderbooks.clone(),
+            latency_logger.clone(),
+            latency_monitor.clone(),
+            notifier.clone(),
+            health.clone(),
+            runtime_control.clone(),
+            analytics.clone(),
+            closing_positions.clone(),
+        ));
+    }
 
     health.mark_ready(true).await;
     info!(mode = %settings.execution_mode, "copy bot started");
@@ -633,6 +781,8 @@ async fn main() -> Result<()> {
     let mut pending_signal_deduper = ExecutionSignalDeduper::default();
     let mut matched_trade_deduper = MatchedTradeDeduper::default();
     let mut pending_validations = PendingPredictionTracker::default();
+    let mut inflight_predictions = HashSet::<String>::new();
+    let mut deferred_direct_matches = HashMap::<String, MatchedTrackedTrade>::new();
     let mut trade_rate_limiter = TradeRateLimiter::default();
     let mut validation_ticker = interval(PREDICTION_VALIDATION_SWEEP_INTERVAL);
     validation_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -718,7 +868,7 @@ async fn main() -> Result<()> {
                         continue;
                     };
 
-                    if !trade_rate_limiter.try_claim(Instant::now()) {
+                    let Some(claim_id) = trade_rate_limiter.try_claim(Instant::now()) else {
                         attribution_logger
                             .record_signal_event(
                                 "prediction_rate_limited",
@@ -733,66 +883,102 @@ async fn main() -> Result<()> {
                             )
                             .await;
                         continue;
-                    }
+                    };
 
-                    match process_trade(
-                        &predicted_trade.entry,
-                        &predicted_trade.signal,
-                        prediction.confidence,
-                        &risk,
-                        &portfolio,
-                        &position_registry,
-                        executor.clone(),
-                        orderbooks.clone(),
-                        latency_logger.clone(),
-                        latency_monitor.clone(),
-                        notifier.clone(),
-                        health.clone(),
-                        runtime_control.clone(),
-                        analytics.clone(),
-                        closing_positions.clone(),
-                        QuotePolicy::CacheOnly,
-                    )
-                    .await
-                    {
-                        Ok(TradeProcessingOutcome::Skipped(reason)) => {
-                            let _ = reason;
-                            trade_rate_limiter.release_last_claim();
-                        }
-                        Ok(TradeProcessingOutcome::Executed(executed_trade)) => {
-                            let signal_key = signal_cache_key(&signal);
-                            let predicted_wallet = prediction
+                    let signal_key = signal_cache_key(&signal);
+                    let prediction_detail = format_prediction_detail(&prediction);
+                    let hot_task = HotPathTradeTask {
+                        matched_trade: predicted_trade,
+                        execution_confidence: prediction.confidence,
+                        quote_policy: QuotePolicy::CacheOnly,
+                        source: HotPathTradeSource::Predicted {
+                            signal_key: signal_key.clone(),
+                            predicted_wallet: prediction
                                 .predicted_wallet
                                 .clone()
-                                .unwrap_or_else(|| "unknown".to_owned());
-                            pending_validations.insert(PendingPredictionExecution {
-                                signal_key,
-                                signal: signal.clone(),
-                                source_entry: executed_trade.source_entry,
-                                decision: executed_trade.decision,
-                                order_request: executed_trade.order_request,
-                                execution_result: executed_trade.execution_result,
-                                predicted_wallet,
-                                confidence: prediction.confidence,
-                                submitted_at: executed_trade.submitted_at,
-                                submitted_at_utc: executed_trade.submission_completed_at,
-                                validation_deadline: executed_trade.submitted_at
-                                    + settings.effective_prediction_validation_timeout(),
-                            });
+                                .unwrap_or_else(|| "unknown".to_owned()),
+                            confidence: prediction.confidence,
+                            claim_id,
+                            prediction_detail: prediction_detail.clone(),
+                        },
+                    };
+                    inflight_predictions.insert(signal_key.clone());
+
+                    let enqueue_result = if settings.hot_path_mode {
+                        hot_path_queue.enqueue(hot_task, HotPathTaskKind::PredictedEntry)
+                    } else {
+                        HotPathEnqueue::ProcessInline(hot_task)
+                    };
+
+                    match enqueue_result {
+                        HotPathEnqueue::Queued => {
                             attribution_logger
                                 .record_signal_event(
-                                    "prediction_executed",
+                                    "prediction_queued_hot_path",
                                     &signal,
                                     pending_validations.len(),
                                     0,
-                                    Some(format_prediction_detail(&prediction)),
+                                    Some(prediction_detail),
                                 )
                                 .await;
                         }
-                        Err(error) => {
-                            trade_rate_limiter.release_last_claim();
-                            error!(?error, "failed to process predicted market signal");
-                            health.set_last_error(format!("{error:#}")).await;
+                        HotPathEnqueue::ProcessInline(task) => {
+                            let result = execute_hot_path_task(
+                                task,
+                                &risk,
+                                &portfolio,
+                                &position_registry,
+                                exit_resolution.clone(),
+                                executor.clone(),
+                                orderbooks.clone(),
+                                latency_logger.clone(),
+                                latency_monitor.clone(),
+                                notifier.clone(),
+                                health.clone(),
+                                runtime_control.clone(),
+                                analytics.clone(),
+                                closing_positions.clone(),
+                            )
+                            .await;
+                            handle_hot_path_result(
+                                result,
+                                &settings,
+                                &mut pending_validations,
+                                &mut inflight_predictions,
+                                &mut deferred_direct_matches,
+                                &mut trade_rate_limiter,
+                                &hot_path_queue,
+                                &risk,
+                                &portfolio,
+                                &position_registry,
+                                exit_resolution.clone(),
+                                executor.clone(),
+                                orderbooks.clone(),
+                                latency_logger.clone(),
+                                latency_monitor.clone(),
+                                notifier.clone(),
+                                health.clone(),
+                                runtime_control.clone(),
+                                analytics.clone(),
+                                closing_positions.clone(),
+                                attribution_logger.clone(),
+                            )
+                            .await;
+                        }
+                        HotPathEnqueue::Dropped(task) => {
+                            if let HotPathTradeSource::Predicted { claim_id, signal_key, .. } = &task.source {
+                                trade_rate_limiter.release(*claim_id);
+                                inflight_predictions.remove(signal_key);
+                            }
+                            attribution_logger
+                                .record_signal_event(
+                                    "prediction_dropped_hot_path_congestion",
+                                    &signal,
+                                    pending_validations.len(),
+                                    0,
+                                    Some("hot path queue saturated".to_owned()),
+                                )
+                                .await;
                         }
                     }
                 }
@@ -904,7 +1090,42 @@ async fn main() -> Result<()> {
                             .await;
                         persist_confirmed_trade_seen(&state_store, &matched_trade.entry, &health)
                             .await;
+                    } else if matched_trade.entry.side.eq_ignore_ascii_case("BUY")
+                        && inflight_predictions.contains(&signal_key)
+                    {
+                        deferred_direct_matches.insert(signal_key.clone(), matched_trade.clone());
+                        attribution_logger
+                            .record_signal_event(
+                                "wallet_confirmation_waiting_for_inflight_prediction",
+                                validation_signal,
+                                pending_validations.len(),
+                                0,
+                                Some(format!(
+                                    "{} action=deferred_until_prediction_result",
+                                    confirmation_detail
+                                )),
+                            )
+                            .await;
+                        persist_confirmed_trade_seen(&state_store, &matched_trade.entry, &health)
+                            .await;
                     } else {
+                        let hot_task = HotPathTradeTask {
+                            matched_trade: matched_trade.clone(),
+                            execution_confidence: 1.0,
+                            quote_policy: QuotePolicy::CacheOnly,
+                            source: HotPathTradeSource::DirectTrackedTrade,
+                        };
+                        let kind = if matched_trade.entry.side.eq_ignore_ascii_case("SELL") {
+                            HotPathTaskKind::SourceExit
+                        } else {
+                            HotPathTaskKind::DirectEntry
+                        };
+                        let enqueue_result = if settings.hot_path_mode {
+                            hot_path_queue.enqueue(hot_task, kind)
+                        } else {
+                            HotPathEnqueue::ProcessInline(hot_task)
+                        };
+
                         attribution_logger
                             .record_signal_event(
                                 "wallet_confirmation_observed",
@@ -912,15 +1133,88 @@ async fn main() -> Result<()> {
                                 pending_validations.len(),
                                 0,
                                 Some(format!(
-                                    "{} action=training_only",
+                                    "{} action=hot_path_execution",
                                     confirmation_detail
                                 )),
                             )
                             .await;
                         persist_confirmed_trade_seen(&state_store, &matched_trade.entry, &health)
                             .await;
+
+                        match enqueue_result {
+                            HotPathEnqueue::Queued => {}
+                            HotPathEnqueue::ProcessInline(task) | HotPathEnqueue::Dropped(task) => {
+                                let result = execute_hot_path_task(
+                                    task,
+                                    &risk,
+                                    &portfolio,
+                                    &position_registry,
+                                    exit_resolution.clone(),
+                                    executor.clone(),
+                                    orderbooks.clone(),
+                                    latency_logger.clone(),
+                                    latency_monitor.clone(),
+                                    notifier.clone(),
+                                    health.clone(),
+                                    runtime_control.clone(),
+                                    analytics.clone(),
+                                    closing_positions.clone(),
+                                )
+                                .await;
+                                handle_hot_path_result(
+                                    result,
+                                    &settings,
+                                    &mut pending_validations,
+                                    &mut inflight_predictions,
+                                    &mut deferred_direct_matches,
+                                    &mut trade_rate_limiter,
+                                    &hot_path_queue,
+                                    &risk,
+                                    &portfolio,
+                                    &position_registry,
+                                    exit_resolution.clone(),
+                                    executor.clone(),
+                                    orderbooks.clone(),
+                                    latency_logger.clone(),
+                                    latency_monitor.clone(),
+                                    notifier.clone(),
+                                    health.clone(),
+                                    runtime_control.clone(),
+                                    analytics.clone(),
+                                    closing_positions.clone(),
+                                    attribution_logger.clone(),
+                                )
+                                .await;
+                            }
+                        }
                     }
                 }
+            }
+            Some(result) = hot_path_result_rx.recv() => {
+                handle_hot_path_result(
+                    result,
+                    &settings,
+                    &mut pending_validations,
+                    &mut inflight_predictions,
+                    &mut deferred_direct_matches,
+                    &mut trade_rate_limiter,
+                    &hot_path_queue,
+                    &risk,
+                    &portfolio,
+                    &position_registry,
+                    exit_resolution.clone(),
+                    executor.clone(),
+                    orderbooks.clone(),
+                    latency_logger.clone(),
+                    latency_monitor.clone(),
+                    notifier.clone(),
+                    health.clone(),
+                    runtime_control.clone(),
+                    analytics.clone(),
+                    closing_positions.clone(),
+                    attribution_logger.clone(),
+                )
+                .await;
             }
             else => {
                 return Err(anyhow!("signal routing channels closed"));
@@ -933,6 +1227,237 @@ fn report_dotenv_load() {
     match dotenvy::dotenv() {
         Ok(path) => eprintln!("loaded .env from {}", path.display()),
         Err(error) => eprintln!("failed to load .env: {error}"),
+    }
+}
+
+async fn run_hot_path_executor(
+    mut hot_path_rx: crate::runtime::hot_path::HotPathReceiver<HotPathTradeTask>,
+    hot_path_result_tx: mpsc::UnboundedSender<HotPathExecutionResult>,
+    risk: RiskEngine,
+    portfolio: Arc<PortfolioService>,
+    position_registry: PositionRegistry,
+    exit_resolution: Arc<ExitResolutionBuffer>,
+    executor: Arc<dyn TradeExecutor>,
+    orderbooks: Arc<OrderBookState>,
+    latency_logger: Arc<LatencyLogger>,
+    latency_monitor: Arc<LatencyMonitor>,
+    notifier: Arc<TelegramNotifier>,
+    health: Arc<HealthState>,
+    runtime_control: Arc<RuntimeControl>,
+    analytics: Arc<ExecutionAnalyticsTracker>,
+    closing_positions: ClosingPositions,
+) {
+    while let Some(task) = hot_path_rx.recv().await {
+        let result = execute_hot_path_task(
+            task,
+            &risk,
+            &portfolio,
+            &position_registry,
+            exit_resolution.clone(),
+            executor.clone(),
+            orderbooks.clone(),
+            latency_logger.clone(),
+            latency_monitor.clone(),
+            notifier.clone(),
+            health.clone(),
+            runtime_control.clone(),
+            analytics.clone(),
+            closing_positions.clone(),
+        )
+        .await;
+        if hot_path_result_tx.send(result).is_err() {
+            break;
+        }
+    }
+}
+
+async fn execute_hot_path_task(
+    task: HotPathTradeTask,
+    risk: &RiskEngine,
+    portfolio: &Arc<PortfolioService>,
+    position_registry: &PositionRegistry,
+    exit_resolution: Arc<ExitResolutionBuffer>,
+    executor: Arc<dyn TradeExecutor>,
+    orderbooks: Arc<OrderBookState>,
+    latency_logger: Arc<LatencyLogger>,
+    latency_monitor: Arc<LatencyMonitor>,
+    notifier: Arc<TelegramNotifier>,
+    health: Arc<HealthState>,
+    runtime_control: Arc<RuntimeControl>,
+    analytics: Arc<ExecutionAnalyticsTracker>,
+    closing_positions: ClosingPositions,
+) -> HotPathExecutionResult {
+    let outcome = process_trade(
+        &task.matched_trade.entry,
+        &task.matched_trade.signal,
+        task.execution_confidence,
+        risk,
+        portfolio,
+        position_registry,
+        exit_resolution,
+        executor,
+        orderbooks,
+        latency_logger,
+        latency_monitor,
+        notifier,
+        health,
+        runtime_control,
+        analytics,
+        closing_positions,
+        task.quote_policy,
+    )
+    .await;
+    HotPathExecutionResult { task, outcome }
+}
+
+async fn handle_hot_path_result(
+    result: HotPathExecutionResult,
+    settings: &Settings,
+    pending_validations: &mut PendingPredictionTracker,
+    inflight_predictions: &mut HashSet<String>,
+    deferred_direct_matches: &mut HashMap<String, MatchedTrackedTrade>,
+    trade_rate_limiter: &mut TradeRateLimiter,
+    hot_path_queue: &HotPathQueue<HotPathTradeTask>,
+    risk: &RiskEngine,
+    portfolio: &Arc<PortfolioService>,
+    position_registry: &PositionRegistry,
+    exit_resolution: Arc<ExitResolutionBuffer>,
+    executor: Arc<dyn TradeExecutor>,
+    orderbooks: Arc<OrderBookState>,
+    latency_logger: Arc<LatencyLogger>,
+    latency_monitor: Arc<LatencyMonitor>,
+    notifier: Arc<TelegramNotifier>,
+    health: Arc<HealthState>,
+    runtime_control: Arc<RuntimeControl>,
+    analytics: Arc<ExecutionAnalyticsTracker>,
+    closing_positions: ClosingPositions,
+    attribution_logger: Arc<AttributionLogger>,
+) {
+    match &result.task.source {
+        HotPathTradeSource::Predicted {
+            signal_key,
+            predicted_wallet,
+            confidence,
+            claim_id,
+            prediction_detail,
+        } => {
+            inflight_predictions.remove(signal_key);
+            match result.outcome {
+                Ok(TradeProcessingOutcome::Skipped(reason)) => {
+                    let _ = reason.code;
+                    trade_rate_limiter.release(*claim_id);
+                }
+                Ok(TradeProcessingOutcome::Executed(executed_trade)) => {
+                    pending_validations.insert(PendingPredictionExecution {
+                        signal_key: signal_key.clone(),
+                        signal: result.task.matched_trade.signal.clone(),
+                        source_entry: executed_trade.source_entry,
+                        decision: executed_trade.decision,
+                        order_request: executed_trade.order_request,
+                        execution_result: executed_trade.execution_result,
+                        predicted_wallet: predicted_wallet.clone(),
+                        confidence: *confidence,
+                        submitted_at: executed_trade.submitted_at,
+                        submitted_at_utc: executed_trade.submission_completed_at,
+                        validation_deadline: executed_trade.submitted_at
+                            + settings.effective_prediction_validation_timeout(),
+                    });
+                    attribution_logger
+                        .record_signal_event(
+                            "prediction_executed",
+                            &result.task.matched_trade.signal,
+                            pending_validations.len(),
+                            0,
+                            Some(prediction_detail.clone()),
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    trade_rate_limiter.release(*claim_id);
+                    error!(?error, "failed to process predicted market signal");
+                    health.set_last_error(format!("{error:#}")).await;
+                }
+            }
+
+            if let Some(deferred_trade) = deferred_direct_matches.remove(signal_key) {
+                let deferred_task = HotPathTradeTask {
+                    matched_trade: deferred_trade.clone(),
+                    execution_confidence: 1.0,
+                    quote_policy: QuotePolicy::CacheOnly,
+                    source: HotPathTradeSource::DirectTrackedTrade,
+                };
+                let enqueue_result = if settings.hot_path_mode {
+                    hot_path_queue.enqueue(deferred_task, HotPathTaskKind::DirectEntry)
+                } else {
+                    HotPathEnqueue::ProcessInline(deferred_task)
+                };
+                match enqueue_result {
+                    HotPathEnqueue::Queued => {}
+                    HotPathEnqueue::ProcessInline(task) | HotPathEnqueue::Dropped(task) => {
+                        let deferred_result = execute_hot_path_task(
+                            task,
+                            risk,
+                            portfolio,
+                            position_registry,
+                            exit_resolution.clone(),
+                            executor.clone(),
+                            orderbooks.clone(),
+                            latency_logger.clone(),
+                            latency_monitor.clone(),
+                            notifier.clone(),
+                            health.clone(),
+                            runtime_control.clone(),
+                            analytics.clone(),
+                            closing_positions.clone(),
+                        )
+                        .await;
+                        Box::pin(handle_hot_path_result(
+                            deferred_result,
+                            settings,
+                            pending_validations,
+                            inflight_predictions,
+                            deferred_direct_matches,
+                            trade_rate_limiter,
+                            hot_path_queue,
+                            risk,
+                            portfolio,
+                            position_registry,
+                            exit_resolution.clone(),
+                            executor.clone(),
+                            orderbooks.clone(),
+                            latency_logger.clone(),
+                            latency_monitor.clone(),
+                            notifier.clone(),
+                            health,
+                            runtime_control.clone(),
+                            analytics.clone(),
+                            closing_positions.clone(),
+                            attribution_logger.clone(),
+                        ))
+                        .await;
+                    }
+                }
+            }
+        }
+        HotPathTradeSource::DirectTrackedTrade => {
+            if let Err(error) = result.outcome {
+                error!(?error, "failed to process direct tracked-wallet trade");
+                health.set_last_error(format!("{error:#}")).await;
+            }
+        }
+    }
+}
+
+async fn spawn_backpressure_sampler(
+    backpressure: RuntimeBackpressure,
+    health: Arc<HealthState>,
+    sample_interval: Duration,
+) {
+    let mut ticker = interval(sample_interval.max(Duration::from_millis(50)));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        health.set_backpressure(backpressure.snapshot()).await;
     }
 }
 
@@ -1010,6 +1535,31 @@ struct ExecutedTrade {
     submission_completed_at: DateTime<Utc>,
 }
 
+#[derive(Clone)]
+struct HotPathTradeTask {
+    matched_trade: MatchedTrackedTrade,
+    execution_confidence: f64,
+    quote_policy: QuotePolicy,
+    source: HotPathTradeSource,
+}
+
+#[derive(Clone)]
+enum HotPathTradeSource {
+    Predicted {
+        signal_key: String,
+        predicted_wallet: String,
+        confidence: f64,
+        claim_id: u64,
+        prediction_detail: String,
+    },
+    DirectTrackedTrade,
+}
+
+struct HotPathExecutionResult {
+    task: HotPathTradeTask,
+    outcome: Result<TradeProcessingOutcome>,
+}
+
 enum TradeProcessingOutcome {
     Skipped(SkipReason),
     Executed(ExecutedTrade),
@@ -1028,12 +1578,6 @@ struct PendingPredictionExecution {
     submitted_at: Instant,
     submitted_at_utc: DateTime<Utc>,
     validation_deadline: Instant,
-}
-
-#[derive(Clone)]
-struct PendingExit {
-    event: ActivityEntry,
-    retries: u8,
 }
 
 struct RecentlyExpiredPrediction {
@@ -1104,28 +1648,39 @@ impl PendingPredictionTracker {
 
 #[derive(Default)]
 struct TradeRateLimiter {
-    recent_claims: VecDeque<Instant>,
+    next_claim_id: u64,
+    recent_claims: VecDeque<(u64, Instant)>,
 }
 
 impl TradeRateLimiter {
-    fn try_claim(&mut self, now: Instant) -> bool {
+    fn try_claim(&mut self, now: Instant) -> Option<u64> {
         self.evict_expired(now);
         if self.recent_claims.len() >= MAX_EXECUTIONS_PER_MINUTE {
-            return false;
+            return None;
         }
-        self.recent_claims.push_back(now);
-        true
+        self.next_claim_id = self.next_claim_id.saturating_add(1);
+        let claim_id = self.next_claim_id;
+        self.recent_claims.push_back((claim_id, now));
+        Some(claim_id)
     }
 
-    fn release_last_claim(&mut self) {
-        self.recent_claims.pop_back();
+    fn release(&mut self, claim_id: u64) {
+        if let Some(index) = self
+            .recent_claims
+            .iter()
+            .position(|(candidate_id, _)| *candidate_id == claim_id)
+        {
+            self.recent_claims.remove(index);
+        }
     }
 
     fn evict_expired(&mut self, now: Instant) {
         while self
             .recent_claims
             .front()
-            .is_some_and(|claimed_at| now.duration_since(*claimed_at) >= Duration::from_secs(60))
+            .is_some_and(|(_, claimed_at)| {
+                now.duration_since(*claimed_at) >= Duration::from_secs(60)
+            })
         {
             self.recent_claims.pop_front();
         }
@@ -1139,6 +1694,7 @@ async fn process_trade(
     risk: &RiskEngine,
     portfolio: &PortfolioService,
     position_registry: &PositionRegistry,
+    exit_resolution: Arc<ExitResolutionBuffer>,
     executor: Arc<dyn TradeExecutor>,
     orderbooks: Arc<OrderBookState>,
     latency_logger: Arc<LatencyLogger>,
@@ -1151,6 +1707,7 @@ async fn process_trade(
     quote_policy: QuotePolicy,
 ) -> Result<TradeProcessingOutcome> {
     let side = normalized_execution_side(entry);
+    let mut stage_timestamps = signal.stage_timestamps.clone();
     if runtime_control.is_paused() {
         let reason = SkipReason::new(
             "latency_fail_safe_paused",
@@ -1186,25 +1743,55 @@ async fn process_trade(
         }
         ExecutionSide::Buy => current_portfolio.has_position_key(&entry.position_key()),
     };
-    let mut pending_exit = matches!(side, ExecutionSide::Sell).then(|| PendingExit {
-        event: entry.clone(),
-        retries: 0,
-    });
-
-    let decision = loop {
-        match risk.evaluate(entry, &current_portfolio) {
-            Ok(decision) => break decision,
-            Err(reason)
-                if matches!(side, ExecutionSide::Sell)
-                    && risk.enable_exit_retry()
-                    && reason.code == "no_position_to_sell" =>
-            {
-                let Some(snapshot) = retry_pending_exit_resolution(
-                    pending_exit.as_mut().expect("pending exit"),
-                    portfolio,
-                )
-                .await
-                else {
+    if matches!(side, ExecutionSide::Sell) {
+        analytics
+            .record_exit_event("source_exit_seen", Some(&current_portfolio))
+            .await;
+        match exit_resolution
+            .resolve_source_exit(
+                &current_portfolio,
+                position_registry,
+                entry,
+                Utc::now(),
+            )
+            .await?
+        {
+            SourceExitResolution::Matched(position_key) => {
+                has_copied_inventory = true;
+                analytics
+                    .record_exit_event("source_exit_matched", Some(&current_portfolio))
+                    .await;
+                info!(
+                    event = "source_exit_matched",
+                    condition_id = %position_key.condition_id,
+                    outcome = %position_key.outcome,
+                    source_wallet = %position_key.source_wallet,
+                    "resolved source exit against owned copied position"
+                );
+            }
+            SourceExitResolution::MatchedByFallback(position_key, fallback_reason) => {
+                has_copied_inventory = true;
+                analytics
+                    .record_exit_event("source_exit_matched_fallback", Some(&current_portfolio))
+                    .await;
+                info!(
+                    event = "source_exit_matched_fallback",
+                    condition_id = %position_key.condition_id,
+                    outcome = %position_key.outcome,
+                    source_wallet = %position_key.source_wallet,
+                    fallback_reason = %fallback_reason,
+                    "resolved source exit through safe same-owner fallback"
+                );
+            }
+            SourceExitResolution::DeferredRetry(retry) => {
+                if retry.already_queued {
+                    let reason = SkipReason::new(
+                        "source_exit_retry_queued",
+                        format!(
+                            "source exit retry {} is already queued: {}",
+                            retry.retry_key, retry.reason
+                        ),
+                    );
                     record_trade_skip(
                         entry,
                         signal,
@@ -1219,11 +1806,134 @@ async fn process_trade(
                     )
                     .await;
                     return Ok(TradeProcessingOutcome::Skipped(reason));
-                };
-                current_portfolio = snapshot;
-                has_copied_inventory = current_portfolio.can_resolve_position_to_sell(entry)
-                    || position_registry.has_matching_open_position(entry);
+                }
+
+                analytics
+                    .record_exit_event("source_exit_retry_queued", Some(&current_portfolio))
+                    .await;
+                info!(
+                    event = "source_exit_retry_queued",
+                    retry_key = %retry.retry_key,
+                    reason = %retry.reason,
+                    condition_id = %entry.condition_id,
+                    outcome = %entry.outcome,
+                    source_wallet = %entry.proxy_wallet,
+                    "queued unresolved source exit for retry"
+                );
+
+                loop {
+                    sleep(exit_resolution.retry_interval()).await;
+                    current_portfolio = load_current_portfolio_snapshot(portfolio).await?;
+                    has_copied_inventory = current_portfolio.can_resolve_position_to_sell(entry)
+                        || position_registry.has_matching_open_position(entry);
+
+                    match exit_resolution
+                        .retry_unresolved_exit(
+                            &retry.retry_key,
+                            &current_portfolio,
+                            position_registry,
+                            Utc::now(),
+                        )
+                        .await?
+                    {
+                        SourceExitResolution::Matched(position_key) => {
+                            has_copied_inventory = true;
+                            analytics
+                                .record_exit_event(
+                                    "source_exit_retry_resolved",
+                                    Some(&current_portfolio),
+                                )
+                                .await;
+                            info!(
+                                event = "source_exit_retry_resolved",
+                                retry_key = %retry.retry_key,
+                                condition_id = %position_key.condition_id,
+                                outcome = %position_key.outcome,
+                                source_wallet = %position_key.source_wallet,
+                                "resolved queued source exit before retry expiry"
+                            );
+                            break;
+                        }
+                        SourceExitResolution::MatchedByFallback(position_key, fallback_reason) => {
+                            has_copied_inventory = true;
+                            analytics
+                                .record_exit_event(
+                                    "source_exit_retry_resolved",
+                                    Some(&current_portfolio),
+                                )
+                                .await;
+                            info!(
+                                event = "source_exit_retry_resolved",
+                                retry_key = %retry.retry_key,
+                                condition_id = %position_key.condition_id,
+                                outcome = %position_key.outcome,
+                                source_wallet = %position_key.source_wallet,
+                                fallback_reason = %fallback_reason,
+                                "resolved queued source exit through safe fallback"
+                            );
+                            break;
+                        }
+                        SourceExitResolution::DeferredRetry(_) => continue,
+                        SourceExitResolution::Failed(reason_detail) => {
+                            exit_resolution
+                                .mark_exit_resolution_failed(&retry.retry_key, &reason_detail)
+                                .await?;
+                            analytics
+                                .record_exit_event(
+                                    "source_exit_unresolved_expired",
+                                    Some(&current_portfolio),
+                                )
+                                .await;
+                            let reason = SkipReason::new("source_exit_unresolved", reason_detail);
+                            record_trade_skip(
+                                entry,
+                                signal,
+                                risk,
+                                health,
+                                latency_logger,
+                                analytics,
+                                Some(&current_portfolio),
+                                None,
+                                classify_rejected_trade(side, has_copied_inventory),
+                                &reason,
+                            )
+                            .await;
+                            return Ok(TradeProcessingOutcome::Skipped(reason));
+                        }
+                    }
+                }
             }
+            SourceExitResolution::Failed(reason_detail) => {
+                analytics
+                    .record_exit_event("source_exit_unresolved_expired", Some(&current_portfolio))
+                    .await;
+                let reason = SkipReason::new("source_exit_unresolved", reason_detail);
+                record_trade_skip(
+                    entry,
+                    signal,
+                    risk,
+                    health,
+                    latency_logger,
+                    analytics,
+                    Some(&current_portfolio),
+                    None,
+                    classify_rejected_trade(side, has_copied_inventory),
+                    &reason,
+                )
+                .await;
+                return Ok(TradeProcessingOutcome::Skipped(reason));
+            }
+        }
+    }
+
+    let decision = loop {
+        let evaluation = if risk.fast_risk_only_on_hot_path() {
+            risk.evaluate_fast(entry, &current_portfolio)
+        } else {
+            risk.evaluate(entry, &current_portfolio)
+        };
+        match evaluation {
+            Ok(decision) => break decision,
             Err(reason) => {
                 record_trade_skip(
                     entry,
@@ -1242,6 +1952,91 @@ async fn process_trade(
             }
         }
     };
+    stage_timestamps.fast_risk_completed_at = Some(Instant::now());
+    stage_timestamps.fast_risk_completed_at_utc = Some(Utc::now());
+    let eligible_class = eligible_class_for_side(side);
+
+    if matches!(side, ExecutionSide::Sell) {
+        let Some(position_key) = decision.position_key.as_ref() else {
+            let reason = SkipReason::new(
+                "missing_position_key",
+                "resolved sell decision did not include a position key",
+            );
+            record_trade_skip(
+                entry,
+                signal,
+                risk,
+                health,
+                latency_logger,
+                analytics,
+                Some(&current_portfolio),
+                None,
+                eligible_class,
+                &reason,
+            )
+            .await;
+            return Ok(TradeProcessingOutcome::Skipped(reason));
+        };
+
+        let close_retry_interval =
+            TimeDelta::from_std(risk.exit_retry_interval()).unwrap_or_else(|_| TimeDelta::zero());
+        if current_portfolio.position_is_closing(position_key)
+            && !current_portfolio.close_retry_due(position_key, Utc::now(), close_retry_interval)
+        {
+            let reason = SkipReason::new(
+                "already_closing",
+                format!(
+                    "position {} {} for wallet {} is already closing",
+                    position_key.condition_id, position_key.outcome, position_key.source_wallet
+                ),
+            );
+            record_trade_skip(
+                entry,
+                signal,
+                risk,
+                health,
+                latency_logger,
+                analytics,
+                Some(&current_portfolio),
+                None,
+                eligible_class,
+                &reason,
+            )
+            .await;
+            return Ok(TradeProcessingOutcome::Skipped(reason));
+        }
+
+        if !claim_closing_position(&closing_positions, position_key).await {
+            let reason = SkipReason::new(
+                "already_closing",
+                format!(
+                    "position {} {} for wallet {} is already closing",
+                    position_key.condition_id, position_key.outcome, position_key.source_wallet
+                ),
+            );
+            record_trade_skip(
+                entry,
+                signal,
+                risk,
+                health,
+                latency_logger,
+                analytics,
+                Some(&current_portfolio),
+                None,
+                eligible_class,
+                &reason,
+            )
+            .await;
+            return Ok(TradeProcessingOutcome::Skipped(reason));
+        }
+
+        current_portfolio.mark_position_closing(position_key, ManagedExitReason::SourceExit.as_str());
+        current_portfolio.note_close_attempt(position_key);
+        if let Err(error) = portfolio.store_snapshot(current_portfolio.clone()).await {
+            warn!(?error, "failed to persist closing state for source-follow exit");
+        }
+    }
+
     let execution_mode = match side {
         ExecutionSide::Buy => ExecutionMode::Normal,
         ExecutionSide::Sell => ExecutionMode::MandatoryExit {
@@ -1260,6 +2055,19 @@ async fn process_trade(
     {
         Ok(quote) => quote,
         Err(reason) => {
+            if matches!(side, ExecutionSide::Sell) {
+                analytics
+                    .record_close_failure_reason(reason.code, Some(&current_portfolio))
+                    .await;
+                persist_failed_close_attempt_state(
+                    portfolio,
+                    &closing_positions,
+                    &mut current_portfolio,
+                    decision.position_key.as_ref(),
+                    reason.code,
+                )
+                .await;
+            }
             record_trade_skip(
                 entry,
                 signal,
@@ -1311,6 +2119,19 @@ async fn process_trade(
     ) {
         Ok(request) => request,
         Err(reason) => {
+            if matches!(side, ExecutionSide::Sell) {
+                analytics
+                    .record_close_failure_reason(reason.code, Some(&current_portfolio))
+                    .await;
+                persist_failed_close_attempt_state(
+                    portfolio,
+                    &closing_positions,
+                    &mut current_portfolio,
+                    decision.position_key.as_ref(),
+                    reason.code,
+                )
+                .await;
+            }
             record_trade_skip(
                 entry,
                 signal,
@@ -1327,56 +2148,9 @@ async fn process_trade(
             return Ok(TradeProcessingOutcome::Skipped(reason));
         }
     };
-    let eligible_class = eligible_class_for_side(side);
-
-    if matches!(side, ExecutionSide::Sell) {
-        let Some(position_key) = decision.position_key.as_ref() else {
-            let reason = SkipReason::new(
-                "missing_position_key",
-                "resolved sell decision did not include a position key",
-            );
-            record_trade_skip(
-                entry,
-                signal,
-                risk,
-                health,
-                latency_logger,
-                analytics,
-                Some(&current_portfolio),
-                Some(&resolved_quote.quote),
-                eligible_class,
-                &reason,
-            )
-            .await;
-            return Ok(TradeProcessingOutcome::Skipped(reason));
-        };
-        if !claim_closing_position(&closing_positions, position_key).await {
-            let reason = SkipReason::new(
-                "already_closing",
-                format!(
-                    "position {} {} for wallet {} is already closing",
-                    position_key.condition_id, position_key.outcome, position_key.source_wallet
-                ),
-            );
-            record_trade_skip(
-                entry,
-                signal,
-                risk,
-                health,
-                latency_logger,
-                analytics,
-                Some(&current_portfolio),
-                Some(&resolved_quote.quote),
-                eligible_class,
-                &reason,
-            )
-            .await;
-            return Ok(TradeProcessingOutcome::Skipped(reason));
-        }
-    }
 
     if let Some(elapsed_total_ms) =
-        latency_monitor.should_pause_before_submit(&signal.stage_timestamps)
+        latency_monitor.should_pause_before_submit(&stage_timestamps)
     {
         let reason = SkipReason::new(
             "latency_fail_safe_pre_submit",
@@ -1391,45 +2165,74 @@ async fn process_trade(
             risk,
             health,
             latency_logger,
-            analytics,
+            analytics.clone(),
             Some(&current_portfolio),
             Some(&resolved_quote.quote),
             eligible_class,
             &reason,
         )
         .await;
-        release_closing_position(&closing_positions, decision.position_key.as_ref()).await;
-        return Ok(TradeProcessingOutcome::Skipped(reason));
-    }
-
-    if matches!(side, ExecutionSide::Sell) {
-        if let Some(position_key) = decision.position_key.as_ref() {
-            if current_portfolio.mark_position_closing(position_key) {
-                if let Err(error) = portfolio.store_snapshot(current_portfolio.clone()).await {
-                    warn!(
-                        ?error,
-                        "failed to persist closing state for exiting position"
-                    );
-                    current_portfolio.restore_position_open(position_key);
-                }
-            }
+        if matches!(side, ExecutionSide::Sell) {
+            analytics
+                .record_close_failure_reason(reason.code, Some(&current_portfolio))
+                .await;
+            persist_failed_close_attempt_state(
+                portfolio,
+                &closing_positions,
+                &mut current_portfolio,
+                decision.position_key.as_ref(),
+                reason.code,
+            )
+            .await;
+        } else {
+            release_closing_position(&closing_positions, decision.position_key.as_ref()).await;
         }
+        return Ok(TradeProcessingOutcome::Skipped(reason));
     }
 
     let execution_started = Instant::now();
     let result = match executor.submit_order(request.clone()).await {
         Ok(result) => result,
         Err(error) => {
-            restore_failed_exit_state(
-                portfolio,
-                &closing_positions,
-                &mut current_portfolio,
-                decision.position_key.as_ref(),
-            )
-            .await;
+            if matches!(side, ExecutionSide::Sell) {
+                analytics
+                    .record_close_failure_reason("close_submission_error", Some(&current_portfolio))
+                    .await;
+                persist_failed_close_attempt_state(
+                    portfolio,
+                    &closing_positions,
+                    &mut current_portfolio,
+                    decision.position_key.as_ref(),
+                    "close_submission_error",
+                )
+                .await;
+                let reason = SkipReason::new(
+                    "close_submission_error",
+                    format!("close submission failed: {error:#}"),
+                );
+                record_trade_skip(
+                    entry,
+                    signal,
+                    risk,
+                    health,
+                    latency_logger,
+                    analytics,
+                    Some(&current_portfolio),
+                    Some(&resolved_quote.quote),
+                    eligible_class,
+                    &reason,
+                )
+                .await;
+                return Ok(TradeProcessingOutcome::Skipped(reason));
+            }
             return Err(error);
         }
     };
+    if matches!(side, ExecutionSide::Sell) {
+        analytics
+            .record_exit_event("close_submitted", Some(&current_portfolio))
+            .await;
+    }
     info!(
         order_id = %result.order_id,
         asset = %request.token_id,
@@ -1441,13 +2244,22 @@ async fn process_trade(
         "execution result received"
     );
     if matches!(result.status, ExecutionStatus::Rejected) || !result.success {
-        restore_failed_exit_state(
-            portfolio,
-            &closing_positions,
-            &mut current_portfolio,
-            decision.position_key.as_ref(),
-        )
-        .await;
+        if matches!(side, ExecutionSide::Sell) {
+            analytics
+                .record_exit_event("close_rejected", Some(&current_portfolio))
+                .await;
+            analytics
+                .record_close_failure_reason("close_rejected", Some(&current_portfolio))
+                .await;
+            persist_failed_close_attempt_state(
+                portfolio,
+                &closing_positions,
+                &mut current_portfolio,
+                decision.position_key.as_ref(),
+                "close_rejected",
+            )
+            .await;
+        }
         let reason = SkipReason::new(
             "order_submission_unsuccessful",
             format!(
@@ -1471,13 +2283,22 @@ async fn process_trade(
         return Ok(TradeProcessingOutcome::Skipped(reason));
     }
     if matches!(result.status, ExecutionStatus::NoFill) {
-        restore_failed_exit_state(
-            portfolio,
-            &closing_positions,
-            &mut current_portfolio,
-            decision.position_key.as_ref(),
-        )
-        .await;
+        if matches!(side, ExecutionSide::Sell) {
+            analytics
+                .record_exit_event("close_nofill", Some(&current_portfolio))
+                .await;
+            analytics
+                .record_close_failure_reason("close_nofill", Some(&current_portfolio))
+                .await;
+            persist_failed_close_attempt_state(
+                portfolio,
+                &closing_positions,
+                &mut current_portfolio,
+                decision.position_key.as_ref(),
+                "close_nofill",
+            )
+            .await;
+        }
         let reason = SkipReason::new(
             "no_fill_skip",
             format!(
@@ -1500,11 +2321,26 @@ async fn process_trade(
         .await;
         return Ok(TradeProcessingOutcome::Skipped(reason));
     }
+    let close_is_partial = matches!(side, ExecutionSide::Sell)
+        && (result.filled_size < request.size
+            || matches!(result.status, ExecutionStatus::PartiallyFilled));
+    if matches!(side, ExecutionSide::Sell) {
+        analytics
+            .record_exit_event(
+                if close_is_partial {
+                    "close_partial"
+                } else {
+                    "close_filled"
+                },
+                Some(&current_portfolio),
+            )
+            .await;
+    }
 
     let submission_completed_at = Utc::now();
     let submitted_at = Instant::now();
     let submit_order_ms = execution_started.elapsed().as_millis() as u64;
-    let measurement = latency_monitor.measure_submission(&signal.stage_timestamps, submitted_at);
+    let measurement = latency_monitor.measure_submission(&stage_timestamps, submitted_at);
     health
         .record_latency(
             measurement.detection_latency_ms,
@@ -1517,7 +2353,7 @@ async fn process_trade(
             &entry,
             &request,
             &result,
-            &signal.stage_timestamps,
+            &stage_timestamps,
             submission_completed_at,
             measurement,
             submit_order_ms,
@@ -1527,11 +2363,31 @@ async fn process_trade(
         warn!(?error, "failed to persist latency event");
     }
 
-    if let Err(error) = position_registry.record_execution(entry, &result).await {
+    let close_fully_closed = decision
+        .position_key
+        .as_ref()
+        .and_then(|position_key| current_portfolio.position_by_key(position_key))
+        .map(|position| position.size <= result.filled_size)
+        .unwrap_or(false);
+    if let Err(error) = position_registry
+        .record_execution(
+            entry,
+            &result,
+            decision.position_key.as_ref(),
+            close_fully_closed,
+        )
+        .await
+    {
         warn!(?error, "failed to update position registry after execution");
     }
     analytics
-        .record_processed(eligible_class, entry, &result, Some(&current_portfolio))
+        .record_processed(
+            eligible_class,
+            entry,
+            &result,
+            Some(&current_portfolio),
+            decision.position_key.as_ref(),
+        )
         .await;
     health.increment_processed().await;
     spawn_post_trade_side_effects(
@@ -1557,74 +2413,31 @@ async fn process_trade(
     }))
 }
 
-async fn retry_pending_exit_resolution(
-    pending_exit: &mut PendingExit,
+async fn load_current_portfolio_snapshot(
     portfolio: &PortfolioService,
-) -> Option<models::PortfolioSnapshot> {
-    let max_retries =
-        (EXIT_RETRY_WINDOW.as_millis() / EXIT_RETRY_INTERVAL.as_millis()).max(1) as u8;
-    info!(
-        event = "pending_exit_buffer",
-        reason_code = "no_position_to_sell",
-        condition_id = %pending_exit.event.condition_id,
-        outcome = %pending_exit.event.outcome,
-        source_wallet = %pending_exit.event.proxy_wallet,
-        "buffering unresolved exit for retry"
-    );
-
-    while pending_exit.retries < max_retries {
-        sleep(EXIT_RETRY_INTERVAL).await;
-        pending_exit.retries = pending_exit.retries.saturating_add(1);
-
-        let snapshot = match portfolio.snapshot().await {
-            Some(snapshot) => snapshot,
-            None => match portfolio.refresh_snapshot().await {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    warn!(
-                        ?error,
-                        "failed to refresh portfolio while retrying pending exit"
-                    );
-                    continue;
-                }
-            },
-        };
-
-        if snapshot.can_resolve_position_to_sell(&pending_exit.event) {
-            info!(
-                event = "pending_exit_buffer_resolved",
-                retries = pending_exit.retries,
-                condition_id = %pending_exit.event.condition_id,
-                outcome = %pending_exit.event.outcome,
-                source_wallet = %pending_exit.event.proxy_wallet,
-                "resolved pending exit after portfolio retry"
-            );
-            return Some(snapshot);
-        }
+) -> Result<models::PortfolioSnapshot> {
+    match portfolio.snapshot().await {
+        Some(snapshot) => Ok(snapshot),
+        None => portfolio.refresh_snapshot().await,
     }
-
-    None
 }
 
-async fn restore_failed_exit_state(
+async fn persist_failed_close_attempt_state(
     portfolio: &PortfolioService,
     closing_positions: &ClosingPositions,
     current_portfolio: &mut models::PortfolioSnapshot,
     position_key: Option<&PositionKey>,
+    failure_reason: &str,
 ) {
     let Some(position_key) = position_key else {
         return;
     };
 
-    let restored = current_portfolio.restore_position_open(position_key);
+    current_portfolio.note_close_failure(position_key, failure_reason);
     release_closing_position(closing_positions, Some(position_key)).await;
 
-    if !restored {
-        return;
-    }
-
     if let Err(error) = portfolio.store_snapshot(current_portfolio.clone()).await {
-        warn!(?error, "failed to restore open state for unresolved exit");
+        warn!(?error, "failed to persist failed closing state");
     }
 }
 
@@ -1662,7 +2475,10 @@ fn spawn_post_trade_side_effects(
 ) {
     tokio::spawn(async move {
         let refreshed = if result.mode.is_paper() {
-            match portfolio.apply_paper_fill(&entry, &result).await {
+            match portfolio
+                .apply_paper_fill(&entry, &result, decision.position_key.as_ref())
+                .await
+            {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     warn!(?error, "failed to apply paper fill to portfolio snapshot");
@@ -1671,8 +2487,12 @@ fn spawn_post_trade_side_effects(
             }
         } else {
             sleep(LIVE_POST_TRADE_REFRESH_DELAY).await;
-            let projected_layout =
-                match portfolio.project_fill_on_snapshot(&current_portfolio, &entry, &result) {
+            let projected_layout = match portfolio.project_fill_on_snapshot(
+                &current_portfolio,
+                &entry,
+                &result,
+                decision.position_key.as_ref(),
+            ) {
                     Ok(snapshot) => Some(snapshot),
                     Err(error) => {
                         warn!(
@@ -2426,18 +3246,15 @@ async fn spawn_force_exit_watcher(
     loop {
         ticker.tick().await;
 
-        let snapshot = match portfolio.snapshot().await {
-            Some(snapshot) => snapshot,
-            None => match portfolio.refresh_snapshot().await {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    warn!(
-                        ?error,
-                        "failed to load portfolio snapshot for force-exit watcher"
-                    );
-                    continue;
-                }
-            },
+        let snapshot = match load_current_portfolio_snapshot(portfolio.as_ref()).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                warn!(
+                    ?error,
+                    "failed to load portfolio snapshot for force-exit watcher"
+                );
+                continue;
+            }
         };
 
         let now = Utc::now();
@@ -2471,6 +3288,8 @@ async fn spawn_force_exit_watcher(
                 reason,
                 position,
                 quote,
+                ExecutionMode::MandatoryExit { reason },
+                true,
                 portfolio.clone(),
                 position_registry.clone(),
                 executor.clone(),
@@ -2486,6 +3305,94 @@ async fn spawn_force_exit_watcher(
                     exit_reason = reason.as_str(),
                     "managed exit attempt failed"
                 );
+            }
+        }
+
+        let closing_positions_due = snapshot
+            .positions
+            .iter()
+            .filter(|position| position.state == models::PositionState::Closing && position.is_active())
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for position in closing_positions_due {
+            let Some(action) = closing_action_plan(&position, &settings, now) else {
+                continue;
+            };
+
+            match action {
+                ClosingActionPlan::Retry {
+                    mode,
+                    escalation_level,
+                } => {
+                    if escalation_level > position.closing_escalation_level
+                        && let Err(error) = persist_closing_escalation(
+                            portfolio.as_ref(),
+                            &analytics,
+                            &position.position_key(),
+                            escalation_level,
+                        )
+                        .await
+                    {
+                        warn!(
+                            ?error,
+                            condition_id = %position.condition_id,
+                            outcome = %position.outcome,
+                            source_wallet = %position.source_wallet,
+                            "failed to persist closing escalation level"
+                        );
+                    }
+
+                    let Some(quote) = orderbooks.best_quote(&position.asset).await else {
+                        continue;
+                    };
+                    if quote.best_bid.is_none() {
+                        continue;
+                    }
+                    let reason = closing_reason_from_position(&position);
+                    if let Err(error) = attempt_managed_exit_position(
+                        &settings,
+                        reason,
+                        position,
+                        quote,
+                        mode,
+                        false,
+                        portfolio.clone(),
+                        position_registry.clone(),
+                        executor.clone(),
+                        closing_positions.clone(),
+                        notifier.clone(),
+                        health.clone(),
+                        analytics.clone(),
+                    )
+                    .await
+                    {
+                        warn!(
+                            ?error,
+                            exit_reason = reason.as_str(),
+                            "closing retry attempt failed"
+                        );
+                    }
+                }
+                ClosingActionPlan::Fail { reason } => {
+                    if let Err(error) = mark_failed_closing_position_stale(
+                        portfolio.as_ref(),
+                        &closing_positions,
+                        &position,
+                        reason,
+                        analytics.clone(),
+                    )
+                    .await
+                    {
+                        warn!(
+                            ?error,
+                            condition_id = %position.condition_id,
+                            outcome = %position.outcome,
+                            source_wallet = %position.source_wallet,
+                            "failed to finalize stale closing position"
+                        );
+                    }
+                }
             }
         }
     }
@@ -2560,6 +3467,8 @@ async fn attempt_managed_exit_position(
     reason: ManagedExitReason,
     position: models::PortfolioPosition,
     quote: models::BestQuote,
+    execution_mode: ExecutionMode,
+    record_managed_metric: bool,
     portfolio: Arc<PortfolioService>,
     position_registry: PositionRegistry,
     executor: Arc<dyn TradeExecutor>,
@@ -2568,10 +3477,7 @@ async fn attempt_managed_exit_position(
     health: Arc<HealthState>,
     analytics: Arc<ExecutionAnalyticsTracker>,
 ) -> Result<()> {
-    let current_portfolio = match portfolio.snapshot().await {
-        Some(snapshot) => snapshot,
-        None => portfolio.refresh_snapshot().await?,
-    };
+    let current_portfolio = load_current_portfolio_snapshot(portfolio.as_ref()).await?;
     let position_key = position.position_key();
     if !claim_closing_position(&closing_positions, &position_key).await {
         info!(
@@ -2585,13 +3491,19 @@ async fn attempt_managed_exit_position(
         return Ok(());
     }
     let mut closing_snapshot = current_portfolio.clone();
-    if !closing_snapshot.mark_position_closing(&position_key) {
+    if !closing_snapshot.mark_position_closing(&position_key, reason.as_str()) {
         release_closing_position(&closing_positions, Some(&position_key)).await;
         return Ok(());
     }
+    closing_snapshot.note_close_attempt(&position_key);
     if let Err(error) = portfolio.store_snapshot(closing_snapshot.clone()).await {
         release_closing_position(&closing_positions, Some(&position_key)).await;
         return Err(error.into());
+    }
+    if record_managed_metric && let Some(event_name) = managed_exit_event_name(reason) {
+        analytics
+            .record_exit_event(event_name, Some(&closing_snapshot))
+            .await;
     }
 
     info!(
@@ -2614,15 +3526,19 @@ async fn attempt_managed_exit_position(
         &entry,
         &decision,
         &quote,
-        ExecutionMode::MandatoryExit { reason },
+        execution_mode,
     ) {
         Ok(request) => request,
         Err(reason) => {
-            restore_failed_exit_state(
+            analytics
+                .record_close_failure_reason(reason.code, Some(&closing_snapshot))
+                .await;
+            persist_failed_close_attempt_state(
                 portfolio.as_ref(),
                 &closing_positions,
                 &mut closing_snapshot,
                 Some(&position_key),
+                reason.code,
             )
             .await;
             return Err(anyhow!(reason.to_string()));
@@ -2631,22 +3547,36 @@ async fn attempt_managed_exit_position(
     let result = match executor.submit_order(request.clone()).await {
         Ok(result) => result,
         Err(error) => {
-            restore_failed_exit_state(
+            analytics
+                .record_close_failure_reason("close_submission_error", Some(&closing_snapshot))
+                .await;
+            persist_failed_close_attempt_state(
                 portfolio.as_ref(),
                 &closing_positions,
                 &mut closing_snapshot,
                 Some(&position_key),
+                "close_submission_error",
             )
             .await;
             return Err(error);
         }
     };
-    if !result.success || !result.has_fill() {
-        restore_failed_exit_state(
+    analytics
+        .record_exit_event("close_submitted", Some(&closing_snapshot))
+        .await;
+    if !result.success || matches!(result.status, ExecutionStatus::Rejected) {
+        analytics
+            .record_exit_event("close_rejected", Some(&closing_snapshot))
+            .await;
+        analytics
+            .record_close_failure_reason("close_rejected", Some(&closing_snapshot))
+            .await;
+        persist_failed_close_attempt_state(
             portfolio.as_ref(),
             &closing_positions,
             &mut closing_snapshot,
             Some(&position_key),
+            "close_rejected",
         )
         .await;
         return Err(anyhow!(
@@ -2657,7 +3587,49 @@ async fn attempt_managed_exit_position(
             result.status
         ));
     }
-    if let Err(error) = position_registry.record_execution(&entry, &result).await {
+    if matches!(result.status, ExecutionStatus::NoFill) || !result.has_fill() {
+        analytics
+            .record_exit_event("close_nofill", Some(&closing_snapshot))
+            .await;
+        analytics
+            .record_close_failure_reason("close_nofill", Some(&closing_snapshot))
+            .await;
+        persist_failed_close_attempt_state(
+            portfolio.as_ref(),
+            &closing_positions,
+            &mut closing_snapshot,
+            Some(&position_key),
+            "close_nofill",
+        )
+        .await;
+        return Err(anyhow!(
+            "managed exit order incomplete: success={} filled={} order_id={} status={}",
+            result.success,
+            result.has_fill(),
+            result.order_id,
+            result.status
+        ));
+    }
+    let close_is_partial =
+        result.filled_size < request.size || matches!(result.status, ExecutionStatus::PartiallyFilled);
+    analytics
+        .record_exit_event(
+            if close_is_partial {
+                "close_partial"
+            } else {
+                "close_filled"
+            },
+            Some(&closing_snapshot),
+        )
+        .await;
+    let close_fully_closed = closing_snapshot
+        .position_by_key(&position_key)
+        .map(|tracked_position| tracked_position.size <= result.filled_size)
+        .unwrap_or(false);
+    if let Err(error) = position_registry
+        .record_execution(&entry, &result, Some(&position_key), close_fully_closed)
+        .await
+    {
         warn!(
             ?error,
             "failed to update position registry after managed exit"
@@ -2669,6 +3641,7 @@ async fn attempt_managed_exit_position(
             &entry,
             &result,
             Some(&closing_snapshot),
+            Some(&position_key),
         )
         .await;
     health.increment_processed().await;
@@ -2767,6 +3740,144 @@ fn effective_time_exit_seconds(configured_seconds: u64) -> i64 {
     } else {
         configured_seconds.min(TIME_EXIT_MAX_HOLD_SECONDS)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClosingActionPlan {
+    Retry { mode: ExecutionMode, escalation_level: u8 },
+    Fail { reason: &'static str },
+}
+
+fn managed_exit_event_name(reason: ManagedExitReason) -> Option<&'static str> {
+    match reason {
+        ManagedExitReason::TakeProfit => Some("managed_exit_take_profit"),
+        ManagedExitReason::StopLoss => Some("managed_exit_stop_loss"),
+        ManagedExitReason::TimeExit => Some("managed_exit_time_limit"),
+        ManagedExitReason::SourceExit => None,
+    }
+}
+
+fn closing_reason_from_position(position: &models::PortfolioPosition) -> ManagedExitReason {
+    match position.closing_reason.as_deref().unwrap_or("SOURCE_EXIT") {
+        "TAKE_PROFIT" => ManagedExitReason::TakeProfit,
+        "STOP_LOSS" => ManagedExitReason::StopLoss,
+        "TIME_EXIT" => ManagedExitReason::TimeExit,
+        _ => ManagedExitReason::SourceExit,
+    }
+}
+
+fn closing_action_plan(
+    position: &models::PortfolioPosition,
+    settings: &Settings,
+    now: DateTime<Utc>,
+) -> Option<ClosingActionPlan> {
+    if position.state != models::PositionState::Closing {
+        return None;
+    }
+
+    let retry_interval =
+        TimeDelta::from_std(settings.exit_retry_interval).unwrap_or_else(|_| TimeDelta::zero());
+    if !position.close_retry_due(now, retry_interval) {
+        return None;
+    }
+
+    let closing_age = position.closing_age(now).unwrap_or_else(TimeDelta::zero);
+    let closing_max_age =
+        TimeDelta::from_std(settings.closing_max_age).unwrap_or_else(|_| TimeDelta::zero());
+    if closing_age < closing_max_age {
+        return Some(ClosingActionPlan::Retry {
+            mode: ExecutionMode::MandatoryExit {
+                reason: closing_reason_from_position(position),
+            },
+            escalation_level: 0,
+        });
+    }
+
+    if !settings.force_exit_on_closing_timeout {
+        return Some(ClosingActionPlan::Fail {
+            reason: "closing_timeout_force_exit_disabled",
+        });
+    }
+
+    let closing_retry_window =
+        TimeDelta::from_std(settings.exit_retry_window).unwrap_or_else(|_| TimeDelta::zero());
+    if closing_retry_window > TimeDelta::zero()
+        && closing_age >= closing_max_age + closing_retry_window
+    {
+        return Some(ClosingActionPlan::Fail {
+            reason: "closing_timeout_exhausted",
+        });
+    }
+
+    let overdue = closing_age - closing_max_age;
+    let stage_three_after =
+        TimeDelta::from_std(EMERGENCY_EXIT_STAGE_THREE_AFTER).unwrap_or_else(|_| TimeDelta::zero());
+    let stage_two_after =
+        TimeDelta::from_std(EMERGENCY_EXIT_STAGE_TWO_AFTER).unwrap_or_else(|_| TimeDelta::zero());
+    let stage = if overdue >= stage_three_after {
+        3
+    } else if overdue >= stage_two_after {
+        2
+    } else {
+        1
+    };
+
+    Some(ClosingActionPlan::Retry {
+        mode: ExecutionMode::EmergencyExit { stage },
+        escalation_level: stage,
+    })
+}
+
+async fn persist_closing_escalation(
+    portfolio: &PortfolioService,
+    analytics: &ExecutionAnalyticsTracker,
+    position_key: &PositionKey,
+    escalation_level: u8,
+) -> Result<()> {
+    let mut snapshot = load_current_portfolio_snapshot(portfolio).await?;
+    let Some(previous_level) = snapshot.set_closing_escalation_level(position_key, escalation_level)
+    else {
+        return Ok(());
+    };
+    if escalation_level <= previous_level {
+        return Ok(());
+    }
+
+    if previous_level < 1 && escalation_level >= 1 {
+        analytics
+            .record_exit_event("close_escalated_mandatory", Some(&snapshot))
+            .await;
+    }
+    if previous_level < 2 && escalation_level >= 2 {
+        analytics
+            .record_exit_event("close_escalated_emergency", Some(&snapshot))
+            .await;
+    }
+
+    portfolio.store_snapshot(snapshot).await?;
+    Ok(())
+}
+
+async fn mark_failed_closing_position_stale(
+    portfolio: &PortfolioService,
+    closing_positions: &ClosingPositions,
+    position: &models::PortfolioPosition,
+    failure_reason: &str,
+    analytics: Arc<ExecutionAnalyticsTracker>,
+) -> Result<()> {
+    let position_key = position.position_key();
+    release_closing_position(closing_positions, Some(&position_key)).await;
+    let mut snapshot = load_current_portfolio_snapshot(portfolio).await?;
+    snapshot.note_close_failure(&position_key, failure_reason);
+    if !snapshot.mark_position_stale(&position_key, "stale_after_failed_exit") {
+        return Ok(());
+    }
+    analytics
+        .record_close_failure_reason(failure_reason, Some(&snapshot))
+        .await;
+    analytics.sync_with_portfolio(&snapshot).await;
+    portfolio.store_snapshot(snapshot).await?;
+    Ok(())
 }
 
 async fn load_prediction_seed_entries(settings: &Settings) -> Result<Vec<ActivityEntry>> {
@@ -3443,6 +4554,152 @@ mod tests {
 
     use super::*;
 
+    fn sample_settings(data_dir: std::path::PathBuf) -> Settings {
+        Settings {
+            execution_mode: crate::config::ExecutionMode::Paper,
+            polymarket_host: "https://example.com".to_owned(),
+            polymarket_data_api: "https://example.com".to_owned(),
+            polymarket_gamma_api: "https://example.com".to_owned(),
+            polymarket_market_ws: "wss://example.com".to_owned(),
+            polymarket_user_ws: "wss://example.com".to_owned(),
+            polymarket_activity_ws: "wss://example.com".to_owned(),
+            polymarket_chain_id: 137,
+            polymarket_signature_type: 0,
+            polymarket_private_key: None,
+            polymarket_funder_address: None,
+            polymarket_profile_address: None,
+            polygon_rpc_url: "https://polygon-rpc.com".to_owned(),
+            polygon_rpc_fallback_urls: Vec::new(),
+            rpc_latency_threshold: Duration::from_millis(300),
+            rpc_confirmation_timeout: Duration::from_secs(10),
+            min_required_matic: dec!(0.1),
+            min_required_usdc: dec!(25),
+            polymarket_usdc_address: "0x1".to_owned(),
+            polymarket_spender_address: "0x2".to_owned(),
+            auto_approve_usdc_allowance: false,
+            usdc_approval_amount: dec!(1000),
+            target_activity_ws_api_key: None,
+            target_activity_ws_secret: None,
+            target_activity_ws_passphrase: None,
+            target_profile_addresses: vec!["0xsource".to_owned()],
+            start_capital_usd: dec!(200),
+            paper_execution_delay: Duration::ZERO,
+            copy_only_new_trades: true,
+            source_trades_limit: 50,
+            http_timeout: Duration::from_secs(2),
+            market_cache_ttl: Duration::from_secs(10),
+            market_raw_ring_capacity: 128,
+            market_parser_workers: 1,
+            market_subscription_batch_size: 1,
+            market_subscription_delay: Duration::from_millis(1),
+            wallet_ring_capacity: 128,
+            wallet_parser_workers: 1,
+            wallet_subscription_batch_size: 1,
+            wallet_subscription_delay: Duration::from_millis(1),
+            hot_path_mode: true,
+            hot_path_queue_capacity: 32,
+            cold_path_queue_capacity: 128,
+            attribution_fast_cache_capacity: 64,
+            persistence_flush_interval: Duration::from_millis(250),
+            analytics_flush_interval: Duration::from_millis(500),
+            telegram_async_only: true,
+            fast_risk_only_on_hot_path: true,
+            exit_priority_strict: true,
+            parse_tasks_market: 1,
+            parse_tasks_wallet: 1,
+            liquidity_sweep_threshold: dec!(1),
+            imbalance_threshold: dec!(2),
+            delta_price_move_bps: 40,
+            delta_size_drop_ratio: dec!(0.25),
+            delta_min_size_drop: dec!(1),
+            inference_confirmation_window: Duration::from_millis(400),
+            activity_stream_enabled: true,
+            activity_match_window: Duration::from_millis(200),
+            activity_price_tolerance: dec!(0.01),
+            activity_size_tolerance_ratio: dec!(0.5),
+            activity_cache_ttl: Duration::from_millis(1500),
+            fallback_market_request_interval: Duration::from_millis(1000),
+            fallback_global_requests_per_minute: 30,
+            activity_correlation_window: Duration::from_millis(400),
+            attribution_lookback: Duration::from_millis(2500),
+            attribution_trades_limit: 100,
+            copy_scale_above_five_usd: dec!(0.25),
+            min_copy_notional_usd: dec!(1),
+            max_copy_notional_usd: dec!(25),
+            max_total_exposure_usd: dec!(150),
+            max_market_exposure_usd: dec!(40),
+            min_source_trade_usdc: dec!(1),
+            max_market_spread_bps: 500,
+            min_top_of_book_ratio: dec!(1),
+            max_slippage_bps: 300,
+            max_source_price_slippage_bps: 200,
+            latency_fail_safe_enabled: true,
+            max_latency: Duration::from_millis(500),
+            average_latency_threshold: Duration::from_millis(350),
+            latency_monitor_interval: Duration::from_millis(50),
+            latency_reconnect_settle: Duration::from_millis(750),
+            prediction_validation_timeout: Duration::from_millis(500),
+            log_attribution_events: true,
+            activity_parser_debug: false,
+            log_latency_events: true,
+            log_skipped_trades: true,
+            enable_log_rotation: true,
+            log_max_lines: 30_000,
+            enable_time_rotation: true,
+            log_rotate_hours: 6,
+            enable_log_clearing: false,
+            allow_buy: true,
+            allow_sell: true,
+            allow_hedging: false,
+            enable_price_bands: true,
+            enable_realistic_paper: true,
+            min_edge_threshold: dec!(0.05),
+            max_copy_delay_ms: 1_500,
+            min_liquidity: dec!(50),
+            min_wallet_score: dec!(0.6),
+            max_position_age_hours: 6,
+            max_hold_time_seconds: 1_800,
+            enable_exit_retry: true,
+            exit_retry_window: Duration::from_secs(30),
+            exit_retry_interval: Duration::from_millis(500),
+            closing_max_age: Duration::from_secs(30),
+            force_exit_on_closing_timeout: true,
+            telegram_bot_token: "token".to_owned(),
+            telegram_chat_id: "chat".to_owned(),
+            health_port: 3000,
+            data_dir,
+        }
+    }
+
+    fn sample_closing_position(
+        started_ago: chrono::TimeDelta,
+        last_attempt_ago: chrono::TimeDelta,
+    ) -> models::PortfolioPosition {
+        models::PortfolioPosition {
+            asset: "asset-1".to_owned(),
+            condition_id: "condition-1".to_owned(),
+            title: "Sample market".to_owned(),
+            outcome: "YES".to_owned(),
+            source_wallet: "0xsource".to_owned(),
+            state: models::PositionState::Closing,
+            size: dec!(10),
+            current_value: dec!(5),
+            average_entry_price: dec!(0.5),
+            current_price: dec!(0.5),
+            cost_basis: dec!(5),
+            unrealized_pnl: dec!(0),
+            opened_at: Some(Utc::now() - chrono::TimeDelta::minutes(20)),
+            source_trade_timestamp_unix: Utc::now().timestamp_millis(),
+            closing_started_at: Some(Utc::now() - started_ago),
+            closing_reason: Some("SOURCE_EXIT".to_owned()),
+            last_close_attempt_at: Some(Utc::now() - last_attempt_ago),
+            close_attempts: 1,
+            close_failure_reason: Some("close_nofill".to_owned()),
+            closing_escalation_level: 0,
+            stale_reason: None,
+        }
+    }
+
     fn sample_entry(side: &str, price: f64) -> ActivityEntry {
         ActivityEntry {
             proxy_wallet: "0xsource".to_owned(),
@@ -3492,8 +4749,14 @@ mod tests {
             stage_timestamps: models::TradeStageTimestamps {
                 websocket_event_received_at: instant,
                 websocket_event_received_at_utc: now,
+                parse_completed_at: instant,
+                parse_completed_at_utc: now,
                 detection_triggered_at: instant,
                 detection_triggered_at_utc: now,
+                attribution_completed_at: Some(instant),
+                attribution_completed_at_utc: Some(now),
+                fast_risk_completed_at: Some(instant),
+                fast_risk_completed_at_utc: Some(now),
             },
             confirmed_at: now,
             generation: 1,
@@ -4014,6 +5277,12 @@ mod tests {
             opened_at: Some(Utc::now() - chrono::TimeDelta::minutes(20)),
             source_trade_timestamp_unix: 0,
             closing_started_at: None,
+            closing_reason: None,
+            last_close_attempt_at: None,
+            close_attempts: 0,
+            close_failure_reason: None,
+            closing_escalation_level: 0,
+            stale_reason: None,
         };
 
         assert_eq!(
@@ -4050,11 +5319,11 @@ mod tests {
         let mut limiter = TradeRateLimiter::default();
         let now = Instant::now();
 
-        assert!(limiter.try_claim(now));
-        assert!(limiter.try_claim(now + Duration::from_secs(1)));
-        assert!(limiter.try_claim(now + Duration::from_secs(2)));
-        assert!(!limiter.try_claim(now + Duration::from_secs(3)));
-        assert!(limiter.try_claim(now + Duration::from_secs(61)));
+        assert!(limiter.try_claim(now).is_some());
+        assert!(limiter.try_claim(now + Duration::from_secs(1)).is_some());
+        assert!(limiter.try_claim(now + Duration::from_secs(2)).is_some());
+        assert!(limiter.try_claim(now + Duration::from_secs(3)).is_none());
+        assert!(limiter.try_claim(now + Duration::from_secs(61)).is_some());
     }
 
     #[test]
@@ -4095,5 +5364,68 @@ mod tests {
             .expect("late validation retained");
         assert!(recovered.execution_result.mode == crate::config::ExecutionMode::Live);
         assert_eq!(recovered.signal_key, "late-live-signal");
+    }
+
+    #[test]
+    fn closing_timeout_escalates_instead_of_becoming_stale() {
+        let settings = sample_settings(std::env::temp_dir().join("copytrade-main-test"));
+        let position = sample_closing_position(
+            chrono::TimeDelta::seconds(31),
+            chrono::TimeDelta::seconds(2),
+        );
+
+        let action = closing_action_plan(&position, &settings, Utc::now()).expect("action");
+        assert!(matches!(
+            action,
+            ClosingActionPlan::Retry {
+                mode: ExecutionMode::EmergencyExit { stage: 1 },
+                escalation_level: 1
+            }
+        ));
+
+        let mut snapshot = models::PortfolioSnapshot {
+            fetched_at: Utc::now(),
+            total_value: dec!(200),
+            total_exposure: dec!(5),
+            cash_balance: dec!(195),
+            realized_pnl: dec!(0),
+            unrealized_pnl: dec!(0),
+            positions: vec![position],
+        };
+        snapshot.cleanup_stale_positions(settings.max_position_age_hours);
+        assert_eq!(snapshot.positions[0].state, models::PositionState::Closing);
+    }
+
+    #[tokio::test]
+    async fn analytics_counters_distinguish_source_and_managed_exits() {
+        let tracker = ExecutionAnalyticsTracker {
+            path: std::env::temp_dir()
+                .join(format!("copytrade-analytics-{}.json", Utc::now().timestamp_nanos_opt().unwrap_or_default())),
+            start_capital_usd: dec!(200),
+            state: Arc::new(Mutex::new(ExecutionAnalyticsState::default())),
+            dirty: Arc::new(AtomicBool::new(false)),
+            flush_notify: Arc::new(Notify::new()),
+        };
+
+        tracker.record_exit_event("source_exit_matched", None).await;
+        tracker.record_exit_event("close_filled", None).await;
+        tracker.record_exit_event("managed_exit_time_limit", None).await;
+
+        let state = tracker.state.lock().await.clone();
+        assert_eq!(state.exit_event_counts.get("source_exit_matched"), Some(&1));
+        assert_eq!(state.exit_event_counts.get("managed_exit_time_limit"), Some(&1));
+        assert_eq!(state.exit_event_counts.get("close_filled"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn closing_claims_block_duplicate_close_submissions() {
+        let closing_positions: ClosingPositions =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let key = PositionKey::new("condition-1", "YES", "0xsource");
+
+        assert!(claim_closing_position(&closing_positions, &key).await);
+        assert!(!claim_closing_position(&closing_positions, &key).await);
+        release_closing_position(&closing_positions, Some(&key)).await;
+        assert!(claim_closing_position(&closing_positions, &key).await);
     }
 }

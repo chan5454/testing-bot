@@ -94,6 +94,8 @@ pub struct OrderBookDelta {
     pub current_imbalance: Option<f64>,
     pub event_received_at: Instant,
     pub event_received_at_utc: DateTime<Utc>,
+    pub parse_completed_at: Instant,
+    pub parse_completed_at_utc: DateTime<Utc>,
     pub observed_at: Instant,
 }
 
@@ -165,6 +167,8 @@ impl OrderBookState {
         book: OrderBookResponse,
         event_received_at: Instant,
         event_received_at_utc: DateTime<Utc>,
+        parse_completed_at: Instant,
+        parse_completed_at_utc: DateTime<Utc>,
     ) -> Result<Option<OrderBookDelta>> {
         let asset_id = book.asset_id.clone();
         let metadata = self.metadata_for(&asset_id, &book.market);
@@ -214,6 +218,8 @@ impl OrderBookState {
                 top,
                 event_received_at,
                 event_received_at_utc,
+                parse_completed_at,
+                parse_completed_at_utc,
                 observed_at,
             )
         }))
@@ -226,6 +232,8 @@ impl OrderBookState {
         updates: &[PriceLevelUpdate],
         event_received_at: Instant,
         event_received_at_utc: DateTime<Utc>,
+        parse_completed_at: Instant,
+        parse_completed_at_utc: DateTime<Utc>,
     ) -> Result<Option<OrderBookDelta>> {
         if updates.is_empty() {
             return Ok(None);
@@ -291,6 +299,8 @@ impl OrderBookState {
             book_state.book,
             event_received_at,
             event_received_at_utc,
+            parse_completed_at,
+            parse_completed_at_utc,
             observed_at,
         )))
     }
@@ -331,7 +341,13 @@ impl OrderBookState {
             .await
             .context("decoding order book")?;
 
-        self.apply_book_snapshot(book, Instant::now(), Utc::now())
+        self.apply_book_snapshot(
+            book,
+            Instant::now(),
+            Utc::now(),
+            Instant::now(),
+            Utc::now(),
+        )
             .await?;
         Ok(self.best_quote(asset_id).await)
     }
@@ -599,6 +615,8 @@ fn delta_from_books(
     current: OrderBook,
     event_received_at: Instant,
     event_received_at_utc: DateTime<Utc>,
+    parse_completed_at: Instant,
+    parse_completed_at_utc: DateTime<Utc>,
     observed_at: Instant,
 ) -> OrderBookDelta {
     OrderBookDelta {
@@ -614,6 +632,8 @@ fn delta_from_books(
         current_imbalance: current.imbalance(),
         event_received_at,
         event_received_at_utc,
+        parse_completed_at,
+        parse_completed_at_utc,
         previous,
         current,
         observed_at,
@@ -683,6 +703,8 @@ mod tests {
                 ],
                 Instant::now(),
                 Utc::now(),
+                Instant::now(),
+                Utc::now(),
             )
             .await
             .expect("apply");
@@ -736,6 +758,17 @@ mod tests {
             wallet_parser_workers: 1,
             wallet_subscription_batch_size: 250,
             wallet_subscription_delay: Duration::from_millis(20),
+            hot_path_mode: true,
+            hot_path_queue_capacity: 128,
+            cold_path_queue_capacity: 512,
+            attribution_fast_cache_capacity: 256,
+            persistence_flush_interval: Duration::from_millis(250),
+            analytics_flush_interval: Duration::from_millis(500),
+            telegram_async_only: true,
+            fast_risk_only_on_hot_path: true,
+            exit_priority_strict: true,
+            parse_tasks_market: 1,
+            parse_tasks_wallet: 1,
             liquidity_sweep_threshold: dec!(1),
             imbalance_threshold: dec!(2),
             delta_price_move_bps: 40,
@@ -789,6 +822,10 @@ mod tests {
             max_position_age_hours: 6,
             max_hold_time_seconds: 1_800,
             enable_exit_retry: true,
+            exit_retry_window: Duration::from_secs(30),
+            exit_retry_interval: Duration::from_millis(500),
+            closing_max_age: Duration::from_secs(30),
+            force_exit_on_closing_timeout: true,
             telegram_bot_token: "token".to_owned(),
             telegram_chat_id: "chat".to_owned(),
             health_port: 3000,

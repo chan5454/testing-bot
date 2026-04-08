@@ -2,6 +2,7 @@ use rust_decimal::Decimal;
 use rust_decimal::RoundingStrategy;
 use rust_decimal_macros::dec;
 use std::fmt::{Display, Formatter};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Settings;
@@ -76,8 +77,12 @@ impl RiskEngine {
         self.settings.log_skipped_trades
     }
 
-    pub fn enable_exit_retry(&self) -> bool {
-        self.settings.enable_exit_retry
+    pub fn exit_retry_interval(&self) -> Duration {
+        self.settings.exit_retry_interval
+    }
+
+    pub fn fast_risk_only_on_hot_path(&self) -> bool {
+        self.settings.fast_risk_only_on_hot_path
     }
 
     fn price_band_rules(
@@ -130,6 +135,14 @@ impl RiskEngine {
     }
 
     pub fn evaluate(
+        &self,
+        entry: &ActivityEntry,
+        portfolio: &PortfolioSnapshot,
+    ) -> Result<CopyDecision, SkipReason> {
+        self.evaluate_fast(entry, portfolio)
+    }
+
+    pub fn evaluate_fast(
         &self,
         entry: &ActivityEntry,
         portfolio: &PortfolioSnapshot,
@@ -319,6 +332,10 @@ impl RiskEngine {
                         resolved_outcome = %resolved_position.outcome,
                         resolved_wallet = %resolved_position.source_wallet,
                         resolved_asset = %resolved_position.asset,
+                        fallback_reason = %resolved_position
+                            .fallback_reason
+                            .as_deref()
+                            .unwrap_or("same_wallet_same_condition"),
                         "fallback_exit_resolution"
                     );
                 }
@@ -610,6 +627,17 @@ mod tests {
             wallet_parser_workers: 1,
             wallet_subscription_batch_size: 250,
             wallet_subscription_delay: Duration::from_millis(20),
+            hot_path_mode: true,
+            hot_path_queue_capacity: 128,
+            cold_path_queue_capacity: 512,
+            attribution_fast_cache_capacity: 256,
+            persistence_flush_interval: Duration::from_millis(250),
+            analytics_flush_interval: Duration::from_millis(500),
+            telegram_async_only: true,
+            fast_risk_only_on_hot_path: true,
+            exit_priority_strict: true,
+            parse_tasks_market: 1,
+            parse_tasks_wallet: 1,
             liquidity_sweep_threshold: dec!(1),
             imbalance_threshold: dec!(2),
             delta_price_move_bps: 40,
@@ -663,6 +691,10 @@ mod tests {
             max_position_age_hours: 6,
             max_hold_time_seconds: 1_800,
             enable_exit_retry: true,
+            exit_retry_window: Duration::from_secs(30),
+            exit_retry_interval: Duration::from_millis(500),
+            closing_max_age: Duration::from_secs(30),
+            force_exit_on_closing_timeout: true,
             telegram_bot_token: "token".to_owned(),
             telegram_chat_id: "chat".to_owned(),
             health_port: 3000,
@@ -720,6 +752,12 @@ mod tests {
                 opened_at: Some(Utc::now()),
                 source_trade_timestamp_unix: 1,
                 closing_started_at: None,
+                closing_reason: None,
+                last_close_attempt_at: None,
+                close_attempts: 0,
+                close_failure_reason: None,
+                closing_escalation_level: 0,
+                stale_reason: None,
             }],
         }
     }
@@ -738,9 +776,9 @@ mod tests {
     }
 
     #[test]
-    fn sell_trade_uses_fallback_resolution_when_wallet_mismatch() {
+    fn sell_trade_uses_safe_same_wallet_fallback_when_asset_differs() {
         let engine = RiskEngine::new(sample_settings());
-        let entry = sample_entry("SELL", "asset-1", 8.0, 4.0, "0xother");
+        let entry = sample_entry("SELL", "asset-other", 8.0, 4.0, "0xsource");
         let decision = engine
             .evaluate(&entry, &sample_portfolio())
             .expect("sell should resolve through fallback");
@@ -752,6 +790,17 @@ mod tests {
             decision.position_key.expect("position key").source_wallet,
             "0xsource"
         );
+    }
+
+    #[test]
+    fn sell_trade_rejects_wallet_mismatch_even_if_market_matches() {
+        let engine = RiskEngine::new(sample_settings());
+        let entry = sample_entry("SELL", "asset-1", 8.0, 4.0, "0xother");
+        let reason = engine
+            .evaluate(&entry, &sample_portfolio())
+            .expect_err("sell should not resolve across source-wallet ownership");
+
+        assert_eq!(reason.code, "no_position_to_sell");
     }
 
     #[test]
@@ -782,6 +831,12 @@ mod tests {
             opened_at: Some(Utc::now()),
             source_trade_timestamp_unix: 1,
             closing_started_at: None,
+            closing_reason: None,
+            last_close_attempt_at: None,
+            close_attempts: 0,
+            close_failure_reason: None,
+            closing_escalation_level: 0,
+            stale_reason: None,
         }];
 
         let decision = engine
@@ -819,6 +874,12 @@ mod tests {
             opened_at: Some(Utc::now()),
             source_trade_timestamp_unix: 1,
             closing_started_at: None,
+            closing_reason: None,
+            last_close_attempt_at: None,
+            close_attempts: 0,
+            close_failure_reason: None,
+            closing_escalation_level: 0,
+            stale_reason: None,
         }];
 
         let reason = engine
@@ -887,6 +948,12 @@ mod tests {
             opened_at: Some(Utc::now()),
             source_trade_timestamp_unix: 1,
             closing_started_at: None,
+            closing_reason: None,
+            last_close_attempt_at: None,
+            close_attempts: 0,
+            close_failure_reason: None,
+            closing_escalation_level: 0,
+            stale_reason: None,
         });
 
         let decision = engine

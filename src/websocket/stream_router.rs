@@ -41,6 +41,8 @@ enum ParsedMarketEvent {
         book: OrderBookResponse,
         received_at: Instant,
         received_at_utc: DateTime<Utc>,
+        parse_completed_at: Instant,
+        parse_completed_at_utc: DateTime<Utc>,
     },
     PriceUpdates {
         asset_id: String,
@@ -48,6 +50,8 @@ enum ParsedMarketEvent {
         updates: Vec<PriceLevelUpdate>,
         received_at: Instant,
         received_at_utc: DateTime<Utc>,
+        parse_completed_at: Instant,
+        parse_completed_at_utc: DateTime<Utc>,
     },
     LastTrade(LastTradeConfirmation),
 }
@@ -91,7 +95,7 @@ impl StreamRouterHandle {
 
         spawn_worker_pool(
             "market-parser",
-            settings.market_parser_workers,
+            settings.parse_tasks_market.max(settings.market_parser_workers),
             input.clone(),
             handler,
         );
@@ -181,9 +185,17 @@ async fn process_event(
             book,
             received_at,
             received_at_utc,
+            parse_completed_at,
+            parse_completed_at_utc,
         } => {
             if let Some(delta) = orderbooks
-                .apply_book_snapshot(book, received_at, received_at_utc)
+                .apply_book_snapshot(
+                    book,
+                    received_at,
+                    received_at_utc,
+                    parse_completed_at,
+                    parse_completed_at_utc,
+                )
                 .await?
             {
                 if let Some(signal) = detector.detect(&delta) {
@@ -197,6 +209,8 @@ async fn process_event(
             updates,
             received_at,
             received_at_utc,
+            parse_completed_at,
+            parse_completed_at_utc,
         } => {
             if let Some(delta) = orderbooks
                 .apply_price_updates(
@@ -205,6 +219,8 @@ async fn process_event(
                     &updates,
                     received_at,
                     received_at_utc,
+                    parse_completed_at,
+                    parse_completed_at_utc,
                 )
                 .await?
             {
@@ -227,23 +243,36 @@ async fn process_event(
 }
 
 fn parse_market_message(raw: RawMarketMessage) -> Result<SequencedParsedMessage> {
-    let value = serde_json::from_str::<serde_json::Value>(&raw.payload)?;
-    let event_type = value
-        .get("event_type")
-        .and_then(|field| field.as_str())
-        .unwrap_or_default();
+    let parse_completed_at = Instant::now();
+    let parse_completed_at_utc = Utc::now();
+    let header = serde_json::from_str::<MarketMessageHeader>(&raw.payload)?;
 
-    let events = match event_type {
+    let events = match header.event_type.as_deref().unwrap_or_default() {
         "book" => vec![ParsedMarketEvent::Book {
-            book: serde_json::from_value(value)?,
+            book: serde_json::from_str(&raw.payload)?,
             received_at: raw.received_at,
             received_at_utc: raw.received_at_utc,
+            parse_completed_at,
+            parse_completed_at_utc,
         }],
-        "price_change" => parse_price_change_events(value, raw.received_at, raw.received_at_utc)?,
+        "price_change" => parse_price_change_events(
+            &raw.payload,
+            raw.received_at,
+            raw.received_at_utc,
+            parse_completed_at,
+            parse_completed_at_utc,
+        )?,
         "last_trade_price" => {
-            parse_last_trade_event(value, raw.received_at, raw.received_at_utc, raw.generation)
-                .map(|event| vec![ParsedMarketEvent::LastTrade(event)])
-                .unwrap_or_default()
+            parse_last_trade_event(
+                &raw.payload,
+                raw.received_at,
+                raw.received_at_utc,
+                parse_completed_at,
+                parse_completed_at_utc,
+                raw.generation,
+            )
+            .map(|event| vec![ParsedMarketEvent::LastTrade(event)])
+            .unwrap_or_default()
         }
         _ => Vec::new(),
     };
@@ -268,11 +297,13 @@ fn recover_from_irrecoverable_gap(
 }
 
 fn parse_price_change_events(
-    value: serde_json::Value,
+    payload: &str,
     received_at: Instant,
     received_at_utc: DateTime<Utc>,
+    parse_completed_at: Instant,
+    parse_completed_at_utc: DateTime<Utc>,
 ) -> Result<Vec<ParsedMarketEvent>> {
-    let message = serde_json::from_value::<PriceChangeMessage>(value)?;
+    let message = serde_json::from_str::<PriceChangeMessage>(payload)?;
     let mut grouped: HashMap<String, Vec<PriceLevelUpdate>> = HashMap::new();
 
     for change in message.price_changes {
@@ -298,50 +329,33 @@ fn parse_price_change_events(
             updates,
             received_at,
             received_at_utc: received_at_utc.clone(),
+            parse_completed_at,
+            parse_completed_at_utc,
         })
         .collect())
 }
 
 fn parse_last_trade_event(
-    value: serde_json::Value,
+    payload: &str,
     received_at: Instant,
     received_at_utc: DateTime<Utc>,
+    parse_completed_at: Instant,
+    parse_completed_at_utc: DateTime<Utc>,
     generation: u64,
 ) -> Option<LastTradeConfirmation> {
-    let asset_id = value.get("asset_id")?.as_str()?.to_owned();
-    let condition_id = value
-        .get("market")
-        .or_else(|| value.get("condition_id"))
-        .and_then(|field| field.as_str())
-        .map(str::to_owned);
-    let price = value
-        .get("price")
-        .or_else(|| value.get("last_trade_price"))
-        .and_then(|field| field.as_str())
-        .and_then(|raw| raw.parse::<f64>().ok())
-        .or_else(|| {
-            value
-                .get("price")
-                .and_then(|field| field.as_f64())
-                .or_else(|| {
-                    value
-                        .get("last_trade_price")
-                        .and_then(|field| field.as_f64())
-                })
-        })?;
-    let side = value.get("side").and_then(parse_execution_side_field);
-    let size = value.get("size").and_then(parse_numeric_field);
-    let transaction_hash = parse_transaction_hash(&value);
+    let message = serde_json::from_str::<LastTradeMessage>(payload).ok()?;
 
     Some(LastTradeConfirmation {
-        asset_id,
-        condition_id,
-        transaction_hash,
-        price,
-        side,
-        size,
+        asset_id: message.asset_id,
+        condition_id: message.condition_id,
+        transaction_hash: message.transaction_hash,
+        price: message.price,
+        side: message.side,
+        size: message.size,
         observed_at: received_at,
         observed_at_utc: received_at_utc,
+        parse_completed_at,
+        parse_completed_at_utc,
         generation,
     })
 }
@@ -350,42 +364,9 @@ fn parse_f64(raw: &str) -> Result<f64> {
     raw.parse::<f64>().map_err(Into::into)
 }
 
-fn parse_execution_side_field(field: &serde_json::Value) -> Option<ExecutionSide> {
-    let raw = field.as_str()?;
-    if raw.eq_ignore_ascii_case("BUY") {
-        Some(ExecutionSide::Buy)
-    } else if raw.eq_ignore_ascii_case("SELL") {
-        Some(ExecutionSide::Sell)
-    } else {
-        None
-    }
-}
-
-fn parse_numeric_field(field: &serde_json::Value) -> Option<f64> {
-    field
-        .as_str()
-        .and_then(|raw| raw.parse::<f64>().ok())
-        .or_else(|| field.as_f64())
-}
-
-fn parse_transaction_hash(value: &serde_json::Value) -> Option<String> {
-    [
-        "transaction_hash",
-        "tx_hash",
-        "hash",
-        "trade_hash",
-        "taker_transaction_hash",
-    ]
-    .into_iter()
-    .find_map(|field| {
-        value.get(field).and_then(|field| {
-            field
-                .as_str()
-                .map(str::trim)
-                .filter(|hash| !hash.is_empty())
-                .map(str::to_owned)
-        })
-    })
+#[derive(Debug, Deserialize)]
+struct MarketMessageHeader {
+    event_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -402,6 +383,91 @@ struct PriceChangeLevel {
     price: String,
     side: String,
     size: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LastTradeMessage {
+    asset_id: String,
+    #[serde(alias = "market", alias = "condition_id")]
+    condition_id: Option<String>,
+    #[serde(alias = "price", alias = "last_trade_price", deserialize_with = "deserialize_f64")]
+    price: f64,
+    #[serde(default, deserialize_with = "deserialize_optional_execution_side")]
+    side: Option<ExecutionSide>,
+    #[serde(default, deserialize_with = "deserialize_optional_f64")]
+    size: Option<f64>,
+    #[serde(
+        default,
+        alias = "transaction_hash",
+        alias = "tx_hash",
+        alias = "hash",
+        alias = "trade_hash",
+        alias = "taker_transaction_hash"
+    )]
+    transaction_hash: Option<String>,
+}
+
+fn deserialize_f64<'de, D>(deserializer: D) -> std::result::Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct NumberVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for NumberVisitor {
+        type Value = f64;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a string or number")
+        }
+
+        fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E> {
+            Ok(value)
+        }
+
+        fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
+            Ok(value as f64)
+        }
+
+        fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
+            Ok(value as f64)
+        }
+
+        fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            value.parse::<f64>().map_err(E::custom)
+        }
+    }
+
+    deserializer.deserialize_any(NumberVisitor)
+}
+
+fn deserialize_optional_f64<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(deserialize_f64(deserializer)?))
+}
+
+fn deserialize_optional_execution_side<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<ExecutionSide>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(raw.and_then(|raw| {
+        if raw.eq_ignore_ascii_case("BUY") {
+            Some(ExecutionSide::Buy)
+        } else if raw.eq_ignore_ascii_case("SELL") {
+            Some(ExecutionSide::Sell)
+        } else {
+            None
+        }
+    }))
 }
 
 #[cfg(test)]

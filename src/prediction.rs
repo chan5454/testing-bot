@@ -667,6 +667,9 @@ pub fn build_predicted_trade(
     let scaled_size = round_six_decimals(signal.estimated_size * size_multiplier);
     let scaled_notional =
         round_six_decimals(signal.estimated_size * signal.price * size_multiplier);
+    let mut hot_signal = signal.clone();
+    hot_signal.stage_timestamps.attribution_completed_at = Some(std::time::Instant::now());
+    hot_signal.stage_timestamps.attribution_completed_at_utc = Some(Utc::now());
 
     Some(MatchedTrackedTrade {
         entry: ActivityEntry {
@@ -689,7 +692,7 @@ pub fn build_predicted_trade(
             event_slug: metadata.event_slug,
             outcome: metadata.outcome,
         },
-        signal: signal.clone(),
+        signal: hot_signal,
         source: "prediction_engine",
         validation_correlation_kind: None,
         validation_match_window: None,
@@ -877,6 +880,17 @@ mod tests {
             wallet_parser_workers: 1,
             wallet_subscription_batch_size: 10,
             wallet_subscription_delay: Duration::ZERO,
+            hot_path_mode: true,
+            hot_path_queue_capacity: 128,
+            cold_path_queue_capacity: 512,
+            attribution_fast_cache_capacity: 256,
+            persistence_flush_interval: Duration::from_millis(250),
+            analytics_flush_interval: Duration::from_millis(500),
+            telegram_async_only: true,
+            fast_risk_only_on_hot_path: true,
+            exit_priority_strict: true,
+            parse_tasks_market: 1,
+            parse_tasks_wallet: 1,
             liquidity_sweep_threshold: dec!(1),
             imbalance_threshold: dec!(2),
             delta_price_move_bps: 40,
@@ -930,6 +944,10 @@ mod tests {
             max_position_age_hours: 6,
             max_hold_time_seconds: 1_800,
             enable_exit_retry: true,
+            exit_retry_window: Duration::from_secs(30),
+            exit_retry_interval: Duration::from_millis(500),
+            closing_max_age: Duration::from_secs(30),
+            force_exit_on_closing_timeout: true,
             telegram_bot_token: "token".to_owned(),
             telegram_chat_id: "chat".to_owned(),
             health_port: 3000,
@@ -949,8 +967,14 @@ mod tests {
             stage_timestamps: TradeStageTimestamps {
                 websocket_event_received_at: now,
                 websocket_event_received_at_utc: Utc::now(),
+                parse_completed_at: now,
+                parse_completed_at_utc: Utc::now(),
                 detection_triggered_at: now,
                 detection_triggered_at_utc: Utc::now(),
+                attribution_completed_at: Some(now),
+                attribution_completed_at_utc: Some(Utc::now()),
+                fast_risk_completed_at: Some(now),
+                fast_risk_completed_at_utc: Some(Utc::now()),
             },
             confirmed_at: Utc::now(),
             generation: 1,

@@ -13,6 +13,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tracing::{debug, error, info, warn};
 
+use crate::attribution_fast::FastAttributionIndex;
 use crate::attribution_logger::AttributionLogger;
 use crate::config::Settings;
 use crate::detection::trade_inference::ConfirmedTradeSignal;
@@ -383,7 +384,7 @@ impl WalletActivityStream {
             });
             spawn_worker_pool(
                 "wallet-user-parser",
-                settings.wallet_parser_workers,
+                settings.parse_tasks_wallet.max(settings.wallet_parser_workers),
                 raw_ring,
                 handler,
             );
@@ -438,7 +439,7 @@ impl WalletActivityStream {
             });
             spawn_worker_pool(
                 "wallet-activity-parser",
-                settings.wallet_parser_workers,
+                settings.parse_tasks_wallet.max(settings.wallet_parser_workers),
                 raw_ring,
                 handler,
             );
@@ -537,6 +538,7 @@ async fn run_activity_coordinator(
     wallet_activity_logger: WalletActivityLogger,
 ) {
     let mut pending_buffer = PendingSignalBuffer::new(&settings);
+    let mut fast_attribution = FastAttributionIndex::new(&settings);
     let mut recent_event_keys = RecentKeyStore::default();
     let mut activity_correlation = ActivityCorrelationBuffer::default();
     let mut untracked_wallet_logs = UntrackedWalletLogState::default();
@@ -639,6 +641,7 @@ async fn run_activity_coordinator(
                     let late_validation_ttl_ms =
                         pending_buffer.late_validation_ttl().as_millis() as u64;
                     let pending_count = pending_buffer.push_signal(signal.clone());
+                    fast_attribution.record_signal(&signal);
                     attribution_logger
                         .record_signal_event(
                             "market_signal_cached_for_validation",
@@ -794,6 +797,15 @@ async fn run_activity_coordinator(
                         "activity trade matched tracked wallet"
                     );
                     event.wallet = tracked_wallet;
+
+                    if let Some(fast_trade) = fast_attribution.resolve_direct_trade(
+                        &event,
+                        &catalog,
+                        &wallet_registry,
+                        &position_registry,
+                    ) {
+                        forward_matched_trade(&matched_trade_tx, fast_trade);
+                    }
 
                     if let Some((walletless_event, correlation_kind)) =
                         activity_correlation.take_walletless_match(&event, &settings)
@@ -1026,39 +1038,45 @@ async fn dispatch_matched_trade(
     matched_trade_tx: &mpsc::UnboundedSender<MatchedTrackedTrade>,
     matched_trade: MatchedTrackedTrade,
 ) {
+    let log_trade = matched_trade.clone();
+    if matched_trade_tx.send(matched_trade).is_err() {
+        warn!("tracked-wallet confirmation channel is unavailable");
+        return;
+    }
+
     let detail = format!(
         "source={} proxy_wallet={} validated={} validation_correlation={} validation_window={} tx_hash_matched={}",
-        matched_trade.source,
-        matched_trade.entry.proxy_wallet,
-        matched_trade.validation_correlation_kind.is_some(),
-        matched_trade
+        log_trade.source,
+        log_trade.entry.proxy_wallet,
+        log_trade.validation_correlation_kind.is_some(),
+        log_trade
             .validation_correlation_kind
             .map(|kind| kind.as_str())
             .unwrap_or("none"),
-        matched_trade
+        log_trade
             .validation_match_window
             .map(|window| window.as_str())
             .unwrap_or("none"),
-        matched_trade.tx_hash_matched,
+        log_trade.tx_hash_matched,
     );
-    if matched_trade.validation_correlation_kind == Some(TradeCorrelationKind::Complementary) {
+    if log_trade.validation_correlation_kind == Some(TradeCorrelationKind::Complementary) {
         attribution_logger
             .record_signal_event(
                 "complementary_match_detected",
-                &matched_trade.signal,
+                &log_trade.signal,
                 0,
                 0,
                 Some(detail.clone()),
             )
             .await;
     }
-    if matched_trade.validation_match_window
+    if log_trade.validation_match_window
         == Some(crate::wallet::wallet_matching::MatchWindow::Fallback)
     {
         attribution_logger
             .record_signal_event(
                 "fallback_match_used",
-                &matched_trade.signal,
+                &log_trade.signal,
                 0,
                 0,
                 Some(detail.clone()),
@@ -1068,11 +1086,17 @@ async fn dispatch_matched_trade(
     attribution_logger
         .record_delivery_event(
             "wallet_confirmation_forwarded",
-            matched_trade.signal.generation,
-            &matched_trade.entry,
+            log_trade.signal.generation,
+            &log_trade.entry,
             Some(detail),
         )
         .await;
+}
+
+fn forward_matched_trade(
+    matched_trade_tx: &mpsc::UnboundedSender<MatchedTrackedTrade>,
+    matched_trade: MatchedTrackedTrade,
+) {
     if matched_trade_tx.send(matched_trade).is_err() {
         warn!("tracked-wallet confirmation channel is unavailable");
     }
@@ -1786,6 +1810,7 @@ async fn subscribe_user_stream<S>(
 where
     S: futures_util::Sink<Message, Error = WsError> + Unpin,
 {
+    let subscription_delay = effective_wallet_subscription_delay(settings);
     let auth = json!({
         "auth": {
             "apiKey": settings.target_activity_ws_api_key.as_deref().unwrap_or_default(),
@@ -1805,8 +1830,8 @@ where
             "markets": chunk,
         });
         sink.send(Message::Text(payload.to_string().into())).await?;
-        if settings.wallet_subscription_delay > Duration::ZERO {
-            sleep(settings.wallet_subscription_delay).await;
+        if subscription_delay > Duration::ZERO {
+            sleep(subscription_delay).await;
         }
     }
     Ok(())
@@ -1821,6 +1846,7 @@ async fn subscribe_public_activity_stream<S>(
 where
     S: futures_util::Sink<Message, Error = WsError> + Unpin,
 {
+    let subscription_delay = effective_wallet_subscription_delay(settings);
     let payload = json!({
         "action": "subscribe",
         "subscriptions": [
@@ -1842,10 +1868,20 @@ where
         )
         .await;
     sink.send(Message::Text(payload_text.into())).await?;
-    if settings.wallet_subscription_delay > Duration::ZERO {
-        sleep(settings.wallet_subscription_delay).await;
+    if subscription_delay > Duration::ZERO {
+        sleep(subscription_delay).await;
     }
     Ok(())
+}
+
+fn effective_wallet_subscription_delay(settings: &Settings) -> Duration {
+    if settings.hot_path_mode {
+        settings
+            .wallet_subscription_delay
+            .min(Duration::from_millis(5))
+    } else {
+        settings.wallet_subscription_delay
+    }
 }
 
 fn parse_user_trade_message(
@@ -1877,6 +1913,8 @@ fn parse_user_trade_message(
     } else {
         event.transaction_hash.clone()
     };
+    let parse_completed_at = Instant::now();
+    let parse_completed_at_utc = Utc::now();
     let wallet = normalize_wallet(primary_wallet);
     let event_id = build_event_id(
         Some(&transaction_hash),
@@ -1902,6 +1940,8 @@ fn parse_user_trade_message(
         source: ActivitySource::UserStream,
         observed_at,
         observed_at_utc,
+        parse_completed_at,
+        parse_completed_at_utc,
     })
 }
 
@@ -1911,6 +1951,8 @@ fn parse_public_activity_trade_messages(
     observed_at: Instant,
     observed_at_utc: DateTime<Utc>,
 ) -> PublicActivityParseReport {
+    let parse_completed_at = Instant::now();
+    let parse_completed_at_utc = Utc::now();
     let Ok(value) = serde_json::from_str::<Value>(payload) else {
         return PublicActivityParseReport {
             failure_detail: Some("invalid_json".to_owned()),
@@ -1929,6 +1971,8 @@ fn parse_public_activity_trade_messages(
         generation,
         observed_at,
         observed_at_utc,
+        parse_completed_at,
+        parse_completed_at_utc,
         &context,
         &mut seen_event_ids,
         &mut events,
@@ -1957,6 +2001,8 @@ fn collect_public_activity_trade_events(
     generation: u64,
     observed_at: Instant,
     observed_at_utc: DateTime<Utc>,
+    parse_completed_at: Instant,
+    parse_completed_at_utc: DateTime<Utc>,
     inherited: &ActivityEnvelopeContext,
     seen_event_ids: &mut HashSet<String>,
     output: &mut Vec<ActivityTradeEvent>,
@@ -1969,6 +2015,8 @@ fn collect_public_activity_trade_events(
                     generation,
                     observed_at,
                     observed_at_utc,
+                    parse_completed_at,
+                    parse_completed_at_utc,
                     inherited,
                     seen_event_ids,
                     output,
@@ -1987,6 +2035,8 @@ fn collect_public_activity_trade_events(
                 generation,
                 observed_at,
                 observed_at_utc,
+                parse_completed_at,
+                parse_completed_at_utc,
                 &context,
             ) {
                 if seen_event_ids.insert(event.event_id.clone()) {
@@ -2001,6 +2051,8 @@ fn collect_public_activity_trade_events(
                         generation,
                         observed_at,
                         observed_at_utc,
+                        parse_completed_at,
+                        parse_completed_at_utc,
                         &context,
                         seen_event_ids,
                         output,
@@ -2017,6 +2069,8 @@ fn parse_public_activity_trade_event(
     generation: u64,
     observed_at: Instant,
     observed_at_utc: DateTime<Utc>,
+    parse_completed_at: Instant,
+    parse_completed_at_utc: DateTime<Utc>,
     context: &ActivityEnvelopeContext,
 ) -> Option<ActivityTradeEvent> {
     if context
@@ -2068,6 +2122,8 @@ fn parse_public_activity_trade_event(
         source: ActivitySource::ActivityStream,
         observed_at,
         observed_at_utc,
+        parse_completed_at,
+        parse_completed_at_utc,
     })
 }
 
@@ -2342,6 +2398,19 @@ fn merge_activity_events(
     } else {
         (tracked_event.observed_at, tracked_event.observed_at_utc)
     };
+    let (parse_completed_at, parse_completed_at_utc) = if walletless_event.parse_completed_at
+        < tracked_event.parse_completed_at
+    {
+        (
+            walletless_event.parse_completed_at,
+            walletless_event.parse_completed_at_utc,
+        )
+    } else {
+        (
+            tracked_event.parse_completed_at,
+            tracked_event.parse_completed_at_utc,
+        )
+    };
 
     ActivityTradeEvent {
         event_id: tracked_event.event_id,
@@ -2362,6 +2431,8 @@ fn merge_activity_events(
         source: tracked_event.source,
         observed_at,
         observed_at_utc,
+        parse_completed_at,
+        parse_completed_at_utc,
     }
 }
 
@@ -2636,6 +2707,17 @@ mod tests {
             wallet_parser_workers: 1,
             wallet_subscription_batch_size: 250,
             wallet_subscription_delay: Duration::from_millis(20),
+            hot_path_mode: true,
+            hot_path_queue_capacity: 128,
+            cold_path_queue_capacity: 512,
+            attribution_fast_cache_capacity: 256,
+            persistence_flush_interval: Duration::from_millis(250),
+            analytics_flush_interval: Duration::from_millis(500),
+            telegram_async_only: true,
+            fast_risk_only_on_hot_path: true,
+            exit_priority_strict: true,
+            parse_tasks_market: 1,
+            parse_tasks_wallet: 1,
             liquidity_sweep_threshold: dec!(1),
             imbalance_threshold: dec!(2),
             delta_price_move_bps: 40,
@@ -2689,6 +2771,10 @@ mod tests {
             max_position_age_hours: 6,
             max_hold_time_seconds: 1_800,
             enable_exit_retry: true,
+            exit_retry_window: Duration::from_secs(30),
+            exit_retry_interval: Duration::from_millis(500),
+            closing_max_age: Duration::from_secs(30),
+            force_exit_on_closing_timeout: true,
             telegram_bot_token: "token".to_owned(),
             telegram_chat_id: "chat".to_owned(),
             health_port: 3000,
@@ -2709,8 +2795,14 @@ mod tests {
             stage_timestamps: TradeStageTimestamps {
                 websocket_event_received_at: instant,
                 websocket_event_received_at_utc: now,
+                parse_completed_at: instant,
+                parse_completed_at_utc: now,
                 detection_triggered_at: instant,
                 detection_triggered_at_utc: now,
+                attribution_completed_at: Some(instant),
+                attribution_completed_at_utc: Some(now),
+                fast_risk_completed_at: Some(instant),
+                fast_risk_completed_at_utc: Some(now),
             },
             confirmed_at: now,
             generation: 1,
@@ -2763,6 +2855,8 @@ mod tests {
             source: ActivitySource::ActivityStream,
             observed_at,
             observed_at_utc,
+            parse_completed_at: observed_at,
+            parse_completed_at_utc: observed_at_utc,
         };
 
         assert!(
@@ -2966,5 +3060,15 @@ mod tests {
 
         assert!(store.insert("one".to_owned(), Duration::from_secs(1)));
         assert!(!store.insert("one".to_owned(), Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn hot_path_wallet_subscriptions_cap_stagger_delay() {
+        let settings = test_settings();
+
+        assert_eq!(
+            effective_wallet_subscription_delay(&settings),
+            Duration::from_millis(5)
+        );
     }
 }

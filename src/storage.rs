@@ -1,11 +1,15 @@
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
+use tokio::time::{MissedTickBehavior, interval};
+use tracing::warn;
 
 use crate::models::ActivityEntry;
 
@@ -18,6 +22,8 @@ const TIMESTAMP_MILLIS_THRESHOLD: i64 = 10_000_000_000;
 pub struct StateStore {
     inner: Arc<RwLock<RuntimeState>>,
     path: Arc<std::path::PathBuf>,
+    dirty: Arc<AtomicBool>,
+    flush_notify: Arc<Notify>,
 }
 
 #[derive(Debug, Default)]
@@ -26,7 +32,7 @@ struct RuntimeState {
     pending_keys: HashSet<String>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct PersistedState {
     seen_keys: VecDeque<String>,
     #[serde(default)]
@@ -39,7 +45,12 @@ struct PersistedState {
 }
 
 impl StateStore {
+    #[allow(dead_code)]
     pub async fn load(data_dir: &Path) -> Result<Self> {
+        Self::load_with_flush(data_dir, Duration::from_millis(250)).await
+    }
+
+    pub async fn load_with_flush(data_dir: &Path, flush_interval: Duration) -> Result<Self> {
         let path = data_dir.join("state.json");
         let mut persisted = match tokio::fs::read_to_string(&path).await {
             Ok(contents) => serde_json::from_str::<PersistedState>(&contents)
@@ -62,13 +73,17 @@ impl StateStore {
             persisted.last_source_timestamp = cursor_from_latest(persisted.latest_source_timestamp);
         }
 
-        Ok(Self {
+        let store = Self {
             inner: Arc::new(RwLock::new(RuntimeState {
                 persisted,
                 pending_keys: HashSet::new(),
             })),
             path: Arc::new(path),
-        })
+            dirty: Arc::new(AtomicBool::new(false)),
+            flush_notify: Arc::new(Notify::new()),
+        };
+        store.spawn_flusher(flush_interval);
+        Ok(store)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -108,7 +123,9 @@ impl StateStore {
             normalize_source_timestamp(entry.timestamp),
             Some(entry.transaction_hash.as_str()),
         );
-        self.persist_locked(&state).await
+        drop(state);
+        self.schedule_persist();
+        Ok(())
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -142,7 +159,9 @@ impl StateStore {
             normalize_source_timestamp(timestamp),
             tx_hash,
         );
-        self.persist_locked(&state).await
+        drop(state);
+        self.schedule_persist();
+        Ok(())
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -153,7 +172,8 @@ impl StateStore {
             return Ok(false);
         }
         apply_source_observation(&mut state.persisted, normalized_timestamp, None);
-        self.persist_locked(&state).await?;
+        drop(state);
+        self.schedule_persist();
         Ok(true)
     }
 
@@ -162,13 +182,56 @@ impl StateStore {
         self.inner.read().await.persisted.last_source_timestamp
     }
 
-    async fn persist_locked(&self, state: &RuntimeState) -> Result<()> {
-        let contents = serde_json::to_string_pretty(&state.persisted)?;
-        tokio::fs::write(&*self.path, contents)
-            .await
-            .with_context(|| format!("writing {}", self.path.display()))?;
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn flush_now(&self) -> Result<()> {
+        let persisted = self.inner.read().await.persisted.clone();
+        persist_state(&self.path, &persisted).await?;
+        self.dirty.store(false, Ordering::Relaxed);
         Ok(())
     }
+
+    fn schedule_persist(&self) {
+        self.dirty.store(true, Ordering::Relaxed);
+        self.flush_notify.notify_one();
+    }
+
+    fn spawn_flusher(&self, flush_interval: Duration) {
+        let inner = self.inner.clone();
+        let path = self.path.clone();
+        let dirty = self.dirty.clone();
+        let flush_notify = self.flush_notify.clone();
+        tokio::spawn(async move {
+            let mut ticker = interval(flush_interval.max(Duration::from_millis(50)));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = flush_notify.notified() => {}
+                }
+                if !dirty.swap(false, Ordering::Relaxed) {
+                    continue;
+                }
+                let persisted = inner.read().await.persisted.clone();
+                if let Err(error) = persist_state(&path, &persisted).await {
+                    warn!(?error, path = %path.display(), "failed to persist runtime state");
+                    dirty.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+    }
+}
+
+async fn persist_state(path: &Path, persisted: &PersistedState) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let contents = serde_json::to_string_pretty(persisted)?;
+    tokio::fs::write(path, contents)
+        .await
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }
 
 fn normalize_source_timestamp(timestamp: i64) -> i64 {
@@ -219,6 +282,7 @@ fn apply_source_observation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn sample_activity() -> ActivityEntry {
         ActivityEntry {
@@ -252,6 +316,7 @@ mod tests {
                 .expect("seed cursor")
         );
         assert_eq!(store.last_source_timestamp().await, 1_234_565);
+        store.flush_now().await.expect("flush state");
 
         let reloaded = StateStore::load(temp_dir.path())
             .await
@@ -305,5 +370,23 @@ mod tests {
 
         assert!(store.has_seen_tx_hash("0xabc").await);
         assert_eq!(store.last_source_timestamp().await, 1_773_670_183);
+    }
+
+    #[tokio::test]
+    async fn background_flush_persists_without_blocking_state_updates() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let store = StateStore::load_with_flush(temp_dir.path(), Duration::from_millis(250))
+            .await
+            .expect("load store");
+
+        store
+            .mark_seen(&sample_activity())
+            .await
+            .expect("mark seen");
+        assert!(store.has_seen_tx_hash("0xhash").await);
+        assert!(!temp_dir.path().join("state.json").exists());
+
+        store.flush_now().await.expect("flush state");
+        assert!(temp_dir.path().join("state.json").exists());
     }
 }

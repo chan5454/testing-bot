@@ -54,6 +54,17 @@ fn sample_settings(data_dir: PathBuf) -> Settings {
         wallet_parser_workers: 1,
         wallet_subscription_batch_size: 250,
         wallet_subscription_delay: Duration::from_millis(20),
+        hot_path_mode: true,
+        hot_path_queue_capacity: 128,
+        cold_path_queue_capacity: 512,
+        attribution_fast_cache_capacity: 256,
+        persistence_flush_interval: Duration::from_millis(250),
+        analytics_flush_interval: Duration::from_millis(500),
+        telegram_async_only: true,
+        fast_risk_only_on_hot_path: true,
+        exit_priority_strict: true,
+        parse_tasks_market: 1,
+        parse_tasks_wallet: 1,
         liquidity_sweep_threshold: dec!(1),
         imbalance_threshold: dec!(2),
         delta_price_move_bps: 40,
@@ -107,6 +118,10 @@ fn sample_settings(data_dir: PathBuf) -> Settings {
         max_position_age_hours: 6,
         max_hold_time_seconds: 1_800,
         enable_exit_retry: true,
+        exit_retry_window: Duration::from_secs(30),
+        exit_retry_interval: Duration::from_millis(500),
+        closing_max_age: Duration::from_secs(30),
+        force_exit_on_closing_timeout: true,
         telegram_bot_token: "token".to_owned(),
         telegram_chat_id: "chat".to_owned(),
         health_port: 3000,
@@ -208,7 +223,7 @@ fn test_zero_fill_does_not_create_position() {
 
     let snapshot = empty_snapshot();
     let projected = service
-        .project_fill_on_snapshot(&snapshot, &sample_entry(), &result)
+        .project_fill_on_snapshot(&snapshot, &sample_entry(), &result, None)
         .expect("projected snapshot");
 
     assert_eq!(projected.positions.len(), 0);

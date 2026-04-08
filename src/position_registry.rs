@@ -41,6 +41,12 @@ pub struct PositionRegistry {
     lifecycle_logger: RollingJsonlLogger,
 }
 
+#[derive(Clone, Debug)]
+pub struct ResolvedTrackedPosition {
+    pub key: PositionKey,
+    pub fallback_reason: Option<String>,
+}
+
 #[derive(Serialize)]
 struct PositionLifecycleEvent<'a> {
     event_type: &'static str,
@@ -68,17 +74,48 @@ impl PositionRegistry {
     }
 
     pub fn has_matching_open_position(&self, entry: &ActivityEntry) -> bool {
-        let position_id = position_id_from_entry(entry);
+        self.resolve_open_position(&entry.position_key()).is_some()
+    }
+
+    pub fn has_open_position_key(&self, key: &PositionKey) -> bool {
         self.positions
             .read()
             .expect("position registry read lock")
             .values()
             .any(|position| {
                 position.status == PositionLifecycleStatus::Open
-                    && (position.position_id == position_id
-                        || (position.market == entry.condition_id
-                            && position.wallet == normalize_wallet(&entry.proxy_wallet)))
+                    && tracked_position_key(position) == *key
             })
+    }
+
+    pub fn resolve_open_position(&self, requested_key: &PositionKey) -> Option<ResolvedTrackedPosition> {
+        let state = self.positions.read().expect("position registry read lock");
+        if let Some(position) = state.values().find(|position| {
+            position.status == PositionLifecycleStatus::Open
+                && tracked_position_key(position) == *requested_key
+        }) {
+            return Some(ResolvedTrackedPosition {
+                key: tracked_position_key(position),
+                fallback_reason: None,
+            });
+        }
+
+        let candidates = state
+            .values()
+            .filter(|position| {
+                position.status == PositionLifecycleStatus::Open
+                    && position.market == requested_key.condition_id
+                    && position.wallet == requested_key.source_wallet
+            })
+            .collect::<Vec<_>>();
+        if candidates.len() == 1 {
+            return Some(ResolvedTrackedPosition {
+                key: tracked_position_key(candidates[0]),
+                fallback_reason: Some("same_wallet_same_condition_single_candidate".to_owned()),
+            });
+        }
+
+        None
     }
 
     pub fn has_open_position_for_wallet(&self, wallet: &str) -> bool {
@@ -158,6 +195,8 @@ impl PositionRegistry {
         &self,
         entry: &ActivityEntry,
         result: &ExecutionResult,
+        position_key: Option<&PositionKey>,
+        fully_closed: bool,
     ) -> Result<()> {
         if matches!(
             result.status,
@@ -169,7 +208,7 @@ impl PositionRegistry {
 
         match result.order_request.side {
             ExecutionSide::Buy => self.open_position(entry, result).await,
-            ExecutionSide::Sell => self.close_position(entry).await,
+            ExecutionSide::Sell => self.close_position(entry, position_key, fully_closed).await,
         }
     }
 
@@ -199,9 +238,22 @@ impl PositionRegistry {
         Ok(())
     }
 
-    async fn close_position(&self, entry: &ActivityEntry) -> Result<()> {
-        let normalized_wallet = normalize_wallet(&entry.proxy_wallet);
-        let target_position_id = position_id_from_entry(entry);
+    async fn close_position(
+        &self,
+        entry: &ActivityEntry,
+        position_key: Option<&PositionKey>,
+        fully_closed: bool,
+    ) -> Result<()> {
+        if !fully_closed {
+            return Ok(());
+        }
+
+        let target_position_id = position_key
+            .map(position_id_from_key)
+            .unwrap_or_else(|| position_id_from_entry(entry));
+        let fallback_position_id = self
+            .resolve_open_position(position_key.unwrap_or(&entry.position_key()))
+            .map(|position| position_id_from_key(&position.key));
         let mut closed_position = None;
         {
             let mut state = self
@@ -212,14 +264,12 @@ impl PositionRegistry {
                 position.status = PositionLifecycleStatus::Closed;
                 position.closed_at = Some(Utc::now().timestamp_millis());
                 closed_position = Some(position.clone());
-            } else if let Some(position) = state.values_mut().find(|position| {
-                position.status == PositionLifecycleStatus::Open
-                    && position.wallet == normalized_wallet
-                    && position.market == entry.condition_id
-            }) {
-                position.status = PositionLifecycleStatus::Closed;
-                position.closed_at = Some(Utc::now().timestamp_millis());
-                closed_position = Some(position.clone());
+            } else if let Some(fallback_position_id) = fallback_position_id.as_ref() {
+                if let Some(position) = state.get_mut(fallback_position_id) {
+                    position.status = PositionLifecycleStatus::Closed;
+                    position.closed_at = Some(Utc::now().timestamp_millis());
+                    closed_position = Some(position.clone());
+                }
             }
         }
 
@@ -292,6 +342,10 @@ fn position_id_from_entry(entry: &ActivityEntry) -> String {
 
 fn position_id_from_key(key: &PositionKey) -> String {
     format!("{}:{}:{}", key.condition_id, key.outcome, key.source_wallet)
+}
+
+fn tracked_position_key(position: &TrackedPosition) -> PositionKey {
+    PositionKey::new(&position.market, &position.outcome, &position.wallet)
 }
 
 fn normalize_timestamp_ms(timestamp: i64) -> i64 {

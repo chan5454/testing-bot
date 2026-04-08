@@ -92,6 +92,17 @@ pub struct Settings {
     pub wallet_parser_workers: usize,
     pub wallet_subscription_batch_size: usize,
     pub wallet_subscription_delay: Duration,
+    pub hot_path_mode: bool,
+    pub hot_path_queue_capacity: usize,
+    pub cold_path_queue_capacity: usize,
+    pub attribution_fast_cache_capacity: usize,
+    pub persistence_flush_interval: Duration,
+    pub analytics_flush_interval: Duration,
+    pub telegram_async_only: bool,
+    pub fast_risk_only_on_hot_path: bool,
+    pub exit_priority_strict: bool,
+    pub parse_tasks_market: usize,
+    pub parse_tasks_wallet: usize,
     pub liquidity_sweep_threshold: Decimal,
     pub imbalance_threshold: Decimal,
     pub delta_price_move_bps: u32,
@@ -149,7 +160,12 @@ pub struct Settings {
     pub min_wallet_score: Decimal,
     pub max_position_age_hours: u64,
     pub max_hold_time_seconds: u64,
+    #[allow(dead_code)]
     pub enable_exit_retry: bool,
+    pub exit_retry_window: Duration,
+    pub exit_retry_interval: Duration,
+    pub closing_max_age: Duration,
+    pub force_exit_on_closing_timeout: bool,
     pub telegram_bot_token: String,
     pub telegram_chat_id: String,
     pub health_port: u16,
@@ -242,6 +258,32 @@ impl Settings {
                 "WALLET_SUBSCRIPTION_DELAY_MS",
                 20_u64,
             )?),
+            hot_path_mode: parse_or_default("HOT_PATH_MODE", true)?,
+            hot_path_queue_capacity: parse_or_default("HOT_PATH_QUEUE_CAPACITY", 256_usize)?,
+            cold_path_queue_capacity: parse_or_default("COLD_PATH_QUEUE_CAPACITY", 2048_usize)?,
+            attribution_fast_cache_capacity: parse_or_default(
+                "ATTRIBUTION_FAST_CACHE_CAPACITY",
+                2048_usize,
+            )?,
+            persistence_flush_interval: Duration::from_millis(parse_or_default(
+                "PERSISTENCE_FLUSH_INTERVAL_MS",
+                250_u64,
+            )?),
+            analytics_flush_interval: Duration::from_millis(parse_or_default(
+                "ANALYTICS_FLUSH_INTERVAL_MS",
+                500_u64,
+            )?),
+            telegram_async_only: parse_or_default("TELEGRAM_ASYNC_ONLY", true)?,
+            fast_risk_only_on_hot_path: parse_or_default("FAST_RISK_ONLY_ON_HOT_PATH", true)?,
+            exit_priority_strict: parse_or_default("EXIT_PRIORITY_STRICT", true)?,
+            parse_tasks_market: parse_or_default_alias(
+                &["PARSE_TASKS_MARKET", "MARKET_PARSER_WORKERS"],
+                1_usize,
+            )?,
+            parse_tasks_wallet: parse_or_default_alias(
+                &["PARSE_TASKS_WALLET", "WALLET_PARSER_WORKERS"],
+                1_usize,
+            )?,
             liquidity_sweep_threshold: parse_or_default_decimal(
                 "LIQUIDITY_SWEEP_THRESHOLD",
                 Decimal::ONE,
@@ -356,6 +398,22 @@ impl Settings {
             max_position_age_hours: parse_or_default("MAX_POSITION_AGE_HOURS", 6_u64)?,
             max_hold_time_seconds: parse_or_default("MAX_HOLD_TIME_SECONDS", 1_800_u64)?,
             enable_exit_retry: parse_or_default("ENABLE_EXIT_RETRY", true)?,
+            exit_retry_window: Duration::from_millis(parse_or_default(
+                "EXIT_RETRY_WINDOW_MS",
+                30_000_u64,
+            )?),
+            exit_retry_interval: Duration::from_millis(parse_or_default(
+                "EXIT_RETRY_INTERVAL_MS",
+                500_u64,
+            )?),
+            closing_max_age: Duration::from_millis(parse_or_default(
+                "CLOSING_MAX_AGE_MS",
+                30_000_u64,
+            )?),
+            force_exit_on_closing_timeout: parse_or_default(
+                "FORCE_EXIT_ON_CLOSING_TIMEOUT",
+                true,
+            )?,
             telegram_bot_token: required("TELEGRAM_BOT_TOKEN")?,
             telegram_chat_id: required("TELEGRAM_CHAT_ID")?,
             health_port: parse("HEALTH_PORT")?,
@@ -453,6 +511,21 @@ fn parse_or_default_u64_alias(keys: &[&str], default: u64) -> Result<u64> {
         if let Some(value) = optional(key) {
             return value
                 .parse::<u64>()
+                .map_err(|error| anyhow!("failed to parse {key}: {error}"));
+        }
+    }
+    Ok(default)
+}
+
+fn parse_or_default_alias<T>(keys: &[&str], default: T) -> Result<T>
+where
+    T: std::str::FromStr,
+    <T as std::str::FromStr>::Err: std::fmt::Display,
+{
+    for key in keys {
+        if let Some(value) = optional(key) {
+            return value
+                .parse::<T>()
                 .map_err(|error| anyhow!("failed to parse {key}: {error}"));
         }
     }

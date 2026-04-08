@@ -49,6 +49,7 @@ pub struct TelegramNotifier {
     client: Client,
     bot_token: String,
     chat_id: String,
+    async_only: bool,
     execution_mode: ExecutionMode,
     start_capital_usd: Decimal,
     summary_state_path: PathBuf,
@@ -62,6 +63,7 @@ impl TelegramNotifier {
             client: Client::new(),
             bot_token: settings.telegram_bot_token,
             chat_id: settings.telegram_chat_id,
+            async_only: settings.telegram_async_only,
             execution_mode: settings.execution_mode,
             start_capital_usd: settings.start_capital_usd,
             summary_state_path: settings.data_dir.join("telegram-daily-summary.json"),
@@ -101,6 +103,10 @@ impl TelegramNotifier {
         .await
         .context("updating pinned daily summary")?;
         Ok(())
+    }
+
+    pub fn async_only(&self) -> bool {
+        self.async_only
     }
 
     pub async fn send_startup_summary(&self, portfolio: &PortfolioSnapshot) -> Result<()> {
@@ -164,7 +170,21 @@ impl TelegramNotifier {
         let processed_exit_events = self
             .load_execution_analytics_state()
             .await?
-            .map(|analytics| analytics.processed_exit_events)
+            .map(|analytics| {
+                let close_filled = analytics
+                    .exit_event_counts
+                    .get("close_filled")
+                    .copied()
+                    .unwrap_or(0);
+                let close_partial = analytics
+                    .exit_event_counts
+                    .get("close_partial")
+                    .copied()
+                    .unwrap_or(0);
+                analytics
+                    .processed_exit_events
+                    .max(close_filled.saturating_add(close_partial))
+            })
             .unwrap_or(0);
         let next_periodic_refresh_at =
             next_periodic_refresh_at_for_update(state.as_ref(), now, update_kind);
@@ -756,6 +776,12 @@ mod tests {
                     opened_at: None,
                     source_trade_timestamp_unix: 0,
                     closing_started_at: None,
+                    closing_reason: None,
+                    last_close_attempt_at: None,
+                    close_attempts: 0,
+                    close_failure_reason: None,
+                    closing_escalation_level: 0,
+                    stale_reason: None,
                 },
                 PortfolioPosition {
                     asset: "asset-2".to_owned(),
@@ -773,6 +799,12 @@ mod tests {
                     opened_at: None,
                     source_trade_timestamp_unix: 0,
                     closing_started_at: None,
+                    closing_reason: None,
+                    last_close_attempt_at: None,
+                    close_attempts: 0,
+                    close_failure_reason: None,
+                    closing_escalation_level: 0,
+                    stale_reason: None,
                 },
             ],
         }
@@ -802,6 +834,12 @@ mod tests {
                 opened_at: None,
                 source_trade_timestamp_unix: 0,
                 closing_started_at: None,
+                closing_reason: None,
+                last_close_attempt_at: None,
+                close_attempts: 0,
+                close_failure_reason: None,
+                closing_escalation_level: 0,
+                stale_reason: None,
             }],
         }
     }
@@ -812,6 +850,7 @@ mod tests {
             client: Client::new(),
             bot_token: "token".to_owned(),
             chat_id: "chat".to_owned(),
+            async_only: true,
             execution_mode: ExecutionMode::Paper,
             start_capital_usd: dec!(200),
             summary_state_path: PathBuf::from("telegram-daily-summary.json"),
@@ -848,6 +887,7 @@ mod tests {
             client: Client::new(),
             bot_token: "token".to_owned(),
             chat_id: "chat".to_owned(),
+            async_only: true,
             execution_mode: ExecutionMode::Paper,
             start_capital_usd: dec!(200),
             summary_state_path: PathBuf::from("telegram-daily-summary.json"),
@@ -869,6 +909,7 @@ mod tests {
             client: Client::new(),
             bot_token: "token".to_owned(),
             chat_id: "chat".to_owned(),
+            async_only: true,
             execution_mode: ExecutionMode::Paper,
             start_capital_usd: dec!(200),
             summary_state_path: PathBuf::from("telegram-daily-summary.json"),

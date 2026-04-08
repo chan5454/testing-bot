@@ -138,8 +138,14 @@ impl LiquiditySweepDetector {
             stage_timestamps: TradeStageTimestamps {
                 websocket_event_received_at: delta.event_received_at,
                 websocket_event_received_at_utc: delta.event_received_at_utc,
+                parse_completed_at: delta.parse_completed_at,
+                parse_completed_at_utc: delta.parse_completed_at_utc,
                 detection_triggered_at: std::time::Instant::now(),
                 detection_triggered_at_utc: Utc::now(),
+                attribution_completed_at: None,
+                attribution_completed_at_utc: None,
+                fast_risk_completed_at: None,
+                fast_risk_completed_at_utc: None,
             },
             score: rules.len() as u32,
         })
@@ -207,8 +213,14 @@ impl LiquiditySweepDetector {
             stage_timestamps: TradeStageTimestamps {
                 websocket_event_received_at: delta.event_received_at,
                 websocket_event_received_at_utc: delta.event_received_at_utc,
+                parse_completed_at: delta.parse_completed_at,
+                parse_completed_at_utc: delta.parse_completed_at_utc,
                 detection_triggered_at: std::time::Instant::now(),
                 detection_triggered_at_utc: Utc::now(),
+                attribution_completed_at: None,
+                attribution_completed_at_utc: None,
+                fast_risk_completed_at: None,
+                fast_risk_completed_at_utc: None,
             },
             score: rules.len() as u32,
         })
@@ -306,6 +318,8 @@ mod tests {
             current_imbalance: current.imbalance(),
             event_received_at: std::time::Instant::now(),
             event_received_at_utc: Utc::now(),
+            parse_completed_at: std::time::Instant::now(),
+            parse_completed_at_utc: Utc::now(),
             observed_at: std::time::Instant::now(),
         }
     }

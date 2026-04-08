@@ -4,6 +4,7 @@ Rust copy-trading bot for Polymarket with:
 
 - real-time market and orderbook ingestion
 - public and authenticated wallet activity ingestion
+- hot-path / cold-path runtime separation for latency-sensitive copying
 - dynamic wallet registry and wallet scoring
 - price-aware risk gating
 - live CLOB execution and realistic paper execution
@@ -30,21 +31,42 @@ The bot is no longer a simple "watch one wallet and market-buy immediately" flow
 The market side stays WebSocket-first:
 
 - `src/websocket/market_stream.rs` subscribes to the Polymarket market stream
-- `src/websocket/stream_router.rs` preserves ordering and routes decoded events
+- `src/websocket/stream_router.rs` preserves ordering and routes decoded events through bounded parser workers
 - `src/orderbook/orderbook_state.rs` and `src/orderbook/orderbook_levels.rs` maintain in-memory books
 - `src/detection/liquidity_sweep_detector.rs` and `src/detection/trade_inference.rs` convert orderbook changes into confirmed trade signals
 
-### 3. Wallet activity and attribution
+The hot parser path now records stage timestamps at WebSocket receive, parse completion, attribution completion, fast-risk completion, submit start, submit end, and confirmation/fill.
+
+### 3. Hot path vs cold path
+
+The runtime is now split explicitly:
+
+- Hot path
+  WebSocket ingest, minimal parse, fast attribution, fast in-memory risk checks, direct source-follow exits, and order submission.
+- Cold path
+  JSON persistence, raw-event archiving, attribution diagnostics, wallet rescanning, analytics rollups, and Telegram updates.
+
+The split is enforced with bounded `tokio` queues and strict exit priority:
+
+- source-follow exits preempt entries
+- direct tracked-wallet entries can fall back to inline execution if the hot queue is saturated
+- predicted entries may be dropped under hot-path congestion instead of delaying exits
+- cold-path logging can shed diagnostics, but it cannot stall trading
+
+### 4. Wallet activity and attribution
 
 Wallet attribution now has multiple inputs:
 
 - `src/wallet/activity_stream.rs` consumes the authenticated user stream when available
 - the same module also consumes the public activity stream
 - parsed activity is matched back to market-side signals and persisted for later analysis
+- `src/attribution_fast.rs` keeps a bounded low-latency index by source wallet, market, outcome, side, and recent timestamp bucket
 - `src/raw_activity_logger.rs` records raw and parsed public-activity diagnostics
 - `src/attribution_logger.rs` records runtime, stream, signal, and matching events
 
-### 4. Dynamic wallet tracking
+Direct tracked-wallet entries and source-follow exits now resolve through the fast attribution index first. Rich attribution logging still runs, but it no longer sits in front of the copy decision.
+
+### 5. Dynamic wallet tracking
 
 Tracked wallets are now registry-backed instead of being a static one-wallet assumption:
 
@@ -55,7 +77,9 @@ Tracked wallets are now registry-backed instead of being a static one-wallet ass
 
 `TARGET_WALLETS` still seeds the registry, but runtime tracking can evolve as the scanner refreshes activity.
 
-### 5. Prediction and wallet quality
+The rescanner remains enabled, but it is now firmly off the hot path. Active-wallet updates are atomic, and owned copied-position exits still resolve from the position registry even after a wallet becomes inactive.
+
+### 6. Prediction and wallet quality
 
 `src/prediction.rs` ranks candidate wallets and markets before risk evaluation:
 
@@ -64,7 +88,7 @@ Tracked wallets are now registry-backed instead of being a static one-wallet ass
 - supports multi-wallet prioritization instead of a single-wallet path
 - can still execute without a prediction upgrade if a direct matched trade arrives
 
-### 6. Price-aware risk engine
+### 7. Price-aware risk engine
 
 `src/risk.rs` is now price-banded and position-aware:
 
@@ -77,7 +101,14 @@ Tracked wallets are now registry-backed instead of being a static one-wallet ass
 
 The design goal is "copy where edge still exists", not "copy everything late".
 
-### 7. Unified execution contract
+Risk evaluation is now two-stage:
+
+- hot-path fast gate
+  O(1) in-memory checks only: copy delay, duplicate/open position checks, opposite-side exposure, top-of-book liquidity, spread, and high-price / remaining-edge screens
+- cold-path audit trail
+  richer explanations, analytics, and serialized skip detail
+
+### 8. Unified execution contract
 
 `src/execution/order_executor.rs` now exposes the same fill contract in both modes:
 
@@ -100,7 +131,7 @@ Paper mode:
 
 This keeps paper behavior much closer to live behavior than the old "always fully filled" simulation.
 
-### 8. Portfolio, position identity, and lifecycle
+### 9. Portfolio, position identity, and lifecycle
 
 The portfolio system now uses a stronger identity model:
 
@@ -112,7 +143,7 @@ The portfolio system now uses a stronger identity model:
 
 This fixes the earlier asset-only matching problems that caused orphan exits and misleading PnL.
 
-### 9. Position registry and ownership
+### 10. Position registry and ownership
 
 `src/position_registry.rs` persists copied-position ownership independently of wallet activity:
 
@@ -122,7 +153,7 @@ This fixes the earlier asset-only matching problems that caused orphan exits and
 
 This is important because exit eligibility is now driven by owned positions, not just by whether a wallet is still active in the wallet registry.
 
-### 10. Exit management
+### 11. Exit management
 
 Exits are now first-class and mandatory.
 
@@ -140,11 +171,15 @@ The runtime in `src/main.rs` applies three exit layers:
 Important protections:
 
 - exits have priority over entries
+- exits are consumed from the hot queue before entries when `EXIT_PRIORITY_STRICT=true`
 - duplicate exits are blocked with a shared closing set
-- orphan exits use fallback resolution plus a short retry buffer
+- source SELL resolution always tries exact `PositionKey { condition_id, outcome, source_wallet }` ownership first
+- safe fallback resolution is limited to the same source wallet and same market/condition
+- unresolved source exits are persisted to a short retry buffer in `data/unresolved-exits.json`
+- `Closing` positions are revisited until they fill, escalate through mandatory/emergency unwind, or record an explicit failed-close reason
 - exit logic uses the position registry, so wallet removal does not strand positions
 
-### 11. Observability and health
+### 12. Observability and health
 
 Operational visibility is spread across:
 
@@ -155,7 +190,21 @@ Operational visibility is spread across:
 - `src/latency_monitor.rs`
   pause-and-reconnect fail-safe when the hot path slows down
 - `src/health.rs`
-  `GET /health` with readiness, counts, latency, pause state, and last error
+  `GET /health` with readiness, counts, latency, queue depth, degradation state, pause state, and last error
+
+The health surface and JSONL latency logs now expose per-stage timing for:
+
+- entry path
+- source-follow exit path
+- managed exit path
+
+and backpressure counters for:
+
+- hot entry queue depth
+- hot exit queue depth
+- cold-path queue depth
+- dropped diagnostics
+- degradation mode
 
 The Telegram summary now reports:
 
@@ -167,7 +216,17 @@ The Telegram summary now reports:
 
 and warns when exits have not executed yet.
 
-### 12. Log rotation and retention
+### 13. Persistence boundaries
+
+Latency-sensitive state updates now happen in memory first and flush on background intervals:
+
+- `data/portfolio-summary.json`
+- `data/state.json`
+- `data/execution-analytics-summary.json`
+
+Critical copied-position ownership transitions still persist through the position registry and lifecycle log so entry/exit ownership is not lost.
+
+### 14. Log rotation and retention
 
 There are now two JSONL logging patterns:
 
@@ -192,15 +251,15 @@ These use `src/rolling_jsonl.rs` and rotate when the active file reaches 30,000 
 
 ## Runtime Flow
 
-The end-to-end trading loop is:
+The latency-sensitive flow is now:
 
 1. Read market deltas from the market WebSocket.
-2. Update the local orderbook and infer a probable trade.
-3. Correlate that trade against wallet activity.
-4. Rank the wallet and market opportunity.
-5. Apply price-band, timing, liquidity, and exposure checks.
-6. Submit an order through the live or paper executor.
-7. Update the portfolio and position registry using filled size only.
+2. Parse the minimal market/activity fields needed for an immediate decision.
+3. Resolve direct tracked-wallet entries and source-follow exits through fast attribution.
+4. Apply the fast in-memory risk gate.
+5. Submit an order through the live or paper executor.
+6. Update in-memory portfolio / lifecycle state immediately.
+7. Flush diagnostics, summaries, and non-critical persistence on the cold path.
 8. Continue managing the position until source exit, TP/SL, or time exit closes it.
 
 ## Execution Modes
@@ -261,7 +320,9 @@ If you prefer the release binary directly:
 - EOA allowance flow: `POLYMARKET_USDC_ADDRESS`, `POLYMARKET_SPENDER_ADDRESS`, `AUTO_APPROVE_USDC_ALLOWANCE`, `USDC_APPROVAL_AMOUNT`
 - Wallet tracking: `TARGET_WALLETS`, optional authenticated activity credentials
 - Risk: `ENABLE_PRICE_BANDS`, `MIN_EDGE_THRESHOLD`, `MAX_COPY_DELAY_MS`, `MIN_LIQUIDITY`, `MIN_WALLET_SCORE`, `ALLOW_HEDGING`
-- Lifecycle and exits: `MAX_POSITION_AGE_HOURS`, `MAX_HOLD_TIME_SECONDS`, `ENABLE_EXIT_RETRY`
+- Lifecycle and exits: `MAX_POSITION_AGE_HOURS`, `MAX_HOLD_TIME_SECONDS`, `ENABLE_EXIT_RETRY`, `EXIT_RETRY_WINDOW_MS`, `EXIT_RETRY_INTERVAL_MS`, `CLOSING_MAX_AGE_MS`, `FORCE_EXIT_ON_CLOSING_TIMEOUT`
+- Latency-first hot path: `HOT_PATH_MODE`, `HOT_PATH_QUEUE_CAPACITY`, `COLD_PATH_QUEUE_CAPACITY`, `ATTRIBUTION_FAST_CACHE_CAPACITY`, `PARSE_TASKS_MARKET`, `PARSE_TASKS_WALLET`, `EXIT_PRIORITY_STRICT`
+- Deferred cold-path work: `PERSISTENCE_FLUSH_INTERVAL_MS`, `ANALYTICS_FLUSH_INTERVAL_MS`, `TELEGRAM_ASYNC_ONLY`
 - Logging: `ENABLE_LOG_ROTATION`, `LOG_MAX_LINES`, `ENABLE_TIME_ROTATION`, `LOG_ROTATE_HOURS`, `ENABLE_LOG_CLEARING`
 - Notifications and health: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `HEALTH_PORT`
 
@@ -275,6 +336,7 @@ Core state:
 - `data/telegram-daily-summary.json`
 - `data/wallets_active.json`
 - `data/positions.json`
+- `data/unresolved-exits.json`
 
 Operational logs:
 
