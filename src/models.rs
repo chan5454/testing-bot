@@ -244,6 +244,18 @@ pub struct BestQuote {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EquityPoint {
+    pub observed_at: DateTime<Utc>,
+    pub equity: Decimal,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RealizedTradePoint {
+    pub observed_at: DateTime<Utc>,
+    pub pnl: Decimal,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PortfolioSnapshot {
     pub fetched_at: DateTime<Utc>,
     pub total_value: Decimal,
@@ -253,7 +265,66 @@ pub struct PortfolioSnapshot {
     pub realized_pnl: Decimal,
     #[serde(default)]
     pub unrealized_pnl: Decimal,
+    #[serde(default)]
+    pub starting_equity: Decimal,
+    #[serde(default)]
+    pub current_equity: Decimal,
+    #[serde(default)]
+    pub peak_equity: Decimal,
+    #[serde(default)]
+    pub current_drawdown_pct: Decimal,
+    #[serde(default)]
+    pub rolling_drawdown_pct: Decimal,
+    #[serde(default)]
+    pub open_exposure_total: Decimal,
+    #[serde(default)]
+    pub open_positions_count: usize,
+    #[serde(default)]
+    pub consecutive_losses: u32,
+    #[serde(default)]
+    pub rolling_loss_count: u32,
+    #[serde(default)]
+    pub loss_cooldown_until: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub drawdown_guard_active: bool,
+    #[serde(default)]
+    pub hard_stop_active: bool,
+    #[serde(default)]
+    pub risk_utilization_pct: Decimal,
+    #[serde(default)]
+    pub recent_equity_samples: Vec<EquityPoint>,
+    #[serde(default)]
+    pub recent_realized_trade_points: Vec<RealizedTradePoint>,
     pub positions: Vec<PortfolioPosition>,
+}
+
+impl Default for PortfolioSnapshot {
+    fn default() -> Self {
+        Self {
+            fetched_at: Utc::now(),
+            total_value: Decimal::ZERO,
+            total_exposure: Decimal::ZERO,
+            cash_balance: Decimal::ZERO,
+            realized_pnl: Decimal::ZERO,
+            unrealized_pnl: Decimal::ZERO,
+            starting_equity: Decimal::ZERO,
+            current_equity: Decimal::ZERO,
+            peak_equity: Decimal::ZERO,
+            current_drawdown_pct: Decimal::ZERO,
+            rolling_drawdown_pct: Decimal::ZERO,
+            open_exposure_total: Decimal::ZERO,
+            open_positions_count: 0,
+            consecutive_losses: 0,
+            rolling_loss_count: 0,
+            loss_cooldown_until: None,
+            drawdown_guard_active: false,
+            hard_stop_active: false,
+            risk_utilization_pct: Decimal::ZERO,
+            recent_equity_samples: Vec::new(),
+            recent_realized_trade_points: Vec::new(),
+            positions: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -355,6 +426,14 @@ impl PortfolioPosition {
 }
 
 impl PortfolioSnapshot {
+    pub fn equity(&self) -> Decimal {
+        if self.current_equity > Decimal::ZERO {
+            self.current_equity
+        } else {
+            self.total_value
+        }
+    }
+
     pub fn market_exposure(&self, condition_id: &str) -> Decimal {
         self.active_positions()
             .iter()
@@ -363,11 +442,38 @@ impl PortfolioSnapshot {
             .sum()
     }
 
+    pub fn market_exposure_pct(&self, condition_id: &str) -> Decimal {
+        let equity = self.equity();
+        if equity <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+
+        (self.market_exposure(condition_id) / equity)
+            .max(Decimal::ZERO)
+            .min(Decimal::ONE)
+    }
+
     pub fn active_total_exposure(&self) -> Decimal {
         self.active_positions()
             .iter()
             .map(|position| position.current_value)
             .sum()
+    }
+
+    pub fn total_exposure_pct(&self) -> Decimal {
+        let equity = self.equity();
+        if equity <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+
+        (self.active_total_exposure() / equity)
+            .max(Decimal::ZERO)
+            .min(Decimal::ONE)
+    }
+
+    pub fn loss_cooldown_active(&self, now: DateTime<Utc>) -> bool {
+        self.loss_cooldown_until
+            .is_some_and(|cooldown_until| cooldown_until > now)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -815,6 +921,34 @@ pub struct ExecutionAnalyticsState {
     pub current_window_open_mtm_win_rate: Decimal,
     pub account_level_portfolio_pnl: Decimal,
     #[serde(default)]
+    pub current_equity: Decimal,
+    #[serde(default)]
+    pub starting_equity: Decimal,
+    #[serde(default)]
+    pub peak_equity: Decimal,
+    #[serde(default)]
+    pub current_drawdown_pct: Decimal,
+    #[serde(default)]
+    pub rolling_drawdown_pct: Decimal,
+    #[serde(default)]
+    pub open_exposure_total: Decimal,
+    #[serde(default)]
+    pub open_positions_count: usize,
+    #[serde(default)]
+    pub risk_utilization_pct: Decimal,
+    #[serde(default)]
+    pub consecutive_losses: u32,
+    #[serde(default)]
+    pub rolling_loss_count: u32,
+    #[serde(default)]
+    pub loss_cooldown_active: bool,
+    #[serde(default)]
+    pub drawdown_guard_active: bool,
+    #[serde(default)]
+    pub hard_stop_active: bool,
+    #[serde(default)]
+    pub risk_event_counts: BTreeMap<String, u64>,
+    #[serde(default)]
     pub cohorts: Vec<TradeCohort>,
 }
 
@@ -855,6 +989,20 @@ impl Default for ExecutionAnalyticsState {
             current_window_win_rate: Decimal::ZERO,
             current_window_open_mtm_win_rate: Decimal::ZERO,
             account_level_portfolio_pnl: Decimal::ZERO,
+            current_equity: Decimal::ZERO,
+            starting_equity: Decimal::ZERO,
+            peak_equity: Decimal::ZERO,
+            current_drawdown_pct: Decimal::ZERO,
+            rolling_drawdown_pct: Decimal::ZERO,
+            open_exposure_total: Decimal::ZERO,
+            open_positions_count: 0,
+            risk_utilization_pct: Decimal::ZERO,
+            consecutive_losses: 0,
+            rolling_loss_count: 0,
+            loss_cooldown_active: false,
+            drawdown_guard_active: false,
+            hard_stop_active: false,
+            risk_event_counts: BTreeMap::new(),
             cohorts: Vec::new(),
         }
     }

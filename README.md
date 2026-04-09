@@ -101,6 +101,8 @@ The rescanner remains enabled, but it is now firmly off the hot path. Active-wal
 - rejects thin books via visible-liquidity and spread checks
 - rejects price chasing, market cooldown churn, conflicting wallet signals, and hyperactive scalp wallets
 - computes a weighted trade-quality score before submit
+- sizes entries as the minimum of risk-percent-of-equity, absolute size cap, remaining total exposure, remaining market exposure, and available cash
+- blocks entries during drawdown guard, hard-stop, loss-streak cooldown, total exposure limit, or per-market exposure limit
 - rejects duplicate positions, stale positions, and opposite-side exposure unless `ALLOW_HEDGING=true`
 
 The design goal is "copy where edge still exists", not "copy everything late".
@@ -111,6 +113,8 @@ Risk evaluation is now two-stage:
   O(1) in-memory checks only: copy delay, duplicate/open position checks, opposite-side exposure, top-of-book liquidity, spread, and high-price / remaining-edge screens
 - cold-path audit trail
   richer explanations, analytics, and serialized skip detail
+
+The drawdown guard is intentionally asymmetric: new entries are blocked when equity/drawdown limits are breached, but source-follow and managed exits stay actionable. If `FORCE_CLOSE_ON_HARD_STOP=true`, the exit watcher submits emergency-exit closes for open positions after the hard-stop threshold is active.
 
 ### 8. Unified execution contract
 
@@ -143,7 +147,7 @@ The portfolio system now uses a stronger identity model:
 - `src/portfolio.rs` uses that key to match buys and sells
 - positions carry `PositionState::{Open, Closing, Closed, Stale}`
 - stale positions are isolated instead of deleted
-- `PortfolioSnapshot` tracks `realized_pnl`, `unrealized_pnl`, `total_exposure`, and cash
+- `PortfolioSnapshot` tracks `realized_pnl`, `unrealized_pnl`, `total_exposure`, cash, current/starting/peak equity, drawdown, rolling drawdown, open exposure, open-position count, loss streak, loss cooldown, hard-stop status, and risk utilization
 
 This fixes the earlier asset-only matching problems that caused orphan exits and misleading PnL.
 
@@ -359,6 +363,7 @@ If you prefer the release binary directly:
 - EOA allowance flow: `POLYMARKET_USDC_ADDRESS`, `POLYMARKET_SPENDER_ADDRESS`, `AUTO_APPROVE_USDC_ALLOWANCE`, `USDC_APPROVAL_AMOUNT`
 - Wallet tracking: `TARGET_WALLETS`, optional authenticated activity credentials
 - Risk: `ENABLE_PRICE_BANDS`, `MIN_EDGE_THRESHOLD`, `MAX_COPY_DELAY_MS`, `ENABLE_ULTRA_SHORT_MARKETS`, `MIN_VISIBLE_LIQUIDITY`, `MAX_SPREAD_BPS`, `MAX_ENTRY_SLIPPAGE`, `MIN_WALLET_AVG_HOLD_MS`, `MAX_WALLET_TRADES_PER_MIN`, `MARKET_COOLDOWN_MS`, `MIN_TRADE_QUALITY_SCORE`, `MIN_LIQUIDITY`, `MIN_WALLET_SCORE`, `ALLOW_HEDGING`
+- Position risk: `MAX_RISK_PER_TRADE_PCT`, `MAX_POSITION_SIZE_ABS`, `MAX_TOTAL_EXPOSURE_PCT`, `MAX_EXPOSURE_PER_MARKET_PCT`, `MAX_DRAWDOWN_PCT`, `HARD_STOP_DRAWDOWN_PCT`, `FORCE_CLOSE_ON_HARD_STOP`, `MAX_CONSECUTIVE_LOSSES`, `LOSS_COOLDOWN_MS`
 - Lifecycle and exits: `MAX_POSITION_AGE_HOURS`, `MAX_HOLD_TIME_SECONDS`, `ENABLE_EXIT_RETRY`, `EXIT_RETRY_WINDOW_MS`, `EXIT_RETRY_INTERVAL_MS`, `CLOSING_MAX_AGE_MS`, `FORCE_EXIT_ON_CLOSING_TIMEOUT`
 - Pending-open exit resolution: `UNRESOLVED_EXIT_INITIAL_RETRY_MS`, `UNRESOLVED_EXIT_MAX_RETRY_MS`, `UNRESOLVED_EXIT_TOTAL_WINDOW_MS`, `POSITION_PENDING_OPEN_TTL_MS`
 - Latency-first hot path: `HOT_PATH_MODE`, `HOT_PATH_QUEUE_CAPACITY`, `COLD_PATH_QUEUE_CAPACITY`, `ATTRIBUTION_FAST_CACHE_CAPACITY`, `PARSE_TASKS_MARKET`, `PARSE_TASKS_WALLET`, `EXIT_PRIORITY_STRICT`

@@ -807,6 +807,7 @@ mod tests {
                     stale_reason: None,
                 },
             ],
+            ..PortfolioSnapshot::default()
         }
     }
 
@@ -841,6 +842,7 @@ mod tests {
                 closing_escalation_level: 0,
                 stale_reason: None,
             }],
+            ..PortfolioSnapshot::default()
         }
     }
 

@@ -111,6 +111,7 @@ enum ManagedExitReason {
     TakeProfit,
     StopLoss,
     TimeExit,
+    HardStop,
 }
 
 impl ManagedExitReason {
@@ -120,6 +121,7 @@ impl ManagedExitReason {
             Self::TakeProfit => "TAKE_PROFIT",
             Self::StopLoss => "STOP_LOSS",
             Self::TimeExit => "TIME_EXIT",
+            Self::HardStop => "HARD_STOP",
         }
     }
 }
@@ -300,6 +302,24 @@ impl ExecutionAnalyticsTracker {
         self.persist_snapshot(snapshot);
     }
 
+    async fn record_risk_event(
+        &self,
+        event_name: &str,
+        portfolio: Option<&models::PortfolioSnapshot>,
+    ) {
+        let snapshot = {
+            let mut state = self.state.lock().await;
+            state.summary_generated_at = Utc::now();
+            state.trade_day = Utc::now().date_naive().to_string();
+            increment_string_counter(&mut state.risk_event_counts, event_name);
+            if let Some(portfolio) = portfolio {
+                refresh_analytics_from_portfolio(&mut state, portfolio, self.start_capital_usd);
+            }
+            state.clone()
+        };
+        self.persist_snapshot(snapshot);
+    }
+
     async fn sync_with_portfolio(&self, portfolio: &models::PortfolioSnapshot) {
         let snapshot = {
             let mut state = self.state.lock().await;
@@ -376,6 +396,19 @@ fn refresh_analytics_from_portfolio(
     state.current_window_unrealized_pnl = split.current_window_unrealized_pnl;
     state.legacy_unrealized_pnl = split.legacy_unrealized_pnl;
     state.account_level_portfolio_pnl = portfolio.total_value - start_capital_usd;
+    state.current_equity = portfolio.current_equity;
+    state.starting_equity = portfolio.starting_equity;
+    state.peak_equity = portfolio.peak_equity;
+    state.current_drawdown_pct = portfolio.current_drawdown_pct;
+    state.rolling_drawdown_pct = portfolio.rolling_drawdown_pct;
+    state.open_exposure_total = portfolio.open_exposure_total;
+    state.open_positions_count = portfolio.open_positions_count;
+    state.risk_utilization_pct = portfolio.risk_utilization_pct;
+    state.consecutive_losses = portfolio.consecutive_losses;
+    state.rolling_loss_count = portfolio.rolling_loss_count;
+    state.loss_cooldown_active = portfolio.loss_cooldown_active(Utc::now());
+    state.drawdown_guard_active = portfolio.drawdown_guard_active;
+    state.hard_stop_active = portfolio.hard_stop_active;
 
     refresh_open_cohort_marks(&mut state.cohorts, portfolio);
 
@@ -2089,6 +2122,11 @@ async fn process_trade(
             }
         }
     };
+    if decision.size_was_scaled {
+        analytics
+            .record_risk_event("position_size_scaled", Some(&current_portfolio))
+            .await;
+    }
     if matches!(side, ExecutionSide::Buy)
         && let Err(reason) =
             risk.enforce_entry_quality_pre_quote(entry, &market_quality_observation)
@@ -3003,6 +3041,16 @@ async fn record_trade_skip(
         reason,
     );
     analytics.record_skip(class, reason, portfolio).await;
+    if matches!(
+        reason.code,
+        "drawdown_guard_triggered"
+            | "hard_stop_triggered"
+            | "exposure_limit_reached"
+            | "market_exposure_limit"
+            | "loss_streak_guard_triggered"
+    ) {
+        analytics.record_risk_event(reason.code, portfolio).await;
+    }
     health
         .record_skip_latency(skip_processing_ms, reason.code)
         .await;
@@ -3503,6 +3551,7 @@ fn fail_safe_hedge_decision(result: &ExecutionSuccess) -> CopyDecision {
         side: result.order_request.side,
         notional: result.filled_notional,
         size: result.filled_size,
+        size_was_scaled: false,
         position_key: None,
         price_band: risk::get_price_band(result.filled_price),
         max_market_spread_bps: 0,
@@ -3551,6 +3600,7 @@ fn fail_safe_hedge_request_decision(
         side: opposite_side(pending_execution.order_request.side),
         notional: pending_execution.execution_result.filled_notional,
         size: pending_execution.execution_result.filled_size,
+        size_was_scaled: false,
         position_key: None,
         price_band: pending_execution.decision.price_band,
         max_market_spread_bps: pending_execution.decision.max_market_spread_bps,
@@ -3863,6 +3913,38 @@ async fn spawn_force_exit_watcher(
             })
             .cloned()
             .collect::<Vec<_>>();
+
+        if snapshot.hard_stop_active && portfolio.force_close_on_hard_stop() {
+            for position in positions.clone() {
+                let Some(quote) = orderbooks.best_quote(&position.asset).await else {
+                    continue;
+                };
+                if quote.best_bid.is_none() {
+                    continue;
+                }
+                if let Err(error) = attempt_managed_exit_position(
+                    &settings,
+                    ManagedExitReason::HardStop,
+                    position,
+                    quote,
+                    ExecutionMode::EmergencyExit { stage: 3 },
+                    false,
+                    portfolio.clone(),
+                    position_registry.clone(),
+                    position_resolver.clone(),
+                    executor.clone(),
+                    closing_positions.clone(),
+                    released_hot_task_tx.clone(),
+                    notifier.clone(),
+                    health.clone(),
+                    analytics.clone(),
+                )
+                .await
+                {
+                    warn!(?error, "hard-stop emergency exit attempt failed");
+                }
+            }
+        }
 
         for position in positions {
             let Some(quote) = orderbooks.best_quote(&position.asset).await else {
@@ -4307,6 +4389,7 @@ fn build_managed_exit_decision(
         side: ExecutionSide::Sell,
         notional: position.current_value,
         size: position.size,
+        size_was_scaled: false,
         position_key: Some(position.position_key()),
         price_band: risk::get_price_band(position.current_price),
         max_market_spread_bps: settings.max_market_spread_bps,
@@ -4363,7 +4446,7 @@ fn managed_exit_event_name(reason: ManagedExitReason) -> Option<&'static str> {
         ManagedExitReason::TakeProfit => Some("managed_exit_take_profit"),
         ManagedExitReason::StopLoss => Some("managed_exit_stop_loss"),
         ManagedExitReason::TimeExit => Some("managed_exit_time_limit"),
-        ManagedExitReason::SourceExit => None,
+        ManagedExitReason::SourceExit | ManagedExitReason::HardStop => None,
     }
 }
 
@@ -4372,6 +4455,7 @@ fn closing_reason_from_position(position: &models::PortfolioPosition) -> Managed
         "TAKE_PROFIT" => ManagedExitReason::TakeProfit,
         "STOP_LOSS" => ManagedExitReason::StopLoss,
         "TIME_EXIT" => ManagedExitReason::TimeExit,
+        "HARD_STOP" => ManagedExitReason::HardStop,
         _ => ManagedExitReason::SourceExit,
     }
 }
@@ -5168,134 +5252,24 @@ mod tests {
     use super::*;
 
     fn sample_settings(data_dir: std::path::PathBuf) -> Settings {
-        Settings {
-            execution_mode: crate::config::ExecutionMode::Paper,
-            polymarket_host: "https://example.com".to_owned(),
-            polymarket_data_api: "https://example.com".to_owned(),
-            polymarket_gamma_api: "https://example.com".to_owned(),
-            polymarket_market_ws: "wss://example.com".to_owned(),
-            polymarket_user_ws: "wss://example.com".to_owned(),
-            polymarket_activity_ws: "wss://example.com".to_owned(),
-            polymarket_chain_id: 137,
-            polymarket_signature_type: 0,
-            polymarket_private_key: None,
-            polymarket_funder_address: None,
-            polymarket_profile_address: None,
-            polygon_rpc_url: "https://polygon-rpc.com".to_owned(),
-            polygon_rpc_fallback_urls: Vec::new(),
-            rpc_latency_threshold: Duration::from_millis(300),
-            rpc_confirmation_timeout: Duration::from_secs(10),
-            min_required_matic: dec!(0.1),
-            min_required_usdc: dec!(25),
-            polymarket_usdc_address: "0x1".to_owned(),
-            polymarket_spender_address: "0x2".to_owned(),
-            auto_approve_usdc_allowance: false,
-            usdc_approval_amount: dec!(1000),
-            target_activity_ws_api_key: None,
-            target_activity_ws_secret: None,
-            target_activity_ws_passphrase: None,
-            target_profile_addresses: vec!["0xsource".to_owned()],
-            start_capital_usd: dec!(200),
-            paper_execution_delay: Duration::ZERO,
-            copy_only_new_trades: true,
-            source_trades_limit: 50,
-            http_timeout: Duration::from_secs(2),
-            market_cache_ttl: Duration::from_secs(10),
-            market_raw_ring_capacity: 128,
-            market_parser_workers: 1,
-            market_subscription_batch_size: 1,
-            market_subscription_delay: Duration::from_millis(1),
-            wallet_ring_capacity: 128,
-            wallet_parser_workers: 1,
-            wallet_subscription_batch_size: 1,
-            wallet_subscription_delay: Duration::from_millis(1),
-            hot_path_mode: true,
-            hot_path_queue_capacity: 32,
-            cold_path_queue_capacity: 128,
-            attribution_fast_cache_capacity: 64,
-            persistence_flush_interval: Duration::from_millis(250),
-            analytics_flush_interval: Duration::from_millis(500),
-            telegram_async_only: true,
-            fast_risk_only_on_hot_path: true,
-            exit_priority_strict: true,
-            parse_tasks_market: 1,
-            parse_tasks_wallet: 1,
-            liquidity_sweep_threshold: dec!(1),
-            imbalance_threshold: dec!(2),
-            delta_price_move_bps: 40,
-            delta_size_drop_ratio: dec!(0.25),
-            delta_min_size_drop: dec!(1),
-            inference_confirmation_window: Duration::from_millis(400),
-            activity_stream_enabled: true,
-            activity_match_window: Duration::from_millis(200),
-            activity_price_tolerance: dec!(0.01),
-            activity_size_tolerance_ratio: dec!(0.5),
-            activity_cache_ttl: Duration::from_millis(1500),
-            fallback_market_request_interval: Duration::from_millis(1000),
-            fallback_global_requests_per_minute: 30,
-            activity_correlation_window: Duration::from_millis(400),
-            attribution_lookback: Duration::from_millis(2500),
-            attribution_trades_limit: 100,
-            copy_scale_above_five_usd: dec!(0.25),
-            min_copy_notional_usd: dec!(1),
-            max_copy_notional_usd: dec!(25),
-            max_total_exposure_usd: dec!(150),
-            max_market_exposure_usd: dec!(40),
-            min_source_trade_usdc: dec!(1),
-            max_market_spread_bps: 500,
-            enable_ultra_short_markets: false,
-            min_visible_liquidity: dec!(50),
-            max_spread_bps: 500,
-            max_entry_slippage: dec!(0.03),
-            min_top_of_book_ratio: dec!(1),
-            max_slippage_bps: 300,
-            max_source_price_slippage_bps: 200,
-            latency_fail_safe_enabled: true,
-            max_latency: Duration::from_millis(500),
-            average_latency_threshold: Duration::from_millis(350),
-            latency_monitor_interval: Duration::from_millis(50),
-            latency_reconnect_settle: Duration::from_millis(750),
-            prediction_validation_timeout: Duration::from_millis(500),
-            log_attribution_events: true,
-            activity_parser_debug: false,
-            log_latency_events: true,
-            log_skipped_trades: true,
-            enable_log_rotation: true,
-            log_max_lines: 30_000,
-            enable_time_rotation: true,
-            log_rotate_hours: 6,
-            enable_log_clearing: false,
-            allow_buy: true,
-            allow_sell: true,
-            allow_hedging: false,
-            enable_price_bands: true,
-            enable_realistic_paper: true,
-            min_edge_threshold: dec!(0.05),
-            max_copy_delay_ms: 1_500,
-            min_liquidity: dec!(50),
-            min_wallet_score: dec!(0.6),
-            min_wallet_avg_hold_ms: 15_000,
-            max_wallet_trades_per_min: 6,
-            market_cooldown: Duration::from_secs(15),
-            min_trade_quality_score: dec!(0.65),
-            max_position_age_hours: 6,
-            max_hold_time_seconds: 1_800,
-            enable_exit_retry: true,
-            exit_retry_window: Duration::from_secs(30),
-            exit_retry_interval: Duration::from_millis(500),
-            unresolved_exit_initial_retry: Duration::from_millis(250),
-            unresolved_exit_total_window: Duration::from_secs(30),
-            unresolved_exit_max_retry: Duration::from_secs(4),
-            position_pending_open_ttl: Duration::from_secs(20),
-            rpc_global_rate_limit_per_second: 10,
-            rpc_per_market_rate_limit_per_second: 3,
-            closing_max_age: Duration::from_secs(30),
-            force_exit_on_closing_timeout: true,
-            telegram_bot_token: "token".to_owned(),
-            telegram_chat_id: "chat".to_owned(),
-            health_port: 3000,
-            data_dir,
-        }
+        let mut settings = Settings::default_for_tests(data_dir);
+        settings.polymarket_host = "https://example.com".to_owned();
+        settings.polymarket_data_api = "https://example.com".to_owned();
+        settings.polymarket_gamma_api = "https://example.com".to_owned();
+        settings.polymarket_market_ws = "wss://example.com".to_owned();
+        settings.polymarket_user_ws = "wss://example.com".to_owned();
+        settings.polymarket_activity_ws = "wss://example.com".to_owned();
+        settings.target_profile_addresses = vec!["0xsource".to_owned()];
+        settings.market_subscription_batch_size = 1;
+        settings.market_subscription_delay = Duration::from_millis(1);
+        settings.wallet_subscription_batch_size = 1;
+        settings.wallet_subscription_delay = Duration::from_millis(1);
+        settings.hot_path_queue_capacity = 32;
+        settings.cold_path_queue_capacity = 128;
+        settings.attribution_fast_cache_capacity = 64;
+        settings.min_top_of_book_ratio = dec!(1);
+        settings.prediction_validation_timeout = Duration::from_millis(500);
+        settings
     }
 
     fn sample_closing_position(
@@ -5423,6 +5397,7 @@ mod tests {
                 side: ExecutionSide::Buy,
                 notional: dec!(2),
                 size: dec!(4),
+                size_was_scaled: false,
                 position_key: None,
                 price_band: risk::PriceBand::Mid,
                 max_market_spread_bps: 300,
@@ -5457,6 +5432,7 @@ mod tests {
             side: ExecutionSide::Buy,
             notional: dec!(5),
             size: dec!(0),
+            size_was_scaled: false,
             position_key: None,
             price_band: risk::PriceBand::Mid,
             max_market_spread_bps: 0,
@@ -5484,6 +5460,7 @@ mod tests {
             side: ExecutionSide::Buy,
             notional: dec!(5),
             size: dec!(0),
+            size_was_scaled: false,
             position_key: None,
             price_band: risk::PriceBand::High,
             max_market_spread_bps: 0,
@@ -5508,6 +5485,7 @@ mod tests {
             side: ExecutionSide::Buy,
             notional: dec!(5),
             size: dec!(0),
+            size_was_scaled: false,
             position_key: None,
             price_band: risk::PriceBand::High,
             max_market_spread_bps: 0,
@@ -5532,6 +5510,7 @@ mod tests {
             side: ExecutionSide::Buy,
             notional: dec!(5.10),
             size: dec!(0),
+            size_was_scaled: false,
             position_key: None,
             price_band: risk::PriceBand::Mid,
             max_market_spread_bps: 0,
@@ -5556,6 +5535,7 @@ mod tests {
             side: ExecutionSide::Sell,
             notional: dec!(5),
             size: dec!(10),
+            size_was_scaled: false,
             position_key: None,
             price_band: risk::PriceBand::Mid,
             max_market_spread_bps: 0,
@@ -5583,6 +5563,7 @@ mod tests {
             side: ExecutionSide::Sell,
             notional: dec!(5),
             size: dec!(10),
+            size_was_scaled: false,
             position_key: None,
             price_band: risk::PriceBand::Mid,
             max_market_spread_bps: 300,
@@ -5616,6 +5597,7 @@ mod tests {
             side: ExecutionSide::Buy,
             notional: dec!(5),
             size: dec!(0),
+            size_was_scaled: false,
             position_key: None,
             price_band: risk::PriceBand::Mid,
             max_market_spread_bps: 300,
@@ -5643,6 +5625,7 @@ mod tests {
             side: ExecutionSide::Buy,
             notional: dec!(5),
             size: dec!(0),
+            size_was_scaled: false,
             position_key: None,
             price_band: risk::PriceBand::Mid,
             max_market_spread_bps: 0,
@@ -5671,6 +5654,7 @@ mod tests {
             side: ExecutionSide::Buy,
             notional: dec!(5),
             size: dec!(0),
+            size_was_scaled: false,
             position_key: None,
             price_band: risk::PriceBand::Mid,
             max_market_spread_bps: 0,
@@ -5723,6 +5707,7 @@ mod tests {
             side: ExecutionSide::Buy,
             notional: dec!(5),
             size: dec!(0),
+            size_was_scaled: false,
             position_key: None,
             price_band: risk::PriceBand::Mid,
             max_market_spread_bps: 0,
@@ -5785,6 +5770,7 @@ mod tests {
             side: ExecutionSide::Sell,
             notional: dec!(5),
             size: dec!(10),
+            size_was_scaled: false,
             position_key: None,
             price_band: risk::PriceBand::Mid,
             max_market_spread_bps: 0,
@@ -5845,6 +5831,7 @@ mod tests {
             side: ExecutionSide::Buy,
             notional: dec!(5),
             size: dec!(0),
+            size_was_scaled: false,
             position_key: None,
             price_band: risk::PriceBand::Mid,
             max_market_spread_bps: 0,
@@ -5870,6 +5857,7 @@ mod tests {
             side: ExecutionSide::Sell,
             notional: dec!(5),
             size: dec!(10),
+            size_was_scaled: false,
             position_key: None,
             price_band: risk::PriceBand::High,
             max_market_spread_bps: 0,
@@ -6018,6 +6006,7 @@ mod tests {
             realized_pnl: dec!(0),
             unrealized_pnl: dec!(0),
             positions: vec![position],
+            ..models::PortfolioSnapshot::default()
         };
         snapshot.cleanup_stale_positions(settings.max_position_age_hours);
         assert_eq!(snapshot.positions[0].state, models::PositionState::Closing);

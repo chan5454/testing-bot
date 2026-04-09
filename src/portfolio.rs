@@ -16,9 +16,24 @@ use tracing::warn;
 use crate::config::{ExecutionMode, Settings};
 use crate::execution::{ExecutionSide, ExecutionStatus, ExecutionSuccess};
 use crate::models::{
-    ActivityEntry, PortfolioPosition, PortfolioSnapshot, PositionEntry, PositionKey, PositionState,
+    ActivityEntry, EquityPoint, PortfolioPosition, PortfolioSnapshot, PositionEntry, PositionKey,
+    PositionState, RealizedTradePoint,
 };
 use crate::orderbook::orderbook_state::{MarketSnapshot, OrderBookState};
+
+const ROLLING_DRAWDOWN_WINDOW: Duration = Duration::from_secs(5 * 60);
+const EQUITY_SAMPLE_MIN_INTERVAL: Duration = Duration::from_secs(1);
+const RECENT_REALIZED_TRADE_LIMIT: usize = 20;
+
+#[derive(Clone)]
+struct PortfolioRiskConfig {
+    start_capital_usd: Decimal,
+    max_drawdown_pct: Decimal,
+    hard_stop_drawdown_pct: Decimal,
+    max_consecutive_losses: u32,
+    loss_cooldown: Duration,
+    force_close_on_hard_stop: bool,
+}
 
 #[derive(Clone)]
 pub struct PortfolioService {
@@ -31,6 +46,7 @@ pub struct PortfolioService {
     persistence_dirty: Arc<AtomicBool>,
     flush_notify: Arc<Notify>,
     start_capital_usd: Decimal,
+    risk_config: PortfolioRiskConfig,
     paper_orderbooks: Option<Arc<OrderBookState>>,
     max_position_age_hours: u64,
 }
@@ -58,6 +74,14 @@ impl PortfolioService {
             persistence_dirty: Arc::new(AtomicBool::new(false)),
             flush_notify: Arc::new(Notify::new()),
             start_capital_usd: settings.start_capital_usd,
+            risk_config: PortfolioRiskConfig {
+                start_capital_usd: settings.start_capital_usd,
+                max_drawdown_pct: settings.max_drawdown_pct.max(Decimal::ZERO),
+                hard_stop_drawdown_pct: settings.hard_stop_drawdown_pct.max(Decimal::ZERO),
+                max_consecutive_losses: settings.max_consecutive_losses,
+                loss_cooldown: settings.loss_cooldown,
+                force_close_on_hard_stop: settings.force_close_on_hard_stop,
+            },
             paper_orderbooks,
             max_position_age_hours: settings.max_position_age_hours,
         };
@@ -101,6 +125,7 @@ impl PortfolioService {
         };
         self.revalue_snapshot(&mut snapshot).await;
         snapshot.cleanup_stale_positions(self.max_position_age_hours);
+        apply_risk_state(&mut snapshot, &self.risk_config);
         *self.cache.write().await = Some(snapshot.clone());
         Ok(snapshot)
     }
@@ -124,6 +149,7 @@ impl PortfolioService {
     ) -> Result<PortfolioSnapshot> {
         normalize_snapshot(&mut snapshot);
         snapshot.cleanup_stale_positions(self.max_position_age_hours);
+        apply_risk_state(&mut snapshot, &self.risk_config);
         *self.cache.write().await = Some(snapshot.clone());
         self.schedule_persist();
         Ok(snapshot)
@@ -139,6 +165,7 @@ impl PortfolioService {
         let mut projected = snapshot.clone();
         apply_position_fill(&mut projected, source, result, false, position_key_hint)?;
         projected.cleanup_stale_positions(self.max_position_age_hours);
+        apply_risk_state(&mut projected, &self.risk_config);
         Ok(projected)
     }
 
@@ -159,9 +186,14 @@ impl PortfolioService {
         apply_paper_trade(&mut snapshot, source, result, position_key_hint)?;
         self.revalue_snapshot(&mut snapshot).await;
         snapshot.cleanup_stale_positions(self.max_position_age_hours);
+        apply_risk_state(&mut snapshot, &self.risk_config);
         *self.cache.write().await = Some(snapshot.clone());
         self.schedule_persist();
         Ok(snapshot)
+    }
+
+    pub fn force_close_on_hard_stop(&self) -> bool {
+        self.risk_config.force_close_on_hard_stop
     }
 
     async fn fetch_live_positions(&self) -> Result<PortfolioSnapshot> {
@@ -255,6 +287,21 @@ impl PortfolioService {
             cash_balance: (total_value - exposure).max(Decimal::ZERO),
             realized_pnl: Decimal::ZERO,
             unrealized_pnl: Decimal::ZERO,
+            starting_equity: Decimal::ZERO,
+            current_equity: Decimal::ZERO,
+            peak_equity: Decimal::ZERO,
+            current_drawdown_pct: Decimal::ZERO,
+            rolling_drawdown_pct: Decimal::ZERO,
+            open_exposure_total: Decimal::ZERO,
+            open_positions_count: 0,
+            consecutive_losses: 0,
+            rolling_loss_count: 0,
+            loss_cooldown_until: None,
+            drawdown_guard_active: false,
+            hard_stop_active: false,
+            risk_utilization_pct: Decimal::ZERO,
+            recent_equity_samples: Vec::new(),
+            recent_realized_trade_points: Vec::new(),
             positions: normalized,
         })
     }
@@ -373,6 +420,24 @@ fn initial_paper_snapshot(start_capital_usd: Decimal) -> PortfolioSnapshot {
         cash_balance: start_capital_usd,
         realized_pnl: Decimal::ZERO,
         unrealized_pnl: Decimal::ZERO,
+        starting_equity: start_capital_usd,
+        current_equity: start_capital_usd,
+        peak_equity: start_capital_usd,
+        current_drawdown_pct: Decimal::ZERO,
+        rolling_drawdown_pct: Decimal::ZERO,
+        open_exposure_total: Decimal::ZERO,
+        open_positions_count: 0,
+        consecutive_losses: 0,
+        rolling_loss_count: 0,
+        loss_cooldown_until: None,
+        drawdown_guard_active: false,
+        hard_stop_active: false,
+        risk_utilization_pct: Decimal::ZERO,
+        recent_equity_samples: vec![EquityPoint {
+            observed_at: Utc::now(),
+            equity: start_capital_usd,
+        }],
+        recent_realized_trade_points: Vec::new(),
         positions: Vec::new(),
     }
 }
@@ -488,18 +553,19 @@ fn apply_position_fill(
                     requested_key.source_wallet
                 )
             })?;
-            let position = &mut snapshot.positions[index];
-            if position.size < result.filled_size {
+            if snapshot.positions[index].size < result.filled_size {
                 return Err(anyhow!(
                     "paper sell size {} exceeds held size {}",
                     result.filled_size,
-                    position.size
+                    snapshot.positions[index].size
                 ));
             }
 
-            let realized_pnl =
-                (result.filled_price - position.average_entry_price) * result.filled_size;
+            let average_entry_price = snapshot.positions[index].average_entry_price;
+            let realized_pnl = (result.filled_price - average_entry_price) * result.filled_size;
             snapshot.realized_pnl += realized_pnl;
+            record_realized_trade(snapshot, realized_pnl);
+            let position = &mut snapshot.positions[index];
             position.state = PositionState::Closing;
             position.closing_started_at = Some(Utc::now());
             position.size -= result.filled_size;
@@ -555,6 +621,7 @@ impl PortfolioService {
             }
         }
         recalculate_snapshot_totals(snapshot);
+        apply_risk_state(snapshot, &self.risk_config);
     }
 }
 
@@ -717,6 +784,9 @@ fn normalize_snapshot(snapshot: &mut PortfolioSnapshot) {
         }
         position.unrealized_pnl = position.current_value - position.cost_basis;
     }
+    if snapshot.starting_equity.is_zero() {
+        snapshot.starting_equity = snapshot.total_value.max(snapshot.cash_balance);
+    }
 }
 
 fn recalculate_snapshot_totals(snapshot: &mut PortfolioSnapshot) {
@@ -732,6 +802,150 @@ fn recalculate_snapshot_totals(snapshot: &mut PortfolioSnapshot) {
         .map(|position| position.unrealized_pnl)
         .sum();
     snapshot.total_value = snapshot.cash_balance + snapshot.total_exposure;
+}
+
+fn record_realized_trade(snapshot: &mut PortfolioSnapshot, realized_pnl: Decimal) {
+    let now = Utc::now();
+    snapshot
+        .recent_realized_trade_points
+        .push(RealizedTradePoint {
+            observed_at: now,
+            pnl: realized_pnl,
+        });
+    if snapshot.recent_realized_trade_points.len() > RECENT_REALIZED_TRADE_LIMIT {
+        let drop_count = snapshot.recent_realized_trade_points.len() - RECENT_REALIZED_TRADE_LIMIT;
+        snapshot.recent_realized_trade_points.drain(0..drop_count);
+    }
+    snapshot.rolling_loss_count = snapshot
+        .recent_realized_trade_points
+        .iter()
+        .filter(|point| point.pnl < Decimal::ZERO)
+        .count() as u32;
+    if realized_pnl < Decimal::ZERO {
+        snapshot.consecutive_losses = snapshot.consecutive_losses.saturating_add(1);
+    } else if realized_pnl > Decimal::ZERO {
+        snapshot.consecutive_losses = 0;
+        snapshot.loss_cooldown_until = None;
+    }
+}
+
+fn apply_risk_state(snapshot: &mut PortfolioSnapshot, config: &PortfolioRiskConfig) {
+    let now = Utc::now();
+    let starting_equity = if snapshot.starting_equity > Decimal::ZERO {
+        snapshot.starting_equity
+    } else {
+        config
+            .start_capital_usd
+            .max(snapshot.total_value)
+            .max(Decimal::ZERO)
+    };
+    snapshot.starting_equity = starting_equity;
+    snapshot.current_equity = snapshot.total_value.max(Decimal::ZERO);
+    snapshot.peak_equity = snapshot
+        .peak_equity
+        .max(starting_equity)
+        .max(snapshot.current_equity);
+    snapshot.open_exposure_total = snapshot.active_total_exposure();
+    snapshot.open_positions_count = snapshot
+        .positions
+        .iter()
+        .filter(|position| position.is_active())
+        .count();
+    snapshot.current_drawdown_pct = drawdown_pct(snapshot.peak_equity, snapshot.current_equity);
+    snapshot.risk_utilization_pct =
+        ratio_pct(snapshot.open_exposure_total, snapshot.current_equity);
+    update_recent_equity_samples(snapshot, now);
+    snapshot.rolling_drawdown_pct = rolling_drawdown(snapshot, now);
+    snapshot.rolling_loss_count = snapshot
+        .recent_realized_trade_points
+        .iter()
+        .filter(|point| point.pnl < Decimal::ZERO)
+        .count() as u32;
+
+    if snapshot
+        .loss_cooldown_until
+        .is_some_and(|cooldown_until| cooldown_until <= now)
+    {
+        snapshot.loss_cooldown_until = None;
+        snapshot.consecutive_losses = 0;
+    } else if config.max_consecutive_losses > 0
+        && snapshot.consecutive_losses >= config.max_consecutive_losses
+        && config.loss_cooldown > Duration::ZERO
+        && snapshot.loss_cooldown_until.is_none()
+    {
+        snapshot.loss_cooldown_until = Some(
+            now + chrono::TimeDelta::from_std(config.loss_cooldown)
+                .unwrap_or_else(|_| chrono::TimeDelta::zero()),
+        );
+    }
+
+    snapshot.drawdown_guard_active = config.max_drawdown_pct > Decimal::ZERO
+        && snapshot.current_drawdown_pct >= config.max_drawdown_pct;
+    if config.hard_stop_drawdown_pct > Decimal::ZERO
+        && snapshot.current_drawdown_pct >= config.hard_stop_drawdown_pct
+    {
+        snapshot.hard_stop_active = true;
+    }
+}
+
+fn update_recent_equity_samples(snapshot: &mut PortfolioSnapshot, now: DateTime<Utc>) {
+    let should_replace_latest = snapshot
+        .recent_equity_samples
+        .last()
+        .and_then(|point| {
+            (now.signed_duration_since(point.observed_at)
+                < chrono::TimeDelta::from_std(EQUITY_SAMPLE_MIN_INTERVAL)
+                    .unwrap_or_else(|_| chrono::TimeDelta::zero()))
+            .then_some(())
+        })
+        .is_some();
+
+    if should_replace_latest {
+        if let Some(last) = snapshot.recent_equity_samples.last_mut() {
+            last.observed_at = now;
+            last.equity = snapshot.current_equity;
+        }
+    } else {
+        snapshot.recent_equity_samples.push(EquityPoint {
+            observed_at: now,
+            equity: snapshot.current_equity,
+        });
+    }
+
+    let window = chrono::TimeDelta::from_std(ROLLING_DRAWDOWN_WINDOW)
+        .unwrap_or_else(|_| chrono::TimeDelta::zero());
+    snapshot
+        .recent_equity_samples
+        .retain(|point| now.signed_duration_since(point.observed_at) <= window);
+}
+
+fn rolling_drawdown(snapshot: &PortfolioSnapshot, now: DateTime<Utc>) -> Decimal {
+    let window = chrono::TimeDelta::from_std(ROLLING_DRAWDOWN_WINDOW)
+        .unwrap_or_else(|_| chrono::TimeDelta::zero());
+    let rolling_peak = snapshot
+        .recent_equity_samples
+        .iter()
+        .filter(|point| now.signed_duration_since(point.observed_at) <= window)
+        .map(|point| point.equity)
+        .max()
+        .unwrap_or(snapshot.current_equity);
+    drawdown_pct(rolling_peak, snapshot.current_equity)
+}
+
+fn drawdown_pct(peak_equity: Decimal, current_equity: Decimal) -> Decimal {
+    if peak_equity <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    ((peak_equity - current_equity).max(Decimal::ZERO) / peak_equity)
+        .max(Decimal::ZERO)
+        .min(Decimal::ONE)
+}
+
+fn ratio_pct(numerator: Decimal, denominator: Decimal) -> Decimal {
+    if denominator <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    (numerator / denominator).max(Decimal::ZERO)
 }
 
 fn decimal_price_from_value(size: Decimal, value: Decimal) -> Decimal {
@@ -872,134 +1086,7 @@ mod tests {
     }
 
     fn sample_settings(data_dir: std::path::PathBuf) -> Settings {
-        Settings {
-            execution_mode: ExecutionMode::Paper,
-            polymarket_host: "https://clob.polymarket.com".to_owned(),
-            polymarket_data_api: "https://data-api.polymarket.com".to_owned(),
-            polymarket_gamma_api: "https://gamma-api.polymarket.com".to_owned(),
-            polymarket_market_ws: "wss://example.com/ws/market".to_owned(),
-            polymarket_user_ws: "wss://example.com/ws/user".to_owned(),
-            polymarket_activity_ws: "wss://example.com/ws/activity".to_owned(),
-            polymarket_chain_id: 137,
-            polymarket_signature_type: 0,
-            polymarket_private_key: None,
-            polymarket_funder_address: None,
-            polymarket_profile_address: None,
-            polygon_rpc_url: "https://polygon-rpc.com".to_owned(),
-            polygon_rpc_fallback_urls: Vec::new(),
-            rpc_latency_threshold: Duration::from_millis(300),
-            rpc_confirmation_timeout: Duration::from_secs(10),
-            min_required_matic: dec!(0.1),
-            min_required_usdc: dec!(25),
-            polymarket_usdc_address: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174".to_owned(),
-            polymarket_spender_address: "0x0000000000000000000000000000000000000001".to_owned(),
-            auto_approve_usdc_allowance: false,
-            usdc_approval_amount: dec!(1000),
-            target_activity_ws_api_key: None,
-            target_activity_ws_secret: None,
-            target_activity_ws_passphrase: None,
-            target_profile_addresses: vec!["0xabc".to_owned()],
-            start_capital_usd: dec!(200),
-            paper_execution_delay: Duration::ZERO,
-            copy_only_new_trades: true,
-            source_trades_limit: 50,
-            http_timeout: Duration::from_secs(2),
-            market_cache_ttl: Duration::from_secs(10),
-            market_raw_ring_capacity: 8192,
-            market_parser_workers: 1,
-            market_subscription_batch_size: 100,
-            market_subscription_delay: Duration::from_millis(40),
-            wallet_ring_capacity: 1024,
-            wallet_parser_workers: 1,
-            wallet_subscription_batch_size: 250,
-            wallet_subscription_delay: Duration::from_millis(20),
-            hot_path_mode: true,
-            hot_path_queue_capacity: 128,
-            cold_path_queue_capacity: 512,
-            attribution_fast_cache_capacity: 256,
-            persistence_flush_interval: Duration::from_millis(250),
-            analytics_flush_interval: Duration::from_millis(500),
-            telegram_async_only: true,
-            fast_risk_only_on_hot_path: true,
-            exit_priority_strict: true,
-            parse_tasks_market: 1,
-            parse_tasks_wallet: 1,
-            liquidity_sweep_threshold: dec!(1),
-            imbalance_threshold: dec!(2),
-            delta_price_move_bps: 40,
-            delta_size_drop_ratio: dec!(0.25),
-            delta_min_size_drop: dec!(1),
-            inference_confirmation_window: Duration::from_millis(400),
-            activity_stream_enabled: true,
-            activity_match_window: Duration::from_millis(200),
-            activity_price_tolerance: dec!(0.01),
-            activity_size_tolerance_ratio: dec!(0.5),
-            activity_cache_ttl: Duration::from_millis(1500),
-            fallback_market_request_interval: Duration::from_millis(1000),
-            fallback_global_requests_per_minute: 30,
-            activity_correlation_window: Duration::from_millis(400),
-            attribution_lookback: Duration::from_millis(2500),
-            attribution_trades_limit: 100,
-            copy_scale_above_five_usd: dec!(0.25),
-            min_copy_notional_usd: dec!(1),
-            max_copy_notional_usd: dec!(25),
-            max_total_exposure_usd: dec!(150),
-            max_market_exposure_usd: dec!(40),
-            min_source_trade_usdc: dec!(0),
-            max_market_spread_bps: 500,
-            enable_ultra_short_markets: false,
-            min_visible_liquidity: dec!(50),
-            max_spread_bps: 500,
-            max_entry_slippage: dec!(0.03),
-            min_top_of_book_ratio: dec!(1.25),
-            max_slippage_bps: 300,
-            max_source_price_slippage_bps: 200,
-            latency_fail_safe_enabled: true,
-            max_latency: Duration::from_millis(500),
-            average_latency_threshold: Duration::from_millis(350),
-            latency_monitor_interval: Duration::from_millis(50),
-            latency_reconnect_settle: Duration::from_millis(750),
-            prediction_validation_timeout: Duration::from_millis(1500),
-            log_attribution_events: true,
-            activity_parser_debug: false,
-            log_latency_events: true,
-            log_skipped_trades: true,
-            enable_log_rotation: true,
-            log_max_lines: 30_000,
-            enable_time_rotation: true,
-            log_rotate_hours: 6,
-            enable_log_clearing: false,
-            allow_buy: true,
-            allow_sell: true,
-            allow_hedging: false,
-            enable_price_bands: true,
-            enable_realistic_paper: true,
-            min_edge_threshold: dec!(0.05),
-            max_copy_delay_ms: 1_500,
-            min_liquidity: dec!(50),
-            min_wallet_score: dec!(0.6),
-            min_wallet_avg_hold_ms: 15_000,
-            max_wallet_trades_per_min: 6,
-            market_cooldown: Duration::from_secs(15),
-            min_trade_quality_score: dec!(0.65),
-            max_position_age_hours: 6,
-            max_hold_time_seconds: 1_800,
-            enable_exit_retry: true,
-            exit_retry_window: Duration::from_secs(30),
-            exit_retry_interval: Duration::from_millis(500),
-            unresolved_exit_initial_retry: Duration::from_millis(250),
-            unresolved_exit_total_window: Duration::from_secs(30),
-            unresolved_exit_max_retry: Duration::from_secs(4),
-            position_pending_open_ttl: Duration::from_secs(20),
-            rpc_global_rate_limit_per_second: 10,
-            rpc_per_market_rate_limit_per_second: 3,
-            closing_max_age: Duration::from_secs(30),
-            force_exit_on_closing_timeout: true,
-            telegram_bot_token: "token".to_owned(),
-            telegram_chat_id: "chat".to_owned(),
-            health_port: 3000,
-            data_dir,
-        }
+        Settings::default_for_tests(data_dir)
     }
 
     #[test]
@@ -1125,6 +1212,7 @@ mod tests {
                 closing_escalation_level: 0,
                 stale_reason: None,
             }],
+            ..PortfolioSnapshot::default()
         };
         let layout = PortfolioSnapshot {
             fetched_at: Utc::now(),
@@ -1181,6 +1269,7 @@ mod tests {
                     stale_reason: None,
                 },
             ],
+            ..PortfolioSnapshot::default()
         };
 
         rehydrate_live_wallet_positions(&mut fetched, &layout);
@@ -1233,6 +1322,7 @@ mod tests {
                 closing_escalation_level: 0,
                 stale_reason: None,
             }],
+            ..PortfolioSnapshot::default()
         };
         let layout = PortfolioSnapshot {
             fetched_at: Utc::now(),
@@ -1264,6 +1354,7 @@ mod tests {
                 closing_escalation_level: 0,
                 stale_reason: None,
             }],
+            ..PortfolioSnapshot::default()
         };
 
         rehydrate_live_wallet_positions(&mut fetched, &layout);
