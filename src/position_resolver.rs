@@ -121,6 +121,15 @@ impl PositionResolver {
         entry: &ActivityEntry,
     ) -> Result<bool> {
         let now = Utc::now();
+        let mut state = self.state.write().expect("position resolver write lock");
+        if state
+            .positions
+            .get(&position_key)
+            .is_some_and(|record| !pending_record_expired(record, now))
+        {
+            return Ok(false);
+        }
+
         let pending_expires_at =
             now + TimeDelta::from_std(self.pending_open_ttl).unwrap_or_else(|_| TimeDelta::zero());
         let record = ResolverPositionRecord {
@@ -139,19 +148,10 @@ impl PositionResolver {
             closing_reason: None,
         };
 
-        let mut state = self.state.write().expect("position resolver write lock");
-        let newly_registered = !state.positions.contains_key(&position_key)
-            || matches!(
-                state
-                    .positions
-                    .get(&position_key)
-                    .map(|record| record.state),
-                None | Some(ResolverPositionState::PendingOpen)
-            );
         state.positions.insert(position_key, record);
         drop(state);
         self.schedule_persist();
-        Ok(newly_registered)
+        Ok(true)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -694,6 +694,39 @@ mod tests {
             }
             other => panic!("expected fallback match, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn register_pending_open_is_idempotent_for_active_keys() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let resolver = PositionResolver::load(&sample_settings(temp_dir.path().to_path_buf()))
+            .expect("resolver");
+        let entry = sample_entry("BUY", "YES");
+        let key = entry.position_key();
+
+        assert!(
+            resolver
+                .register_pending_open(key.clone(), &entry)
+                .expect("first register")
+        );
+        assert!(
+            !resolver
+                .register_pending_open(key.clone(), &entry)
+                .expect("duplicate pending register")
+        );
+
+        resolver
+            .promote_to_open(&key, &sample_position())
+            .expect("promote");
+        assert!(
+            !resolver
+                .register_pending_open(key.clone(), &entry)
+                .expect("duplicate open register")
+        );
+        assert!(matches!(
+            resolver.resolve_owned_position(&entry, Utc::now()),
+            ResolveResult::FoundOpen(_)
+        ));
     }
 
     #[test]

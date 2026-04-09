@@ -546,8 +546,7 @@ fn market_subscription_plan(settings: &Settings, reconnect_attempt: u32) -> Mark
     };
     let mut batch_size = settings
         .market_subscription_batch_size
-        .max(1)
-        .min(MARKET_SUBSCRIPTION_SAFE_MAX_BATCH_SIZE);
+        .clamp(1, MARKET_SUBSCRIPTION_SAFE_MAX_BATCH_SIZE);
     let mut delay = settings.market_subscription_delay.max(min_delay);
 
     if reconnect_attempt >= 2 {

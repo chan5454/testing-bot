@@ -130,6 +130,7 @@ impl AttributionLogger {
         .await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_generation_reset(
         &self,
         event_type: &'static str,
@@ -186,6 +187,7 @@ impl AttributionLogger {
         .await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_activity_event(
         &self,
         event_type: &'static str,
@@ -295,6 +297,7 @@ impl AttributionLogger {
         .await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_heartbeat(
         &self,
         health: &HealthSnapshot,

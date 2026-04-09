@@ -267,12 +267,12 @@ impl PositionRegistry {
                 position.status = PositionLifecycleStatus::Closed;
                 position.closed_at = Some(Utc::now().timestamp_millis());
                 closed_position = Some(position.clone());
-            } else if let Some(fallback_position_id) = fallback_position_id.as_ref() {
-                if let Some(position) = state.get_mut(fallback_position_id) {
-                    position.status = PositionLifecycleStatus::Closed;
-                    position.closed_at = Some(Utc::now().timestamp_millis());
-                    closed_position = Some(position.clone());
-                }
+            } else if let Some(fallback_position_id) = fallback_position_id.as_ref()
+                && let Some(position) = state.get_mut(fallback_position_id)
+            {
+                position.status = PositionLifecycleStatus::Closed;
+                position.closed_at = Some(Utc::now().timestamp_millis());
+                closed_position = Some(position.clone());
             }
         }
 

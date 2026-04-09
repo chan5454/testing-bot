@@ -63,6 +63,7 @@ impl LatencyLogger {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_processed_trade(
         &self,
         source: &ActivityEntry,
@@ -188,6 +189,7 @@ impl LatencyLogger {
         self.write_event(&event).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_prediction_validation(
         &self,
         signal: &crate::detection::trade_inference::ConfirmedTradeSignal,

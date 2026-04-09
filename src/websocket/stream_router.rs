@@ -199,10 +199,9 @@ async fn process_event(
                     parse_completed_at_utc,
                 )
                 .await?
+                && let Some(signal) = detector.detect(&delta)
             {
-                if let Some(signal) = detector.detect(&delta) {
-                    inference.record_probable_trade(signal, delta.observed_at);
-                }
+                inference.record_probable_trade(signal, delta.observed_at);
             }
         }
         ParsedMarketEvent::PriceUpdates {
@@ -225,10 +224,9 @@ async fn process_event(
                     parse_completed_at_utc,
                 )
                 .await?
+                && let Some(signal) = detector.detect(&delta)
             {
-                if let Some(signal) = detector.detect(&delta) {
-                    inference.record_probable_trade(signal, delta.observed_at);
-                }
+                inference.record_probable_trade(signal, delta.observed_at);
             }
         }
         ParsedMarketEvent::LastTrade(confirmation) => {
@@ -328,7 +326,7 @@ fn parse_price_change_events(
             condition_id: message.market.clone(),
             updates,
             received_at,
-            received_at_utc: received_at_utc.clone(),
+            received_at_utc,
             parse_completed_at,
             parse_completed_at_utc,
         })

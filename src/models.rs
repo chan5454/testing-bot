@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+#[cfg(debug_assertions)]
+use std::collections::BTreeSet;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
@@ -426,6 +428,78 @@ impl PortfolioPosition {
 }
 
 impl PortfolioSnapshot {
+    #[track_caller]
+    pub fn debug_assert_invariants(&self) {
+        #[cfg(debug_assertions)]
+        {
+            let mut active_keys = BTreeSet::new();
+            for position in &self.positions {
+                debug_assert!(
+                    position.size >= Decimal::ZERO,
+                    "portfolio position has negative size: {:?}",
+                    position.position_key()
+                );
+                debug_assert!(
+                    position.current_value >= Decimal::ZERO,
+                    "portfolio position has negative exposure value: {:?}",
+                    position.position_key()
+                );
+
+                match position.state {
+                    PositionState::Open => {
+                        debug_assert!(
+                            position.closing_started_at.is_none(),
+                            "open position retained closing_started_at: {:?}",
+                            position.position_key()
+                        );
+                    }
+                    PositionState::Closing => {
+                        debug_assert!(
+                            position.closing_started_at.is_some(),
+                            "closing position is missing closing_started_at: {:?}",
+                            position.position_key()
+                        );
+                    }
+                    PositionState::Closed => {
+                        debug_assert!(
+                            position.size.is_zero(),
+                            "closed position still has non-zero size: {:?}",
+                            position.position_key()
+                        );
+                    }
+                    PositionState::Stale => {
+                        debug_assert!(
+                            position.stale_reason.is_some(),
+                            "stale position is missing stale_reason: {:?}",
+                            position.position_key()
+                        );
+                    }
+                }
+
+                if position.is_active() {
+                    let key = position.position_key();
+                    debug_assert!(
+                        !key.condition_id.is_empty()
+                            && !key.outcome.is_empty()
+                            && !key.source_wallet.is_empty(),
+                        "active copied position has an incomplete PositionKey: {:?}",
+                        key
+                    );
+                    debug_assert!(
+                        active_keys.insert(key.clone()),
+                        "duplicate active copied-position key in portfolio: {:?}",
+                        key
+                    );
+                }
+            }
+
+            debug_assert!(
+                self.active_total_exposure() >= Decimal::ZERO,
+                "portfolio total exposure is negative"
+            );
+        }
+    }
+
     pub fn equity(&self) -> Decimal {
         if self.current_equity > Decimal::ZERO {
             self.current_equity

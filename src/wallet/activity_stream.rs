@@ -323,6 +323,7 @@ struct ActivityCorrelationBuffer {
 }
 
 impl WalletActivityStream {
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         settings: Settings,
         catalog: AssetCatalog,
@@ -526,6 +527,7 @@ impl WalletActivityStream {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_activity_coordinator(
     _client: Client,
     settings: Settings,
@@ -610,9 +612,7 @@ async fn run_activity_coordinator(
                 }
 
                 for command in commands {
-                    let signal = match command {
-                        ActivityCommand::ObserveMarketSignal(signal) => signal,
-                    };
+                    let ActivityCommand::ObserveMarketSignal(signal) = command;
                     if signal.generation < current_generation {
                         attribution_logger
                             .record_signal_event(
@@ -2000,6 +2000,7 @@ fn parse_public_activity_trade_messages(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_public_activity_trade_events(
     value: &Value,
     generation: u64,
@@ -2042,10 +2043,9 @@ fn collect_public_activity_trade_events(
                 parse_completed_at,
                 parse_completed_at_utc,
                 &context,
-            ) {
-                if seen_event_ids.insert(event.event_id.clone()) {
-                    output.push(event);
-                }
+            ) && seen_event_ids.insert(event.event_id.clone())
+            {
+                output.push(event);
             }
 
             for key in ACTIVITY_FIELD_KEYS {

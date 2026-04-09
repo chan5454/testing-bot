@@ -717,12 +717,10 @@ async fn select_rpc_endpoint(
     latency_threshold: Duration,
 ) -> Result<(String, Duration)> {
     let probe_timeout = latency_threshold.max(Duration::from_millis(300));
-    let probes = join_all(
-        endpoints
-            .iter()
-            .cloned()
-            .map(|endpoint| async move { probe_rpc_endpoint(endpoint, probe_timeout).await }),
-    )
+    let probes = join_all(endpoints.iter().map(|endpoint| {
+        let endpoint = endpoint.clone();
+        async move { probe_rpc_endpoint(endpoint, probe_timeout).await }
+    }))
     .await;
 
     let mut successful = probes

@@ -229,6 +229,21 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     }
 }
 
+fn restored_created_at(path: &Path, max_duration: Duration) -> Instant {
+    let Some(age) = file_age(path) else {
+        return Instant::now();
+    };
+    let bounded_age = age.min(max_duration);
+    Instant::now()
+        .checked_sub(bounded_age)
+        .unwrap_or_else(Instant::now)
+}
+
+fn file_age(path: &Path) -> Option<Duration> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    SystemTime::now().duration_since(modified).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,19 +336,4 @@ mod tests {
         assert_eq!(current.lines().count(), 1);
         assert!(current.contains(r#""line":3"#));
     }
-}
-
-fn restored_created_at(path: &Path, max_duration: Duration) -> Instant {
-    let Some(age) = file_age(path) else {
-        return Instant::now();
-    };
-    let bounded_age = age.min(max_duration);
-    Instant::now()
-        .checked_sub(bounded_age)
-        .unwrap_or_else(Instant::now)
-}
-
-fn file_age(path: &Path) -> Option<Duration> {
-    let modified = fs::metadata(path).ok()?.modified().ok()?;
-    SystemTime::now().duration_since(modified).ok()
 }

@@ -99,7 +99,6 @@ pub struct Settings {
     pub persistence_flush_interval: Duration,
     pub analytics_flush_interval: Duration,
     pub telegram_async_only: bool,
-    pub fast_risk_only_on_hot_path: bool,
     pub exit_priority_strict: bool,
     pub parse_tasks_market: usize,
     pub parse_tasks_wallet: usize,
@@ -256,7 +255,6 @@ impl Settings {
             persistence_flush_interval: Duration::from_millis(250),
             analytics_flush_interval: Duration::from_millis(500),
             telegram_async_only: true,
-            fast_risk_only_on_hot_path: true,
             exit_priority_strict: true,
             parse_tasks_market: 1,
             parse_tasks_wallet: 1,
@@ -440,7 +438,6 @@ impl Settings {
                 500_u64,
             )?),
             telegram_async_only: parse_or_default("TELEGRAM_ASYNC_ONLY", true)?,
-            fast_risk_only_on_hot_path: parse_or_default("FAST_RISK_ONLY_ON_HOT_PATH", true)?,
             exit_priority_strict: parse_or_default("EXIT_PRIORITY_STRICT", true)?,
             parse_tasks_market: parse_or_default_alias(
                 &["PARSE_TASKS_MARKET", "MARKET_PARSER_WORKERS"],

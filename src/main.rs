@@ -1356,6 +1356,7 @@ fn report_dotenv_load() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_hot_path_executor(
     mut hot_path_rx: crate::runtime::hot_path::HotPathReceiver<HotPathTradeTask>,
     hot_path_result_tx: mpsc::UnboundedSender<HotPathExecutionResult>,
@@ -1401,6 +1402,7 @@ async fn run_hot_path_executor(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_hot_path_task(
     task: HotPathTradeTask,
     risk: &RiskEngine,
@@ -1441,6 +1443,7 @@ async fn execute_hot_path_task(
     HotPathExecutionResult { task, outcome }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_hot_path_result(
     result: HotPathExecutionResult,
     settings: &Settings,
@@ -1485,6 +1488,7 @@ async fn handle_hot_path_result(
                     trade_rate_limiter.release(*claim_id);
                 }
                 Ok(TradeProcessingOutcome::Executed(executed_trade)) => {
+                    let executed_trade = *executed_trade;
                     pending_validations.insert(PendingPredictionExecution {
                         signal_key: signal_key.clone(),
                         signal: result.task.matched_trade.signal.clone(),
@@ -1712,7 +1716,7 @@ struct HotPathExecutionResult {
 enum TradeProcessingOutcome {
     Skipped(SkipReason),
     Deferred(DeferredTrade),
-    Executed(ExecutedTrade),
+    Executed(Box<ExecutedTrade>),
 }
 
 struct DeferredTrade {
@@ -1838,6 +1842,7 @@ impl TradeRateLimiter {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_trade(
     task: &HotPathTradeTask,
     risk: &RiskEngine,
@@ -2083,43 +2088,35 @@ async fn process_trade(
         }
     }
 
-    let decision = loop {
-        let evaluation = match side {
-            ExecutionSide::Sell => {
-                if let Some(resolved_position) = resolved_exit_position.clone() {
-                    risk.evaluate_sell_from_resolved_position(entry, resolved_position)
-                } else if risk.fast_risk_only_on_hot_path() {
-                    risk.evaluate_fast(entry, &current_portfolio)
-                } else {
-                    risk.evaluate(entry, &current_portfolio)
-                }
+    let evaluation = match side {
+        ExecutionSide::Sell => match resolved_exit_position.clone() {
+            Some(resolved_position) => {
+                risk.evaluate_sell_from_resolved_position(entry, resolved_position)
             }
-            ExecutionSide::Buy => {
-                if risk.fast_risk_only_on_hot_path() {
-                    risk.evaluate_fast(entry, &current_portfolio)
-                } else {
-                    risk.evaluate(entry, &current_portfolio)
-                }
-            }
-        };
-        match evaluation {
-            Ok(decision) => break decision,
-            Err(reason) => {
-                record_trade_skip(
-                    entry,
-                    signal,
-                    risk,
-                    health,
-                    latency_logger,
-                    analytics,
-                    Some(&current_portfolio),
-                    None,
-                    classify_rejected_trade(side, has_copied_inventory),
-                    &reason,
-                )
-                .await;
-                return Ok(TradeProcessingOutcome::Skipped(reason));
-            }
+            None => Err(SkipReason::new(
+                "resolved_exit_position_missing",
+                "source exit was resolved, but no local owned-position metadata was available",
+            )),
+        },
+        ExecutionSide::Buy => risk.evaluate(entry, &current_portfolio),
+    };
+    let decision = match evaluation {
+        Ok(decision) => decision,
+        Err(reason) => {
+            record_trade_skip(
+                entry,
+                signal,
+                risk,
+                health,
+                latency_logger,
+                analytics,
+                Some(&current_portfolio),
+                None,
+                classify_rejected_trade(side, has_copied_inventory),
+                &reason,
+            )
+            .await;
+            return Ok(TradeProcessingOutcome::Skipped(reason));
         }
     };
     if decision.size_was_scaled {
@@ -2154,7 +2151,29 @@ async fn process_trade(
     if matches!(side, ExecutionSide::Buy)
         && let Some(position_key) = decision.position_key.as_ref()
     {
-        position_resolver.register_pending_open(position_key.clone(), entry)?;
+        if !position_resolver.register_pending_open(position_key.clone(), entry)? {
+            let reason = SkipReason::new(
+                "position_exists",
+                format!(
+                    "position already registered for condition {} outcome {} wallet {}",
+                    position_key.condition_id, position_key.outcome, position_key.source_wallet
+                ),
+            );
+            record_trade_skip(
+                entry,
+                signal,
+                risk,
+                health,
+                latency_logger,
+                analytics,
+                Some(&current_portfolio),
+                None,
+                classify_rejected_trade(side, true),
+                &reason,
+            )
+            .await;
+            return Ok(TradeProcessingOutcome::Skipped(reason));
+        }
         analytics
             .record_exit_event("position_pending_registered", Some(&current_portfolio))
             .await;
@@ -2371,7 +2390,7 @@ async fn process_trade(
         return Ok(TradeProcessingOutcome::Skipped(reason));
     }
     let request = match build_execution_request_with_mode(
-        &entry,
+        entry,
         &decision,
         &resolved_quote.quote,
         execution_mode,
@@ -2646,7 +2665,7 @@ async fn process_trade(
         .await;
     if let Err(error) = latency_logger
         .record_processed_trade(
-            &entry,
+            entry,
             &request,
             &result,
             &stage_timestamps,
@@ -2696,6 +2715,11 @@ async fn process_trade(
         .await
     {
         warn!(?error, "failed to update position registry after execution");
+        resync_position_registry_after_persist_error(
+            position_registry,
+            &current_portfolio,
+            "hot_path_execution",
+        );
     }
     analytics
         .record_processed(
@@ -2722,14 +2746,14 @@ async fn process_trade(
         health,
         analytics,
     );
-    Ok(TradeProcessingOutcome::Executed(ExecutedTrade {
+    Ok(TradeProcessingOutcome::Executed(Box::new(ExecutedTrade {
         source_entry: entry.clone(),
         decision: decision.clone(),
         order_request: request,
         execution_result: result,
         submitted_at,
         submission_completed_at,
-    }))
+    })))
 }
 
 async fn finalize_failed_pending_open(
@@ -2755,6 +2779,7 @@ async fn finalize_failed_pending_open(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn project_execution_state_into_cache(
     portfolio: &PortfolioService,
     position_resolver: &PositionResolver,
@@ -2884,6 +2909,24 @@ async fn persist_failed_close_attempt_state(
     }
 }
 
+fn resync_position_registry_after_persist_error(
+    position_registry: &PositionRegistry,
+    snapshot: &models::PortfolioSnapshot,
+    context: &'static str,
+) {
+    if let Err(sync_error) = position_registry.sync_from_portfolio(snapshot) {
+        warn!(
+            ?sync_error,
+            context, "position registry reconciliation failed after write error"
+        );
+    } else {
+        warn!(
+            context,
+            "position registry reconciled from portfolio after write error"
+        );
+    }
+}
+
 async fn claim_closing_position(
     closing_positions: &ClosingPositions,
     position_key: &PositionKey,
@@ -2903,6 +2946,7 @@ async fn release_closing_position(
     closing_positions.remove(position_key);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_post_trade_side_effects(
     entry: ActivityEntry,
     decision: CopyDecision,
@@ -3011,6 +3055,7 @@ fn spawn_post_trade_side_effects(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record_trade_skip(
     entry: &ActivityEntry,
     signal: &ConfirmedTradeSignal,
@@ -3267,6 +3312,7 @@ fn is_executable_quote(quote: &models::BestQuote, side: ExecutionSide) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_expired_prediction_validations(
     pending_validations: &mut PendingPredictionTracker,
     executor: Arc<dyn TradeExecutor>,
@@ -3389,6 +3435,7 @@ async fn handle_expired_prediction_validations(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn attempt_fail_safe_hedge(
     pending_execution: PendingPredictionExecution,
     executor: Arc<dyn TradeExecutor>,
@@ -3874,6 +3921,7 @@ async fn spawn_unresolved_exit_retry_worker(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_force_exit_watcher(
     settings: Settings,
     portfolio: Arc<PortfolioService>,
@@ -4148,6 +4196,7 @@ async fn spawn_log_retention_maintainer(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn attempt_managed_exit_position(
     settings: &Settings,
     reason: ManagedExitReason,
@@ -4187,7 +4236,7 @@ async fn attempt_managed_exit_position(
     let _ = position_resolver.mark_closing(&position_key, reason.as_str());
     if let Err(error) = portfolio.store_snapshot(closing_snapshot.clone()).await {
         release_closing_position(&closing_positions, Some(&position_key)).await;
-        return Err(error.into());
+        return Err(error);
     }
     if record_managed_metric && let Some(event_name) = managed_exit_event_name(reason) {
         analytics
@@ -4318,6 +4367,11 @@ async fn attempt_managed_exit_position(
         warn!(
             ?error,
             "failed to update position registry after managed exit"
+        );
+        resync_position_registry_after_persist_error(
+            &position_registry,
+            &closing_snapshot,
+            "managed_exit_execution",
         );
     }
     analytics
@@ -4941,7 +4995,7 @@ fn scale_bps_threshold(value: u32, numerator: u32, denominator: u32) -> u32 {
     if value == 0 {
         return 0;
     }
-    (((value as u64 * numerator as u64) + denominator as u64 - 1) / denominator as u64) as u32
+    (value as u64 * numerator as u64).div_ceil(denominator as u64) as u32
 }
 
 fn slippage_bps_for_mode(

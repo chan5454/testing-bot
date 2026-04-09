@@ -126,6 +126,7 @@ impl PortfolioService {
         self.revalue_snapshot(&mut snapshot).await;
         snapshot.cleanup_stale_positions(self.max_position_age_hours);
         apply_risk_state(&mut snapshot, &self.risk_config);
+        snapshot.debug_assert_invariants();
         *self.cache.write().await = Some(snapshot.clone());
         Ok(snapshot)
     }
@@ -150,6 +151,7 @@ impl PortfolioService {
         normalize_snapshot(&mut snapshot);
         snapshot.cleanup_stale_positions(self.max_position_age_hours);
         apply_risk_state(&mut snapshot, &self.risk_config);
+        snapshot.debug_assert_invariants();
         *self.cache.write().await = Some(snapshot.clone());
         self.schedule_persist();
         Ok(snapshot)
@@ -166,6 +168,7 @@ impl PortfolioService {
         apply_position_fill(&mut projected, source, result, false, position_key_hint)?;
         projected.cleanup_stale_positions(self.max_position_age_hours);
         apply_risk_state(&mut projected, &self.risk_config);
+        projected.debug_assert_invariants();
         Ok(projected)
     }
 
@@ -187,6 +190,7 @@ impl PortfolioService {
         self.revalue_snapshot(&mut snapshot).await;
         snapshot.cleanup_stale_positions(self.max_position_age_hours);
         apply_risk_state(&mut snapshot, &self.risk_config);
+        snapshot.debug_assert_invariants();
         *self.cache.write().await = Some(snapshot.clone());
         self.schedule_persist();
         Ok(snapshot)
@@ -605,19 +609,19 @@ fn apply_position_fill(
 impl PortfolioService {
     async fn revalue_snapshot(&self, snapshot: &mut PortfolioSnapshot) {
         normalize_snapshot(snapshot);
-        if self.mode == ExecutionMode::Paper {
-            if let Some(orderbooks) = &self.paper_orderbooks {
-                for position in &mut snapshot.positions {
-                    if let Some(mark_price) = position_mark_price(
-                        orderbooks.market_snapshot(&position.asset).await,
-                        position.current_price,
-                    ) {
-                        position.current_price = mark_price;
-                    }
-                    position.current_value = position.size * position.current_price;
-                    position.cost_basis = position.size * position.average_entry_price;
-                    position.unrealized_pnl = position.current_value - position.cost_basis;
+        if self.mode == ExecutionMode::Paper
+            && let Some(orderbooks) = &self.paper_orderbooks
+        {
+            for position in &mut snapshot.positions {
+                if let Some(mark_price) = position_mark_price(
+                    orderbooks.market_snapshot(&position.asset).await,
+                    position.current_price,
+                ) {
+                    position.current_price = mark_price;
                 }
+                position.current_value = position.size * position.current_price;
+                position.cost_basis = position.size * position.average_entry_price;
+                position.unrealized_pnl = position.current_value - position.cost_basis;
             }
         }
         recalculate_snapshot_totals(snapshot);

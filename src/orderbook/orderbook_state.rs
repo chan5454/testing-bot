@@ -225,6 +225,7 @@ impl OrderBookState {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn apply_price_updates(
         &self,
         asset_id: &str,
@@ -276,17 +277,18 @@ impl OrderBookState {
         book_state.metadata = metadata.clone();
         book_state.book = top_levels(&book_state.bids, &book_state.asks);
         book_state.observed_at = observed_at;
-        if !book_state.tick_size.is_zero() && !book_state.min_order_size.is_zero() {
-            if let Ok(current_quote) = best_quote_from_book(
+        if !book_state.tick_size.is_zero()
+            && !book_state.min_order_size.is_zero()
+            && let Ok(current_quote) = best_quote_from_book(
                 asset_id.to_owned(),
                 &book_state.book,
                 book_state.tick_size,
                 book_state.min_order_size,
                 book_state.neg_risk,
-            ) {
-                book_state.last_valid_quote = Some(current_quote);
-                book_state.last_valid_quote_observed_at = Some(observed_at);
-            }
+            )
+        {
+            book_state.last_valid_quote = Some(current_quote);
+            book_state.last_valid_quote_observed_at = Some(observed_at);
         }
 
         if previous == OrderBook::default() {
@@ -322,10 +324,11 @@ impl OrderBookState {
     }
 
     pub async fn refresh_book_snapshot(&self, asset_id: &str) -> Result<Option<BestQuote>> {
-        if let Some(quote) = self.best_quote(asset_id).await {
-            if !quote.tick_size.is_zero() && !quote.min_order_size.is_zero() {
-                return Ok(Some(quote));
-            }
+        if let Some(quote) = self.best_quote(asset_id).await
+            && !quote.tick_size.is_zero()
+            && !quote.min_order_size.is_zero()
+        {
+            return Ok(Some(quote));
         }
 
         let book = self
@@ -382,13 +385,13 @@ impl OrderBookState {
             .as_ref()
             .and_then(|quote| quote.best_bid_size)
             .or_else(|| decimal_from_size(book.book.bids[0].size).ok().flatten())
-            .or_else(|| Some(book.min_order_size));
+            .or(Some(book.min_order_size));
         let ask_size = book
             .last_valid_quote
             .as_ref()
             .and_then(|quote| quote.best_ask_size)
             .or_else(|| decimal_from_size(book.book.asks[0].size).ok().flatten())
-            .or_else(|| Some(book.min_order_size));
+            .or(Some(book.min_order_size));
 
         let (best_bid, best_ask) = match side {
             ExecutionSide::Buy => (Some(bid_seed), Some(ask_seed.max(reference_price))),
@@ -603,6 +606,7 @@ fn decimal_from_f64_lossy(value: f64) -> Option<Decimal> {
     Decimal::from_f64_retain(value)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn delta_from_books(
     metadata: AssetMetadata,
     previous: OrderBook,

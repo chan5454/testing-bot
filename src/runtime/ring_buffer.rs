@@ -42,7 +42,7 @@ impl<T> RingBuffer<T> {
                     let dropped_total = self.dropped_items.fetch_add(1, Ordering::Relaxed) + 1;
                     if dropped_total == 1
                         || dropped_total.is_power_of_two()
-                        || dropped_total % 1024 == 0
+                        || dropped_total.is_multiple_of(1024)
                     {
                         warn!(
                             dropped_total,

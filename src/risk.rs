@@ -141,10 +141,6 @@ impl RiskEngine {
         self.settings.exit_retry_interval
     }
 
-    pub fn fast_risk_only_on_hot_path(&self) -> bool {
-        self.settings.fast_risk_only_on_hot_path
-    }
-
     pub fn observe_source_trade(&self, entry: &ActivityEntry) -> MarketQualityObservation {
         let now_ms = current_time_ms().unwrap_or_default();
         let event_timestamp_ms = normalized_timestamp_ms(entry.timestamp).unwrap_or(now_ms as i64);
@@ -167,17 +163,16 @@ impl RiskEngine {
             wallet_stats.recent_trade_timestamps_ms.pop_front();
         }
 
-        if matches!(side, ExecutionSide::Sell) {
-            if let Some(open_timestamp_ms) = wallet_stats
+        if matches!(side, ExecutionSide::Sell)
+            && let Some(open_timestamp_ms) = wallet_stats
                 .open_entries_by_key
                 .remove(&entry.position_key())
-                && event_timestamp_ms > open_timestamp_ms
-            {
-                wallet_stats.total_hold_ms = wallet_stats
-                    .total_hold_ms
-                    .saturating_add(event_timestamp_ms.saturating_sub(open_timestamp_ms) as u128);
-                wallet_stats.hold_samples = wallet_stats.hold_samples.saturating_add(1);
-            }
+            && event_timestamp_ms > open_timestamp_ms
+        {
+            wallet_stats.total_hold_ms = wallet_stats
+                .total_hold_ms
+                .saturating_add(event_timestamp_ms.saturating_sub(open_timestamp_ms) as u128);
+            wallet_stats.hold_samples = wallet_stats.hold_samples.saturating_add(1);
         }
 
         wallet_stats
@@ -494,10 +489,28 @@ impl RiskEngine {
         entry: &ActivityEntry,
         portfolio: &PortfolioSnapshot,
     ) -> Result<CopyDecision, SkipReason> {
-        self.evaluate_fast(entry, portfolio)
+        match entry.side.as_str() {
+            "BUY" if self.settings.allow_buy => self.evaluate_buy(entry, portfolio),
+            "SELL" if self.settings.allow_sell => Err(SkipReason::new(
+                "sell_requires_resolved_position",
+                "sell risk evaluation requires a resolver/portfolio-owned position; use evaluate_sell_from_resolved_position",
+            )),
+            "BUY" => Err(SkipReason::new(
+                "buy_disabled",
+                "buy copying is disabled by ALLOW_BUY",
+            )),
+            "SELL" => Err(SkipReason::new(
+                "sell_disabled",
+                "sell copying is disabled by ALLOW_SELL",
+            )),
+            other => Err(SkipReason::new(
+                "unsupported_side",
+                format!("unsupported trade side {other}"),
+            )),
+        }
     }
 
-    pub fn evaluate_fast(
+    fn evaluate_buy(
         &self,
         entry: &ActivityEntry,
         portfolio: &PortfolioSnapshot,
@@ -532,12 +545,6 @@ impl RiskEngine {
                 "source trade price is zero",
             ));
         }
-        let source_size = entry.size_decimal().map_err(|error| {
-            SkipReason::new(
-                "invalid_source_size",
-                format!("failed to parse source size: {error}"),
-            )
-        })?;
         let price_band = get_price_band(source_price);
         let base_scaled_notional =
             scaled_notional(source_notional, self.settings.copy_scale_above_five_usd);
@@ -548,159 +555,117 @@ impl RiskEngine {
         let remaining_market =
             (self.market_exposure_cap(portfolio) - market_exposure).max(Decimal::ZERO);
 
-        match entry.side.as_str() {
-            "BUY" if self.settings.allow_buy => {
-                self.enforce_entry_risk_limits(entry, portfolio)?;
-                let price_band_rules = self.price_band_rules(source_price, price_band)?;
-                tracing::info!(
-                    price_band = price_band.as_str(),
-                    source_price = %source_price.round_dp(4),
-                    source_wallet = %entry.proxy_wallet,
-                    condition_id = %entry.condition_id,
-                    "price_band_selected"
-                );
-                if let Some(delay_ms) = copy_delay_ms(entry.timestamp)
-                    && delay_ms > self.settings.max_copy_delay_ms
-                {
-                    tracing::info!(
-                        reason_code = "late_entry_rejected",
-                        delay_ms,
-                        max_copy_delay_ms = self.settings.max_copy_delay_ms,
-                        source_wallet = %entry.proxy_wallet,
-                        condition_id = %entry.condition_id,
-                        "late_entry_rejected"
-                    );
-                    return Err(SkipReason::new(
-                        "too_late_strict",
-                        format!(
-                            "source trade delay {}ms exceeded max {}ms",
-                            delay_ms, self.settings.max_copy_delay_ms
-                        ),
-                    ));
-                }
-                let requested_key = entry.position_key();
-                if portfolio.has_stale_position_key(&requested_key)
-                    || portfolio.has_stale_position_for_condition(&entry.condition_id)
-                {
-                    tracing::info!(
-                        reason_code = "stale_position_ignored",
-                        condition_id = %entry.condition_id,
-                        outcome = %entry.outcome,
-                        source_wallet = %entry.proxy_wallet,
-                        "stale_position_ignored"
-                    );
-                    return Err(SkipReason::new(
-                        "stale_position_ignored",
-                        format!(
-                            "stale_position_ignored: condition {} is isolated from new entries",
-                            entry.condition_id
-                        ),
-                    ));
-                }
-                if portfolio.has_position_key(&requested_key) {
-                    return Err(SkipReason::new(
-                        "position_exists",
-                        format!(
-                            "position already exists for condition {} outcome {} wallet {}",
-                            entry.condition_id, entry.outcome, entry.proxy_wallet
-                        ),
-                    ));
-                }
-                if !self.settings.allow_hedging
-                    && let Some(existing) =
-                        portfolio.opposite_side_position(&entry.condition_id, &entry.outcome)
-                {
-                    tracing::info!(
-                        reason_code = "opposite_side_blocked",
-                        condition_id = %entry.condition_id,
-                        requested_outcome = %entry.outcome,
-                        existing_outcome = %existing.outcome,
-                        "opposite_side_blocked"
-                    );
-                    return Err(SkipReason::new(
-                        "opposite_side_blocked",
-                        format!(
-                            "opposite_side_blocked: existing outcome {} for condition {} prevents {}",
-                            existing.outcome, entry.condition_id, entry.outcome
-                        ),
-                    ));
-                }
-                let scaled_notional = (base_scaled_notional
-                    * price_band_rules.size_multiplier
-                    * wallet_performance_multiplier(portfolio, &entry.proxy_wallet))
-                .min(self.settings.max_copy_notional_usd)
-                .max(Decimal::ZERO);
-                let allowed_notional = scaled_notional
-                    .min(self.per_trade_notional_cap(portfolio))
-                    .min(self.settings.max_position_size_abs.max(Decimal::ZERO))
-                    .min(remaining_total)
-                    .min(remaining_market)
-                    .min(portfolio.cash_balance.max(Decimal::ZERO));
-                if allowed_notional < self.settings.min_copy_notional_usd {
-                    return Err(SkipReason::new(
-                        "buy_notional_below_minimum",
-                        format!(
-                            "allowed copy notional {} is below minimum {} after exposure and cash caps",
-                            allowed_notional.round_dp(4),
-                            self.settings.min_copy_notional_usd.round_dp(4)
-                        ),
-                    ));
-                }
-                Ok(CopyDecision {
-                    token_id: entry.asset.clone(),
-                    side: ExecutionSide::Buy,
-                    notional: allowed_notional,
-                    size: Decimal::ZERO,
-                    size_was_scaled: allowed_notional < scaled_notional,
-                    position_key: Some(requested_key),
-                    price_band,
-                    max_market_spread_bps: price_band_rules.max_spread_bps,
-                    min_top_of_book_ratio: self.settings.min_top_of_book_ratio,
-                    min_visible_liquidity_usd: self.settings.min_liquidity.max(Decimal::ZERO),
-                    max_slippage_bps: price_band_rules.max_slippage_bps,
-                    max_source_price_slippage_bps: price_band_rules.max_slippage_bps,
-                    min_edge_threshold: self.settings.min_edge_threshold.max(Decimal::ZERO),
-                })
-            }
-            "SELL" if self.settings.allow_sell => {
-                let Some(resolved_position) = portfolio.resolve_position_to_sell(entry) else {
-                    tracing::info!(
-                        reason_code = "no_position_to_sell",
-                        condition_id = %entry.condition_id,
-                        outcome = %entry.outcome,
-                        source_wallet = %entry.proxy_wallet,
-                        asset = %entry.asset,
-                        "no_position_to_sell"
-                    );
-                    return Err(SkipReason::new(
-                        "no_position_to_sell",
-                        format!(
-                            "portfolio does not hold asset {} for wallet {}",
-                            entry.asset, entry.proxy_wallet
-                        ),
-                    ));
-                };
-                self.evaluate_sell_from_resolved_position_internal(
-                    entry,
-                    resolved_position,
-                    source_notional,
-                    source_size,
-                    price_band,
-                )
-            }
-            "BUY" => Err(SkipReason::new(
-                "buy_disabled",
-                "buy copying is disabled by ALLOW_BUY",
-            )),
-            "SELL" => Err(SkipReason::new(
-                "sell_disabled",
-                "sell copying is disabled by ALLOW_SELL",
-            )),
-            other => Err(SkipReason::new(
-                "unsupported_side",
-                format!("unsupported trade side {other}"),
-            )),
+        self.enforce_entry_risk_limits(entry, portfolio)?;
+        let price_band_rules = self.price_band_rules(source_price, price_band)?;
+        tracing::info!(
+            price_band = price_band.as_str(),
+            source_price = %source_price.round_dp(4),
+            source_wallet = %entry.proxy_wallet,
+            condition_id = %entry.condition_id,
+            "price_band_selected"
+        );
+        if let Some(delay_ms) = copy_delay_ms(entry.timestamp)
+            && delay_ms > self.settings.max_copy_delay_ms
+        {
+            tracing::info!(
+                reason_code = "late_entry_rejected",
+                delay_ms,
+                max_copy_delay_ms = self.settings.max_copy_delay_ms,
+                source_wallet = %entry.proxy_wallet,
+                condition_id = %entry.condition_id,
+                "late_entry_rejected"
+            );
+            return Err(SkipReason::new(
+                "too_late_strict",
+                format!(
+                    "source trade delay {}ms exceeded max {}ms",
+                    delay_ms, self.settings.max_copy_delay_ms
+                ),
+            ));
         }
+        let requested_key = entry.position_key();
+        if portfolio.has_stale_position_key(&requested_key)
+            || portfolio.has_stale_position_for_condition(&entry.condition_id)
+        {
+            tracing::info!(
+                reason_code = "stale_position_ignored",
+                condition_id = %entry.condition_id,
+                outcome = %entry.outcome,
+                source_wallet = %entry.proxy_wallet,
+                "stale_position_ignored"
+            );
+            return Err(SkipReason::new(
+                "stale_position_ignored",
+                format!(
+                    "stale_position_ignored: condition {} is isolated from new entries",
+                    entry.condition_id
+                ),
+            ));
+        }
+        if portfolio.has_position_key(&requested_key) {
+            return Err(SkipReason::new(
+                "position_exists",
+                format!(
+                    "position already exists for condition {} outcome {} wallet {}",
+                    entry.condition_id, entry.outcome, entry.proxy_wallet
+                ),
+            ));
+        }
+        if !self.settings.allow_hedging
+            && let Some(existing) =
+                portfolio.opposite_side_position(&entry.condition_id, &entry.outcome)
+        {
+            tracing::info!(
+                reason_code = "opposite_side_blocked",
+                condition_id = %entry.condition_id,
+                requested_outcome = %entry.outcome,
+                existing_outcome = %existing.outcome,
+                "opposite_side_blocked"
+            );
+            return Err(SkipReason::new(
+                "opposite_side_blocked",
+                format!(
+                    "opposite_side_blocked: existing outcome {} for condition {} prevents {}",
+                    existing.outcome, entry.condition_id, entry.outcome
+                ),
+            ));
+        }
+        let scaled_notional = (base_scaled_notional
+            * price_band_rules.size_multiplier
+            * wallet_performance_multiplier(portfolio, &entry.proxy_wallet))
+        .min(self.settings.max_copy_notional_usd)
+        .max(Decimal::ZERO);
+        let allowed_notional = scaled_notional
+            .min(self.per_trade_notional_cap(portfolio))
+            .min(self.settings.max_position_size_abs.max(Decimal::ZERO))
+            .min(remaining_total)
+            .min(remaining_market)
+            .min(portfolio.cash_balance.max(Decimal::ZERO));
+        if allowed_notional < self.settings.min_copy_notional_usd {
+            return Err(SkipReason::new(
+                "buy_notional_below_minimum",
+                format!(
+                    "allowed copy notional {} is below minimum {} after exposure and cash caps",
+                    allowed_notional.round_dp(4),
+                    self.settings.min_copy_notional_usd.round_dp(4)
+                ),
+            ));
+        }
+        Ok(CopyDecision {
+            token_id: entry.asset.clone(),
+            side: ExecutionSide::Buy,
+            notional: allowed_notional,
+            size: Decimal::ZERO,
+            size_was_scaled: allowed_notional < scaled_notional,
+            position_key: Some(requested_key),
+            price_band,
+            max_market_spread_bps: price_band_rules.max_spread_bps,
+            min_top_of_book_ratio: self.settings.min_top_of_book_ratio,
+            min_visible_liquidity_usd: self.settings.min_liquidity.max(Decimal::ZERO),
+            max_slippage_bps: price_band_rules.max_slippage_bps,
+            max_source_price_slippage_bps: price_band_rules.max_slippage_bps,
+            min_edge_threshold: self.settings.min_edge_threshold.max(Decimal::ZERO),
+        })
     }
 
     pub fn evaluate_sell_from_resolved_position(
@@ -1327,8 +1292,11 @@ mod tests {
     fn sell_trade_is_copyable_when_asset_is_held() {
         let engine = RiskEngine::new(sample_settings());
         let entry = sample_entry("SELL", "asset-1", 8.0, 4.0, "0xsource");
+        let resolved_position = sample_portfolio()
+            .resolve_position_to_sell(&entry)
+            .expect("resolved position");
         let decision = engine
-            .evaluate(&entry, &sample_portfolio())
+            .evaluate_sell_from_resolved_position(&entry, resolved_position)
             .expect("sell should be copyable");
 
         assert_eq!(decision.side, ExecutionSide::Sell);
@@ -1340,8 +1308,11 @@ mod tests {
     fn sell_trade_uses_safe_same_wallet_fallback_when_asset_differs() {
         let engine = RiskEngine::new(sample_settings());
         let entry = sample_entry("SELL", "asset-other", 8.0, 4.0, "0xsource");
+        let resolved_position = sample_portfolio()
+            .resolve_position_to_sell(&entry)
+            .expect("resolved fallback position");
         let decision = engine
-            .evaluate(&entry, &sample_portfolio())
+            .evaluate_sell_from_resolved_position(&entry, resolved_position)
             .expect("sell should resolve through fallback");
 
         assert_eq!(decision.side, ExecutionSide::Sell);
@@ -1357,11 +1328,16 @@ mod tests {
     fn sell_trade_rejects_wallet_mismatch_even_if_market_matches() {
         let engine = RiskEngine::new(sample_settings());
         let entry = sample_entry("SELL", "asset-1", 8.0, 4.0, "0xother");
+        assert!(
+            sample_portfolio()
+                .resolve_position_to_sell(&entry)
+                .is_none()
+        );
         let reason = engine
             .evaluate(&entry, &sample_portfolio())
             .expect_err("sell should not resolve across source-wallet ownership");
 
-        assert_eq!(reason.code, "no_position_to_sell");
+        assert_eq!(reason.code, "sell_requires_resolved_position");
     }
 
     #[test]
@@ -1749,7 +1725,14 @@ mod tests {
             engine.evaluate(&buy, &portfolio).expect_err("buy").code,
             "drawdown_guard_triggered"
         );
-        assert!(engine.evaluate(&sell, &portfolio).is_ok());
+        let resolved_position = portfolio
+            .resolve_position_to_sell(&sell)
+            .expect("sell resolves against owned position");
+        assert!(
+            engine
+                .evaluate_sell_from_resolved_position(&sell, resolved_position)
+                .is_ok()
+        );
     }
 
     #[test]
