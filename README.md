@@ -93,10 +93,14 @@ The rescanner remains enabled, but it is now firmly off the hot path. Active-wal
 `src/risk.rs` is now price-banded and position-aware:
 
 - `PriceBand::{Low, Mid, High}` changes slippage, spread, and size rules by source price
+- classifies markets as `UltraShort`, `Short`, or `Medium` from title heuristics
 - blocks very high-price entries above `0.92`
 - replaces the old hard entry ceiling with a remaining-edge check
-- rejects late copies via `MAX_COPY_DELAY_MS`
-- rejects thin books via spread and liquidity checks
+- rejects late copies via the strict `MAX_COPY_DELAY_MS` gate
+- rejects ultra-short markets unless `ENABLE_ULTRA_SHORT_MARKETS=true`
+- rejects thin books via visible-liquidity and spread checks
+- rejects price chasing, market cooldown churn, conflicting wallet signals, and hyperactive scalp wallets
+- computes a weighted trade-quality score before submit
 - rejects duplicate positions, stale positions, and opposite-side exposure unless `ALLOW_HEDGING=true`
 
 The design goal is "copy where edge still exists", not "copy everything late".
@@ -354,7 +358,7 @@ If you prefer the release binary directly:
 - Live wallet identity: `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_PROFILE_ADDRESS`, optional `POLYMARKET_FUNDER_ADDRESS`
 - EOA allowance flow: `POLYMARKET_USDC_ADDRESS`, `POLYMARKET_SPENDER_ADDRESS`, `AUTO_APPROVE_USDC_ALLOWANCE`, `USDC_APPROVAL_AMOUNT`
 - Wallet tracking: `TARGET_WALLETS`, optional authenticated activity credentials
-- Risk: `ENABLE_PRICE_BANDS`, `MIN_EDGE_THRESHOLD`, `MAX_COPY_DELAY_MS`, `MIN_LIQUIDITY`, `MIN_WALLET_SCORE`, `ALLOW_HEDGING`
+- Risk: `ENABLE_PRICE_BANDS`, `MIN_EDGE_THRESHOLD`, `MAX_COPY_DELAY_MS`, `ENABLE_ULTRA_SHORT_MARKETS`, `MIN_VISIBLE_LIQUIDITY`, `MAX_SPREAD_BPS`, `MAX_ENTRY_SLIPPAGE`, `MIN_WALLET_AVG_HOLD_MS`, `MAX_WALLET_TRADES_PER_MIN`, `MARKET_COOLDOWN_MS`, `MIN_TRADE_QUALITY_SCORE`, `MIN_LIQUIDITY`, `MIN_WALLET_SCORE`, `ALLOW_HEDGING`
 - Lifecycle and exits: `MAX_POSITION_AGE_HOURS`, `MAX_HOLD_TIME_SECONDS`, `ENABLE_EXIT_RETRY`, `EXIT_RETRY_WINDOW_MS`, `EXIT_RETRY_INTERVAL_MS`, `CLOSING_MAX_AGE_MS`, `FORCE_EXIT_ON_CLOSING_TIMEOUT`
 - Pending-open exit resolution: `UNRESOLVED_EXIT_INITIAL_RETRY_MS`, `UNRESOLVED_EXIT_MAX_RETRY_MS`, `UNRESOLVED_EXIT_TOTAL_WINDOW_MS`, `POSITION_PENDING_OPEN_TTL_MS`
 - Latency-first hot path: `HOT_PATH_MODE`, `HOT_PATH_QUEUE_CAPACITY`, `COLD_PATH_QUEUE_CAPACITY`, `ATTRIBUTION_FAST_CACHE_CAPACITY`, `PARSE_TASKS_MARKET`, `PARSE_TASKS_WALLET`, `EXIT_PRIORITY_STRICT`

@@ -1858,6 +1858,7 @@ async fn process_trade(
     health
         .set_portfolio_value(current_portfolio.total_value)
         .await;
+    let market_quality_observation = risk.observe_source_trade(entry);
     let mut resolved_exit_position = if matches!(side, ExecutionSide::Sell) {
         current_portfolio.resolve_position_to_sell(entry)
     } else {
@@ -2088,6 +2089,25 @@ async fn process_trade(
             }
         }
     };
+    if matches!(side, ExecutionSide::Buy)
+        && let Err(reason) =
+            risk.enforce_entry_quality_pre_quote(entry, &market_quality_observation)
+    {
+        record_trade_skip(
+            entry,
+            signal,
+            risk,
+            health,
+            latency_logger,
+            analytics,
+            Some(&current_portfolio),
+            None,
+            classify_rejected_trade(side, has_copied_inventory),
+            &reason,
+        )
+        .await;
+        return Ok(TradeProcessingOutcome::Skipped(reason));
+    }
     stage_timestamps.fast_risk_completed_at = Some(Instant::now());
     stage_timestamps.fast_risk_completed_at_utc = Some(Utc::now());
     let eligible_class = eligible_class_for_side(side);
@@ -2254,6 +2274,36 @@ async fn process_trade(
             side = %entry.side,
             "resolved execution quote through resilient fallback path"
         );
+    }
+    if matches!(execution_mode, ExecutionMode::Normal)
+        && matches!(side, ExecutionSide::Buy)
+        && let Err(reason) = risk.enforce_entry_quality_post_quote(
+            entry,
+            &resolved_quote.quote,
+            &market_quality_observation,
+        )
+    {
+        finalize_failed_pending_open(
+            position_resolver,
+            pending_open_key.as_ref(),
+            &analytics,
+            "market_quality_rejected",
+        )
+        .await;
+        record_trade_skip(
+            entry,
+            signal,
+            risk,
+            health,
+            latency_logger,
+            analytics,
+            Some(&current_portfolio),
+            None,
+            classify_rejected_trade(side, has_copied_inventory),
+            &reason,
+        )
+        .await;
+        return Ok(TradeProcessingOutcome::Skipped(reason));
     }
     if matches!(execution_mode, ExecutionMode::Normal)
         && let Err(reason) = enforce_signal_price_deviation(entry, &decision, &resolved_quote.quote)
@@ -5193,6 +5243,10 @@ mod tests {
             max_market_exposure_usd: dec!(40),
             min_source_trade_usdc: dec!(1),
             max_market_spread_bps: 500,
+            enable_ultra_short_markets: false,
+            min_visible_liquidity: dec!(50),
+            max_spread_bps: 500,
+            max_entry_slippage: dec!(0.03),
             min_top_of_book_ratio: dec!(1),
             max_slippage_bps: 300,
             max_source_price_slippage_bps: 200,
@@ -5220,6 +5274,10 @@ mod tests {
             max_copy_delay_ms: 1_500,
             min_liquidity: dec!(50),
             min_wallet_score: dec!(0.6),
+            min_wallet_avg_hold_ms: 15_000,
+            max_wallet_trades_per_min: 6,
+            market_cooldown: Duration::from_secs(15),
+            min_trade_quality_score: dec!(0.65),
             max_position_age_hours: 6,
             max_hold_time_seconds: 1_800,
             enable_exit_retry: true,

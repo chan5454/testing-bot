@@ -54,6 +54,30 @@ impl ActivityEntry {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum MarketType {
+    UltraShort,
+    Short,
+    Medium,
+}
+
+pub fn classify_market(title: &str) -> MarketType {
+    let normalized = title.trim().to_ascii_lowercase();
+    if normalized.contains("up/down")
+        || normalized.contains("up down")
+        || normalized.contains("5m")
+        || normalized.contains("5 min")
+        || normalized.contains("5 minute")
+    {
+        MarketType::UltraShort
+    } else if normalized.contains("1h") || normalized.contains("1 h") || normalized.contains("hour")
+    {
+        MarketType::Short
+    } else {
+        MarketType::Medium
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct PositionKey {
     pub condition_id: String,

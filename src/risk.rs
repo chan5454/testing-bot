@@ -1,13 +1,18 @@
 use rust_decimal::Decimal;
 use rust_decimal::RoundingStrategy;
 use rust_decimal_macros::dec;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::{Display, Formatter};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Settings;
 use crate::execution::ExecutionSide;
-use crate::models::{ActivityEntry, PortfolioSnapshot, PositionKey, ResolvedPosition};
+use crate::models::{
+    ActivityEntry, BestQuote, MarketType, PortfolioSnapshot, PositionKey, ResolvedPosition,
+    classify_market,
+};
 
 #[derive(Clone, Debug)]
 pub struct CopyDecision {
@@ -57,6 +62,54 @@ impl SkipReason {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct TradeQualityScore {
+    pub liquidity_score: Decimal,
+    pub spread_score: Decimal,
+    pub slippage_score: Decimal,
+    pub wallet_score: Decimal,
+    pub latency_score: Decimal,
+    pub total_score: Decimal,
+}
+
+#[derive(Clone, Debug)]
+pub struct MarketQualityObservation {
+    pub market_type: MarketType,
+    pub signal_age_ms: Option<u64>,
+    pub wallet_trades_per_minute: u32,
+    pub wallet_avg_hold_ms: Option<u64>,
+    pub wallet_hold_samples: u64,
+    pub market_cooldown_active: bool,
+    pub conflicting_signal: bool,
+}
+
+#[derive(Default)]
+struct MarketQualityState {
+    wallets: HashMap<String, WalletBehaviorStats>,
+    markets: HashMap<String, MarketBehaviorStats>,
+}
+
+#[derive(Default)]
+struct WalletBehaviorStats {
+    recent_trade_timestamps_ms: VecDeque<i64>,
+    open_entries_by_key: HashMap<PositionKey, i64>,
+    total_hold_ms: u128,
+    hold_samples: u64,
+}
+
+#[derive(Default)]
+struct MarketBehaviorStats {
+    recent_signals: VecDeque<RecentMarketSignal>,
+    last_entry_signal_at_ms: Option<i64>,
+}
+
+#[derive(Clone)]
+struct RecentMarketSignal {
+    timestamp_ms: i64,
+    side: ExecutionSide,
+    wallet: String,
+}
+
 impl Display for SkipReason {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.code, self.detail)
@@ -66,11 +119,15 @@ impl Display for SkipReason {
 #[derive(Clone)]
 pub struct RiskEngine {
     settings: Settings,
+    market_quality_state: Arc<RwLock<MarketQualityState>>,
 }
 
 impl RiskEngine {
     pub fn new(settings: Settings) -> Self {
-        Self { settings }
+        Self {
+            settings,
+            market_quality_state: Arc::new(RwLock::new(MarketQualityState::default())),
+        }
     }
 
     pub fn should_log_skips(&self) -> bool {
@@ -83,6 +140,301 @@ impl RiskEngine {
 
     pub fn fast_risk_only_on_hot_path(&self) -> bool {
         self.settings.fast_risk_only_on_hot_path
+    }
+
+    pub fn observe_source_trade(&self, entry: &ActivityEntry) -> MarketQualityObservation {
+        let now_ms = current_time_ms().unwrap_or_default();
+        let event_timestamp_ms = normalized_timestamp_ms(entry.timestamp).unwrap_or(now_ms as i64);
+        let market_type = classify_market(&entry.title);
+        let signal_age_ms = Some(now_ms.saturating_sub(event_timestamp_ms.max(0) as u64));
+        let wallet = normalize_wallet(&entry.proxy_wallet);
+        let side = normalized_execution_side(entry);
+        let market_window_ms = self.settings.market_cooldown.as_millis().max(60_000) as i64;
+
+        let mut state = self
+            .market_quality_state
+            .write()
+            .expect("market quality write lock");
+        let wallet_stats = state.wallets.entry(wallet.clone()).or_default();
+        while wallet_stats
+            .recent_trade_timestamps_ms
+            .front()
+            .is_some_and(|timestamp_ms| event_timestamp_ms.saturating_sub(*timestamp_ms) >= 60_000)
+        {
+            wallet_stats.recent_trade_timestamps_ms.pop_front();
+        }
+
+        if matches!(side, ExecutionSide::Sell) {
+            if let Some(open_timestamp_ms) = wallet_stats
+                .open_entries_by_key
+                .remove(&entry.position_key())
+                && event_timestamp_ms > open_timestamp_ms
+            {
+                wallet_stats.total_hold_ms = wallet_stats
+                    .total_hold_ms
+                    .saturating_add(event_timestamp_ms.saturating_sub(open_timestamp_ms) as u128);
+                wallet_stats.hold_samples = wallet_stats.hold_samples.saturating_add(1);
+            }
+        }
+
+        wallet_stats
+            .recent_trade_timestamps_ms
+            .push_back(event_timestamp_ms);
+        if matches!(side, ExecutionSide::Buy) {
+            wallet_stats
+                .open_entries_by_key
+                .insert(entry.position_key(), event_timestamp_ms);
+        }
+        let wallet_trades_per_minute = wallet_stats.recent_trade_timestamps_ms.len() as u32;
+        let wallet_avg_hold_ms = average_hold_ms(wallet_stats);
+        let wallet_hold_samples = wallet_stats.hold_samples;
+
+        let market_stats = state.markets.entry(entry.condition_id.clone()).or_default();
+        while market_stats.recent_signals.front().is_some_and(|recent| {
+            event_timestamp_ms.saturating_sub(recent.timestamp_ms) >= market_window_ms
+        }) {
+            market_stats.recent_signals.pop_front();
+        }
+
+        let market_cooldown_active = matches!(side, ExecutionSide::Buy)
+            && self.settings.market_cooldown > Duration::ZERO
+            && market_stats
+                .last_entry_signal_at_ms
+                .is_some_and(|last_entry_ms| {
+                    event_timestamp_ms.saturating_sub(last_entry_ms)
+                        < self.settings.market_cooldown.as_millis() as i64
+                });
+        let conflicting_signal = matches!(side, ExecutionSide::Buy)
+            && market_stats.recent_signals.iter().any(|recent| {
+                recent.side != side
+                    && recent.wallet != wallet
+                    && event_timestamp_ms.saturating_sub(recent.timestamp_ms) < market_window_ms
+            });
+        market_stats.recent_signals.push_back(RecentMarketSignal {
+            timestamp_ms: event_timestamp_ms,
+            side,
+            wallet,
+        });
+        if matches!(side, ExecutionSide::Buy) {
+            market_stats.last_entry_signal_at_ms = Some(event_timestamp_ms);
+        }
+
+        MarketQualityObservation {
+            market_type,
+            signal_age_ms,
+            wallet_trades_per_minute,
+            wallet_avg_hold_ms,
+            wallet_hold_samples,
+            market_cooldown_active,
+            conflicting_signal,
+        }
+    }
+
+    pub fn enforce_entry_quality_pre_quote(
+        &self,
+        entry: &ActivityEntry,
+        observation: &MarketQualityObservation,
+    ) -> Result<(), SkipReason> {
+        if !self.settings.enable_ultra_short_markets
+            && observation.market_type == MarketType::UltraShort
+        {
+            return Err(SkipReason::new(
+                "market_ultra_short_filtered",
+                format!("market '{}' was classified as ultra-short", entry.title),
+            ));
+        }
+
+        if let Some(delay_ms) = observation.signal_age_ms
+            && delay_ms > self.settings.max_copy_delay_ms
+        {
+            return Err(SkipReason::new(
+                "too_late_strict",
+                format!(
+                    "source trade delay {}ms exceeded strict max {}ms",
+                    delay_ms, self.settings.max_copy_delay_ms
+                ),
+            ));
+        }
+
+        if self.settings.max_wallet_trades_per_min > 0
+            && observation.wallet_trades_per_minute > self.settings.max_wallet_trades_per_min
+        {
+            return Err(SkipReason::new(
+                "wallet_too_fast",
+                format!(
+                    "wallet {} traded {} times in the last minute above max {}",
+                    entry.proxy_wallet,
+                    observation.wallet_trades_per_minute,
+                    self.settings.max_wallet_trades_per_min
+                ),
+            ));
+        }
+
+        if self.settings.min_wallet_avg_hold_ms > 0
+            && observation.wallet_hold_samples > 0
+            && observation
+                .wallet_avg_hold_ms
+                .is_some_and(|hold_ms| hold_ms < self.settings.min_wallet_avg_hold_ms)
+        {
+            return Err(SkipReason::new(
+                "wallet_too_fast",
+                format!(
+                    "wallet {} average hold {}ms is below minimum {}ms",
+                    entry.proxy_wallet,
+                    observation.wallet_avg_hold_ms.unwrap_or_default(),
+                    self.settings.min_wallet_avg_hold_ms
+                ),
+            ));
+        }
+
+        if observation.market_cooldown_active {
+            return Err(SkipReason::new(
+                "market_cooldown",
+                format!(
+                    "condition {} is within the {}ms market cooldown window",
+                    entry.condition_id,
+                    self.settings.market_cooldown.as_millis()
+                ),
+            ));
+        }
+
+        if observation.conflicting_signal {
+            return Err(SkipReason::new(
+                "conflicting_wallet_signal",
+                format!(
+                    "condition {} has a recent conflicting source signal",
+                    entry.condition_id
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn enforce_entry_quality_post_quote(
+        &self,
+        entry: &ActivityEntry,
+        quote: &BestQuote,
+        observation: &MarketQualityObservation,
+    ) -> Result<TradeQualityScore, SkipReason> {
+        let best_bid_size = quote.best_bid_size.unwrap_or(Decimal::ZERO);
+        let best_ask_size = quote.best_ask_size.unwrap_or(Decimal::ZERO);
+        if best_bid_size < self.settings.min_visible_liquidity
+            || best_ask_size < self.settings.min_visible_liquidity
+        {
+            return Err(SkipReason::new(
+                "low_visible_liquidity",
+                format!(
+                    "visible top-of-book liquidity bid={} ask={} is below minimum {}",
+                    best_bid_size.round_dp(4),
+                    best_ask_size.round_dp(4),
+                    self.settings.min_visible_liquidity.round_dp(4)
+                ),
+            ));
+        }
+
+        let Some(best_bid) = quote.best_bid else {
+            return Err(SkipReason::new(
+                "low_visible_liquidity",
+                format!("missing best bid for asset {}", quote.asset_id),
+            ));
+        };
+        let Some(best_ask) = quote.best_ask else {
+            return Err(SkipReason::new(
+                "low_visible_liquidity",
+                format!("missing best ask for asset {}", quote.asset_id),
+            ));
+        };
+
+        let Some(spread_bps) = market_spread_bps(best_bid, best_ask) else {
+            return Err(SkipReason::new(
+                "spread_too_wide",
+                format!(
+                    "could not compute spread from best bid {} and best ask {}",
+                    best_bid.round_dp(4),
+                    best_ask.round_dp(4)
+                ),
+            ));
+        };
+        if self.settings.max_spread_bps > 0
+            && spread_bps > Decimal::from(self.settings.max_spread_bps)
+        {
+            return Err(SkipReason::new(
+                "spread_too_wide",
+                format!(
+                    "spread {} bps is above max {} bps",
+                    spread_bps.round_dp(2),
+                    self.settings.max_spread_bps
+                ),
+            ));
+        }
+
+        let source_price = entry.price_decimal().map_err(|error| {
+            SkipReason::new(
+                "invalid_source_price",
+                format!("failed to parse source price: {error}"),
+            )
+        })?;
+        let slippage = (best_ask - source_price).abs();
+        if self.settings.max_entry_slippage > Decimal::ZERO
+            && slippage > self.settings.max_entry_slippage
+        {
+            return Err(SkipReason::new(
+                "price_chased_strict",
+                format!(
+                    "entry price moved {} above source price {} with max {}",
+                    slippage.round_dp(4),
+                    source_price.round_dp(4),
+                    self.settings.max_entry_slippage.round_dp(4)
+                ),
+            ));
+        }
+
+        let quality = TradeQualityScore {
+            liquidity_score: positive_ratio_score(
+                best_bid_size.min(best_ask_size),
+                self.settings.min_visible_liquidity,
+            ),
+            spread_score: inverse_ratio_score(
+                spread_bps,
+                Decimal::from(self.settings.max_spread_bps.max(1)),
+            ),
+            slippage_score: inverse_ratio_score(
+                slippage,
+                self.settings.max_entry_slippage.max(dec!(0.0001)),
+            ),
+            wallet_score: wallet_quality_score(&self.settings, observation),
+            latency_score: latency_quality_score(self.settings.max_copy_delay_ms, observation),
+            total_score: Decimal::ZERO,
+        };
+        let total_score = ((quality.liquidity_score * dec!(0.25))
+            + (quality.spread_score * dec!(0.20))
+            + (quality.slippage_score * dec!(0.20))
+            + (quality.wallet_score * dec!(0.20))
+            + (quality.latency_score * dec!(0.15)))
+        .round_dp(4);
+        let quality = TradeQualityScore {
+            total_score,
+            ..quality
+        };
+
+        if quality.total_score < self.settings.min_trade_quality_score {
+            return Err(SkipReason::new(
+                "trade_quality_rejected",
+                format!(
+                    "trade quality {} is below minimum {} (liq={} spread={} slip={} wallet={} latency={})",
+                    quality.total_score.round_dp(4),
+                    self.settings.min_trade_quality_score.round_dp(4),
+                    quality.liquidity_score.round_dp(4),
+                    quality.spread_score.round_dp(4),
+                    quality.slippage_score.round_dp(4),
+                    quality.wallet_score.round_dp(4),
+                    quality.latency_score.round_dp(4)
+                ),
+            ));
+        }
+
+        Ok(quality)
     }
 
     fn price_band_rules(
@@ -215,7 +567,7 @@ impl RiskEngine {
                         "late_entry_rejected"
                     );
                     return Err(SkipReason::new(
-                        "too_late",
+                        "too_late_strict",
                         format!(
                             "source trade delay {}ms exceeded max {}ms",
                             delay_ms, self.settings.max_copy_delay_ms
@@ -547,20 +899,106 @@ fn wallet_performance_multiplier(portfolio: &PortfolioSnapshot, wallet: &str) ->
     }
 }
 
-fn copy_delay_ms(timestamp: i64) -> Option<u64> {
+fn average_hold_ms(stats: &WalletBehaviorStats) -> Option<u64> {
+    if stats.hold_samples == 0 {
+        return None;
+    }
+
+    Some((stats.total_hold_ms / u128::from(stats.hold_samples)) as u64)
+}
+
+fn current_time_ms() -> Option<u64> {
+    Some(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_millis() as u64,
+    )
+}
+
+fn normalized_timestamp_ms(timestamp: i64) -> Option<i64> {
     if timestamp <= 0 {
         return None;
     }
 
-    let normalized_timestamp_ms = if timestamp >= 10_000_000_000 {
+    Some(if timestamp >= 10_000_000_000 {
         timestamp
     } else {
         timestamp.saturating_mul(1000)
+    })
+}
+
+fn normalize_wallet(wallet: &str) -> String {
+    wallet.trim().to_ascii_lowercase()
+}
+
+fn normalized_execution_side(entry: &ActivityEntry) -> ExecutionSide {
+    if entry.side.eq_ignore_ascii_case("SELL") {
+        ExecutionSide::Sell
+    } else {
+        ExecutionSide::Buy
+    }
+}
+
+fn positive_ratio_score(actual: Decimal, minimum: Decimal) -> Decimal {
+    if minimum <= Decimal::ZERO {
+        return Decimal::ONE;
+    }
+
+    (actual / minimum).min(Decimal::ONE).max(Decimal::ZERO)
+}
+
+fn inverse_ratio_score(actual: Decimal, maximum: Decimal) -> Decimal {
+    if maximum <= Decimal::ZERO {
+        return Decimal::ONE;
+    }
+
+    (Decimal::ONE - (actual / maximum))
+        .min(Decimal::ONE)
+        .max(Decimal::ZERO)
+}
+
+fn wallet_quality_score(settings: &Settings, observation: &MarketQualityObservation) -> Decimal {
+    let trade_rate_score = if settings.max_wallet_trades_per_min == 0 {
+        Decimal::ONE
+    } else {
+        inverse_ratio_score(
+            Decimal::from(observation.wallet_trades_per_minute),
+            Decimal::from(settings.max_wallet_trades_per_min.max(1)),
+        )
     };
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_millis() as i64;
+
+    let hold_score = match (
+        settings.min_wallet_avg_hold_ms,
+        observation.wallet_avg_hold_ms,
+        observation.wallet_hold_samples,
+    ) {
+        (0, _, _) | (_, None, _) | (_, _, 0) => Decimal::ONE,
+        (minimum, Some(avg_hold_ms), _) => {
+            positive_ratio_score(Decimal::from(avg_hold_ms), Decimal::from(minimum.max(1)))
+        }
+    };
+
+    ((trade_rate_score + hold_score) / dec!(2))
+        .min(Decimal::ONE)
+        .max(Decimal::ZERO)
+}
+
+fn latency_quality_score(
+    max_copy_delay_ms: u64,
+    observation: &MarketQualityObservation,
+) -> Decimal {
+    match (max_copy_delay_ms, observation.signal_age_ms) {
+        (0, _) | (_, None) => Decimal::ONE,
+        (maximum, Some(delay_ms)) => {
+            inverse_ratio_score(Decimal::from(delay_ms), Decimal::from(maximum.max(1)))
+        }
+    }
+}
+
+fn copy_delay_ms(timestamp: i64) -> Option<u64> {
+    let normalized_timestamp_ms = normalized_timestamp_ms(timestamp)?;
+    let now_ms = current_time_ms()? as i64;
 
     Some(now_ms.saturating_sub(normalized_timestamp_ms).max(0) as u64)
 }
@@ -713,6 +1151,10 @@ mod tests {
             max_market_exposure_usd: dec!(40),
             min_source_trade_usdc: dec!(0),
             max_market_spread_bps: 500,
+            enable_ultra_short_markets: false,
+            min_visible_liquidity: dec!(50),
+            max_spread_bps: 500,
+            max_entry_slippage: dec!(0.03),
             min_top_of_book_ratio: dec!(1.25),
             max_slippage_bps: 300,
             max_source_price_slippage_bps: 200,
@@ -740,6 +1182,10 @@ mod tests {
             max_copy_delay_ms: u64::MAX,
             min_liquidity: dec!(50),
             min_wallet_score: dec!(0.6),
+            min_wallet_avg_hold_ms: 15_000,
+            max_wallet_trades_per_min: 6,
+            market_cooldown: Duration::from_secs(15),
+            min_trade_quality_score: dec!(0.65),
             max_position_age_hours: 6,
             max_hold_time_seconds: 1_800,
             enable_exit_retry: true,
@@ -783,6 +1229,28 @@ mod tests {
             slug: "sample-market".to_owned(),
             event_slug: "sample-event".to_owned(),
             outcome: "YES".to_owned(),
+        }
+    }
+
+    fn recent_timestamp_ms() -> i64 {
+        current_time_ms().expect("current time") as i64
+    }
+
+    fn sample_quote(
+        best_bid: Decimal,
+        best_bid_size: Decimal,
+        best_ask: Decimal,
+        best_ask_size: Decimal,
+    ) -> BestQuote {
+        BestQuote {
+            asset_id: "asset-1".to_owned(),
+            best_bid: Some(best_bid),
+            best_bid_size: Some(best_bid_size),
+            best_ask: Some(best_ask),
+            best_ask_size: Some(best_ask_size),
+            tick_size: dec!(0.01),
+            min_order_size: dec!(1),
+            neg_risk: false,
         }
     }
 
@@ -1019,5 +1487,149 @@ mod tests {
             .expect("buy should remain eligible");
 
         assert_eq!(decision.notional, dec!(5));
+    }
+
+    #[test]
+    fn ultra_short_market_is_rejected() {
+        let engine = RiskEngine::new(sample_settings());
+        let mut entry = sample_entry("BUY", "asset-2", 10.0, 5.0, "0xsource");
+        entry.title = "BTC Up/Down 5m".to_owned();
+        entry.timestamp = recent_timestamp_ms();
+
+        let observation = engine.observe_source_trade(&entry);
+        let reason = engine
+            .enforce_entry_quality_pre_quote(&entry, &observation)
+            .expect_err("ultra-short markets should be filtered");
+
+        assert_eq!(reason.code, "market_ultra_short_filtered");
+    }
+
+    #[test]
+    fn low_liquidity_is_rejected() {
+        let mut settings = sample_settings();
+        settings.enable_ultra_short_markets = true;
+        let engine = RiskEngine::new(settings);
+        let mut entry = sample_entry("BUY", "asset-2", 10.0, 5.0, "0xsource");
+        entry.timestamp = recent_timestamp_ms();
+
+        let observation = engine.observe_source_trade(&entry);
+        engine
+            .enforce_entry_quality_pre_quote(&entry, &observation)
+            .expect("pre-quote checks should pass");
+        let reason = engine
+            .enforce_entry_quality_post_quote(
+                &entry,
+                &sample_quote(dec!(0.49), dec!(10), dec!(0.51), dec!(12)),
+                &observation,
+            )
+            .expect_err("low liquidity should be rejected");
+
+        assert_eq!(reason.code, "low_visible_liquidity");
+    }
+
+    #[test]
+    fn high_slippage_is_rejected() {
+        let mut settings = sample_settings();
+        settings.enable_ultra_short_markets = true;
+        let engine = RiskEngine::new(settings);
+        let mut entry = sample_entry("BUY", "asset-2", 10.0, 5.0, "0xsource");
+        entry.timestamp = recent_timestamp_ms();
+
+        let observation = engine.observe_source_trade(&entry);
+        let reason = engine
+            .enforce_entry_quality_post_quote(
+                &entry,
+                &sample_quote(dec!(0.58), dec!(80), dec!(0.60), dec!(80)),
+                &observation,
+            )
+            .expect_err("slippage should be rejected");
+
+        assert_eq!(reason.code, "price_chased_strict");
+    }
+
+    #[test]
+    fn fast_wallet_is_rejected() {
+        let mut settings = sample_settings();
+        settings.enable_ultra_short_markets = true;
+        settings.max_wallet_trades_per_min = 2;
+        let engine = RiskEngine::new(settings);
+
+        for offset in 0..2 {
+            let mut entry = sample_entry("BUY", "asset-2", 10.0, 5.0, "0xsource");
+            entry.timestamp = recent_timestamp_ms() - (offset * 1_000);
+            let _ = engine.observe_source_trade(&entry);
+        }
+
+        let mut third = sample_entry("BUY", "asset-2", 10.0, 5.0, "0xsource");
+        third.timestamp = recent_timestamp_ms();
+        let observation = engine.observe_source_trade(&third);
+        let reason = engine
+            .enforce_entry_quality_pre_quote(&third, &observation)
+            .expect_err("fast wallets should be rejected");
+
+        assert_eq!(reason.code, "wallet_too_fast");
+    }
+
+    #[test]
+    fn cooldown_prevents_reentry() {
+        let mut settings = sample_settings();
+        settings.enable_ultra_short_markets = true;
+        settings.market_cooldown = Duration::from_secs(30);
+        let engine = RiskEngine::new(settings);
+
+        let mut first = sample_entry("BUY", "asset-2", 10.0, 5.0, "0xsource");
+        first.timestamp = recent_timestamp_ms();
+        let first_observation = engine.observe_source_trade(&first);
+        engine
+            .enforce_entry_quality_pre_quote(&first, &first_observation)
+            .expect("first entry should pass");
+
+        let mut second = sample_entry("BUY", "asset-2", 10.0, 5.0, "0xother");
+        second.timestamp = recent_timestamp_ms() + 1;
+        let second_observation = engine.observe_source_trade(&second);
+        let reason = engine
+            .enforce_entry_quality_pre_quote(&second, &second_observation)
+            .expect_err("cooldown should block immediate re-entry");
+
+        assert_eq!(reason.code, "market_cooldown");
+    }
+
+    #[test]
+    fn valid_trade_passes_quality_filters() {
+        let mut settings = sample_settings();
+        settings.enable_ultra_short_markets = true;
+        settings.max_wallet_trades_per_min = 10;
+        settings.min_wallet_avg_hold_ms = 1;
+        settings.market_cooldown = Duration::ZERO;
+        settings.min_trade_quality_score = dec!(0.50);
+        let engine = RiskEngine::new(settings);
+
+        let mut seed_buy = sample_entry("BUY", "asset-seed", 10.0, 5.0, "0xsource");
+        seed_buy.condition_id = "condition-seed".to_owned();
+        seed_buy.asset = "asset-seed".to_owned();
+        seed_buy.timestamp = recent_timestamp_ms() - 30_000;
+        let _ = engine.observe_source_trade(&seed_buy);
+
+        let mut seed_sell = sample_entry("SELL", "asset-seed", 10.0, 5.2, "0xsource");
+        seed_sell.condition_id = "condition-seed".to_owned();
+        seed_sell.asset = "asset-seed".to_owned();
+        seed_sell.timestamp = recent_timestamp_ms() - 10_000;
+        let _ = engine.observe_source_trade(&seed_sell);
+
+        let mut entry = sample_entry("BUY", "asset-2", 10.0, 5.0, "0xsource");
+        entry.timestamp = recent_timestamp_ms();
+        let observation = engine.observe_source_trade(&entry);
+        engine
+            .enforce_entry_quality_pre_quote(&entry, &observation)
+            .expect("pre-quote filters should pass");
+        let quality = engine
+            .enforce_entry_quality_post_quote(
+                &entry,
+                &sample_quote(dec!(0.49), dec!(80), dec!(0.51), dec!(90)),
+                &observation,
+            )
+            .expect("valid trade should pass");
+
+        assert!(quality.total_score >= dec!(0.50));
     }
 }
