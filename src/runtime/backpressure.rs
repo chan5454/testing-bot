@@ -76,12 +76,7 @@ impl RuntimeBackpressure {
             if self
                 .inner
                 .cold_path_queue_depth
-                .compare_exchange(
-                    current,
-                    current - 1,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
+                .compare_exchange(current, current - 1, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
                 break;
@@ -162,4 +157,3 @@ mod tests {
         assert!(!backpressure.snapshot().degradation_mode);
     }
 }
-

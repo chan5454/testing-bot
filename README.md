@@ -143,7 +143,19 @@ The portfolio system now uses a stronger identity model:
 
 This fixes the earlier asset-only matching problems that caused orphan exits and misleading PnL.
 
-### 10. Position registry and ownership
+### 10. Position resolver and ownership
+
+`src/position_resolver.rs` now keeps a low-latency in-memory ownership index in front of the portfolio refresh cycle:
+
+- entries register a `PendingOpen` record as soon as execution is committed
+- the resolver can answer whether a copied position is `PendingOpen`, `Open`, or already `Closing`
+- source-follow exits bind directly to pending opens instead of spinning in a retry loop
+- when a pending position is promoted to open, any bound exit is released immediately back onto the hot path
+- pending-open resolver state persists to `data/position-resolver.json`
+
+This is the key fix for the old `owned_position_not_resolved_yet` bottleneck: exit matching no longer depends on the portfolio snapshot winning a race against the source SELL.
+
+### 11. Position registry and persistence
 
 `src/position_registry.rs` persists copied-position ownership independently of wallet activity:
 
@@ -153,7 +165,7 @@ This fixes the earlier asset-only matching problems that caused orphan exits and
 
 This is important because exit eligibility is now driven by owned positions, not just by whether a wallet is still active in the wallet registry.
 
-### 11. Exit management
+### 12. Exit management
 
 Exits are now first-class and mandatory.
 
@@ -174,12 +186,15 @@ Important protections:
 - exits are consumed from the hot queue before entries when `EXIT_PRIORITY_STRICT=true`
 - duplicate exits are blocked with a shared closing set
 - source SELL resolution always tries exact `PositionKey { condition_id, outcome, source_wallet }` ownership first
+- source SELL resolution checks both `PendingOpen` and fully open copied positions
+- pending-open exits bind locally and are released on the position-open event instead of polling
 - safe fallback resolution is limited to the same source wallet and same market/condition
 - unresolved source exits are persisted to a short retry buffer in `data/unresolved-exits.json`
+- unresolved retry now uses stepped backoff (`UNRESOLVED_EXIT_INITIAL_RETRY_MS`, `UNRESOLVED_EXIT_MAX_RETRY_MS`, `UNRESOLVED_EXIT_TOTAL_WINDOW_MS`) and runs off the hot path
 - `Closing` positions are revisited until they fill, escalate through mandatory/emergency unwind, or record an explicit failed-close reason
 - exit logic uses the position registry, so wallet removal does not strand positions
 
-### 12. Observability and health
+### 13. Observability and health
 
 Operational visibility is spread across:
 
@@ -216,17 +231,35 @@ The Telegram summary now reports:
 
 and warns when exits have not executed yet.
 
-### 13. Persistence boundaries
+The analytics summary now separates:
+
+- `position_pending_registered`
+- `position_promoted_to_open`
+- `exit_resolved_against_pending`
+- `exit_resolved_against_open`
+- `exit_bound_to_pending`
+- `deferred_exit_released`
+- `deferred_exit_expired`
+- `resolver_not_found`
+- `resolver_ambiguous`
+- `source_exit_retry_queued`
+- `source_exit_retry_resolved`
+- `source_exit_unresolved_expired`
+
+### 14. Persistence boundaries
 
 Latency-sensitive state updates now happen in memory first and flush on background intervals:
 
 - `data/portfolio-summary.json`
 - `data/state.json`
 - `data/execution-analytics-summary.json`
+- `data/position-resolver.json`
 
 Critical copied-position ownership transitions still persist through the position registry and lifecycle log so entry/exit ownership is not lost.
 
-### 14. Log rotation and retention
+The runtime now stores the projected portfolio layout in memory immediately after fills, so source-follow exits do not have to wait for a later JSON flush or live refresh just to discover a copied position.
+
+### 15. Log rotation and retention
 
 There are now two JSONL logging patterns:
 
@@ -256,11 +289,13 @@ The latency-sensitive flow is now:
 1. Read market deltas from the market WebSocket.
 2. Parse the minimal market/activity fields needed for an immediate decision.
 3. Resolve direct tracked-wallet entries and source-follow exits through fast attribution.
-4. Apply the fast in-memory risk gate.
-5. Submit an order through the live or paper executor.
-6. Update in-memory portfolio / lifecycle state immediately.
-7. Flush diagnostics, summaries, and non-critical persistence on the cold path.
-8. Continue managing the position until source exit, TP/SL, or time exit closes it.
+4. Register `PendingOpen` ownership before entry submission so later exits can resolve locally.
+5. Apply the fast in-memory risk gate.
+6. Submit an order through the live or paper executor.
+7. Project the fill into the in-memory portfolio and promote the resolver entry immediately.
+8. Release any exit that was bound to the pending position.
+9. Flush diagnostics, summaries, and non-critical persistence on the cold path.
+10. Continue managing the position until source exit, TP/SL, or time exit closes it.
 
 ## Execution Modes
 
@@ -321,6 +356,7 @@ If you prefer the release binary directly:
 - Wallet tracking: `TARGET_WALLETS`, optional authenticated activity credentials
 - Risk: `ENABLE_PRICE_BANDS`, `MIN_EDGE_THRESHOLD`, `MAX_COPY_DELAY_MS`, `MIN_LIQUIDITY`, `MIN_WALLET_SCORE`, `ALLOW_HEDGING`
 - Lifecycle and exits: `MAX_POSITION_AGE_HOURS`, `MAX_HOLD_TIME_SECONDS`, `ENABLE_EXIT_RETRY`, `EXIT_RETRY_WINDOW_MS`, `EXIT_RETRY_INTERVAL_MS`, `CLOSING_MAX_AGE_MS`, `FORCE_EXIT_ON_CLOSING_TIMEOUT`
+- Pending-open exit resolution: `UNRESOLVED_EXIT_INITIAL_RETRY_MS`, `UNRESOLVED_EXIT_MAX_RETRY_MS`, `UNRESOLVED_EXIT_TOTAL_WINDOW_MS`, `POSITION_PENDING_OPEN_TTL_MS`
 - Latency-first hot path: `HOT_PATH_MODE`, `HOT_PATH_QUEUE_CAPACITY`, `COLD_PATH_QUEUE_CAPACITY`, `ATTRIBUTION_FAST_CACHE_CAPACITY`, `PARSE_TASKS_MARKET`, `PARSE_TASKS_WALLET`, `EXIT_PRIORITY_STRICT`
 - Deferred cold-path work: `PERSISTENCE_FLUSH_INTERVAL_MS`, `ANALYTICS_FLUSH_INTERVAL_MS`, `TELEGRAM_ASYNC_ONLY`
 - Logging: `ENABLE_LOG_ROTATION`, `LOG_MAX_LINES`, `ENABLE_TIME_ROTATION`, `LOG_ROTATE_HOURS`, `ENABLE_LOG_CLEARING`
@@ -336,6 +372,7 @@ Core state:
 - `data/telegram-daily-summary.json`
 - `data/wallets_active.json`
 - `data/positions.json`
+- `data/position-resolver.json`
 - `data/unresolved-exits.json`
 
 Operational logs:

@@ -473,16 +473,21 @@ fn apply_position_fill(
             }
         }
         ExecutionSide::Sell => {
-            let requested_key = position_key_hint.cloned().unwrap_or_else(|| source.position_key());
-            let (index, _used_fallback) =
-                resolve_exit_index(snapshot, &requested_key, Some(&result.order_request.token_id))
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "cannot sell asset {} for wallet {} without a matching position",
-                            result.order_request.token_id,
-                            requested_key.source_wallet
-                        )
-                    })?;
+            let requested_key = position_key_hint
+                .cloned()
+                .unwrap_or_else(|| source.position_key());
+            let (index, _used_fallback) = resolve_exit_index(
+                snapshot,
+                &requested_key,
+                Some(&result.order_request.token_id),
+            )
+            .ok_or_else(|| {
+                anyhow!(
+                    "cannot sell asset {} for wallet {} without a matching position",
+                    result.order_request.token_id,
+                    requested_key.source_wallet
+                )
+            })?;
             let position = &mut snapshot.positions[index];
             if position.size < result.filled_size {
                 return Err(anyhow!(
@@ -974,6 +979,12 @@ mod tests {
             enable_exit_retry: true,
             exit_retry_window: Duration::from_secs(30),
             exit_retry_interval: Duration::from_millis(500),
+            unresolved_exit_initial_retry: Duration::from_millis(250),
+            unresolved_exit_total_window: Duration::from_secs(30),
+            unresolved_exit_max_retry: Duration::from_secs(4),
+            position_pending_open_ttl: Duration::from_secs(20),
+            rpc_global_rate_limit_per_second: 10,
+            rpc_per_market_rate_limit_per_second: 3,
             closing_max_age: Duration::from_secs(30),
             force_exit_on_closing_timeout: true,
             telegram_bot_token: "token".to_owned(),
@@ -1381,7 +1392,10 @@ mod tests {
         );
         assert!(!temp_dir.path().join("portfolio-summary.json").exists());
 
-        portfolio.flush_persistence().await.expect("flush persistence");
+        portfolio
+            .flush_persistence()
+            .await
+            .expect("flush persistence");
         assert!(temp_dir.path().join("portfolio-summary.json").exists());
     }
 }

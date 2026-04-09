@@ -112,11 +112,12 @@ impl TradeStageTimestamps {
     }
 
     pub fn attribution_latency_ms(&self) -> Option<u64> {
-        self.attribution_completed_at.map(|attribution_completed_at| {
-            attribution_completed_at
-                .duration_since(self.parse_completed_at)
-                .as_millis() as u64
-        })
+        self.attribution_completed_at
+            .map(|attribution_completed_at| {
+                attribution_completed_at
+                    .duration_since(self.parse_completed_at)
+                    .as_millis() as u64
+            })
     }
 
     pub fn detection_latency_ms(&self) -> u64 {
@@ -129,16 +130,15 @@ impl TradeStageTimestamps {
         let baseline = self
             .attribution_completed_at
             .unwrap_or(self.detection_triggered_at);
-        self.fast_risk_completed_at
-            .map(|fast_risk_completed_at| {
-                fast_risk_completed_at
-                    .duration_since(baseline)
-                    .as_millis() as u64
-            })
+        self.fast_risk_completed_at.map(|fast_risk_completed_at| {
+            fast_risk_completed_at.duration_since(baseline).as_millis() as u64
+        })
     }
 
     pub fn execution_latency_ms(&self, submitted_at: Instant) -> u64 {
-        let baseline = self.fast_risk_completed_at.unwrap_or(self.detection_triggered_at);
+        let baseline = self
+            .fast_risk_completed_at
+            .unwrap_or(self.detection_triggered_at);
         submitted_at.duration_since(baseline).as_millis() as u64
     }
 
@@ -469,10 +469,6 @@ impl PortfolioSnapshot {
         )
     }
 
-    pub fn can_resolve_position_to_sell(&self, entry: &ActivityEntry) -> bool {
-        self.resolve_position_to_sell(entry).is_some()
-    }
-
     pub fn resolve_position_to_sell_with_hint(
         &self,
         requested_key: &PositionKey,
@@ -518,9 +514,9 @@ impl PortfolioSnapshot {
     }
 
     pub fn position_is_closing(&self, key: &PositionKey) -> bool {
-        self.positions
-            .iter()
-            .any(|position| position.position_key() == *key && position.state == PositionState::Closing)
+        self.positions.iter().any(|position| {
+            position.position_key() == *key && position.state == PositionState::Closing
+        })
     }
 
     pub fn close_retry_due(

@@ -361,7 +361,10 @@ impl AttributionLogger {
             | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 self.backpressure.decrement_cold_path_depth();
                 self.backpressure.note_diagnostic_drop();
-                warn!(event = label, "dropping attribution event due to cold-path backpressure");
+                warn!(
+                    event = label,
+                    "dropping attribution event due to cold-path backpressure"
+                );
             }
         }
     }
@@ -376,7 +379,8 @@ fn spawn_writer(
 ) {
     tokio::spawn(async move {
         while let Some(line) = line_rx.recv().await {
-            if let Err(error) = write_line(&path, rotating_logger.as_ref(), &write_lock, &line).await
+            if let Err(error) =
+                write_line(&path, rotating_logger.as_ref(), &write_lock, &line).await
             {
                 warn!(?error, "failed to persist attribution event");
             }
@@ -683,6 +687,12 @@ mod tests {
             enable_exit_retry: true,
             exit_retry_window: Duration::from_secs(30),
             exit_retry_interval: Duration::from_millis(500),
+            unresolved_exit_initial_retry: Duration::from_millis(250),
+            unresolved_exit_total_window: Duration::from_secs(30),
+            unresolved_exit_max_retry: Duration::from_secs(4),
+            position_pending_open_ttl: Duration::from_secs(20),
+            rpc_global_rate_limit_per_second: 10,
+            rpc_per_market_rate_limit_per_second: 3,
             closing_max_age: Duration::from_secs(30),
             force_exit_on_closing_timeout: true,
             telegram_bot_token: "token".to_owned(),

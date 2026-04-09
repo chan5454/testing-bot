@@ -341,13 +341,7 @@ impl OrderBookState {
             .await
             .context("decoding order book")?;
 
-        self.apply_book_snapshot(
-            book,
-            Instant::now(),
-            Utc::now(),
-            Instant::now(),
-            Utc::now(),
-        )
+        self.apply_book_snapshot(book, Instant::now(), Utc::now(), Instant::now(), Utc::now())
             .await?;
         Ok(self.best_quote(asset_id).await)
     }
@@ -824,6 +818,12 @@ mod tests {
             enable_exit_retry: true,
             exit_retry_window: Duration::from_secs(30),
             exit_retry_interval: Duration::from_millis(500),
+            unresolved_exit_initial_retry: Duration::from_millis(250),
+            unresolved_exit_total_window: Duration::from_secs(30),
+            unresolved_exit_max_retry: Duration::from_secs(4),
+            position_pending_open_ttl: Duration::from_secs(20),
+            rpc_global_rate_limit_per_second: 10,
+            rpc_per_market_rate_limit_per_second: 3,
             closing_max_age: Duration::from_secs(30),
             force_exit_on_closing_timeout: true,
             telegram_bot_token: "token".to_owned(),

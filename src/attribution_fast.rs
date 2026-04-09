@@ -6,12 +6,12 @@ use crate::config::Settings;
 use crate::detection::trade_inference::ConfirmedTradeSignal;
 use crate::orderbook::orderbook_state::AssetCatalog;
 use crate::position_registry::PositionRegistry;
+use crate::wallet::wallet_matching::ActivityTradeEvent;
 use crate::wallet::wallet_matching::{
-    ActivityMatch, MatchWindow, MatchedTrackedTrade, MarketSignalValidation, TradeCorrelationKind,
+    ActivityMatch, MarketSignalValidation, MatchWindow, MatchedTrackedTrade, TradeCorrelationKind,
     build_wallet_triggered_trade,
 };
 use crate::wallet_registry::WalletRegistry;
-use crate::wallet::wallet_matching::ActivityTradeEvent;
 
 #[derive(Clone)]
 struct RecentSignal {
@@ -62,18 +62,21 @@ impl FastAttributionIndex {
         let validation = if event.asset_id.is_some() && event.side.is_some() {
             None
         } else {
-            self.recent_signals
-                .iter()
-                .find_map(|candidate| {
-                    validation_for_event(candidate, &event, self.correlation_window_ms)
-                })
+            self.recent_signals.iter().find_map(|candidate| {
+                validation_for_event(candidate, &event, self.correlation_window_ms)
+            })
         };
 
-        let mut matched_trade =
-            build_wallet_triggered_trade(&event, catalog, validation.as_ref())?;
+        let mut matched_trade = build_wallet_triggered_trade(&event, catalog, validation.as_ref())?;
         let now = Utc::now();
-        matched_trade.signal.stage_timestamps.attribution_completed_at = Some(std::time::Instant::now());
-        matched_trade.signal.stage_timestamps.attribution_completed_at_utc = Some(now);
+        matched_trade
+            .signal
+            .stage_timestamps
+            .attribution_completed_at = Some(std::time::Instant::now());
+        matched_trade
+            .signal
+            .stage_timestamps
+            .attribution_completed_at_utc = Some(now);
         Some(matched_trade)
     }
 }
@@ -106,7 +109,7 @@ fn validation_for_event(
                 .stage_timestamps
                 .detection_triggered_at_utc
                 .timestamp_millis())
-            .abs()
+        .abs()
             > correlation_window_ms
     {
         return None;
@@ -245,6 +248,12 @@ mod tests {
             enable_exit_retry: true,
             exit_retry_window: Duration::from_secs(30),
             exit_retry_interval: Duration::from_millis(500),
+            unresolved_exit_initial_retry: Duration::from_millis(250),
+            unresolved_exit_total_window: Duration::from_secs(30),
+            unresolved_exit_max_retry: Duration::from_secs(4),
+            position_pending_open_ttl: Duration::from_secs(20),
+            rpc_global_rate_limit_per_second: 10,
+            rpc_per_market_rate_limit_per_second: 3,
             closing_max_age: Duration::from_secs(30),
             force_exit_on_closing_timeout: true,
             telegram_bot_token: "token".to_owned(),
@@ -322,10 +331,12 @@ mod tests {
 
         assert_eq!(trade.entry.asset, "asset-1");
         assert_eq!(trade.entry.proxy_wallet, "0xsource");
-        assert!(trade
-            .signal
-            .stage_timestamps
-            .attribution_completed_at_utc
-            .is_some());
+        assert!(
+            trade
+                .signal
+                .stage_timestamps
+                .attribution_completed_at_utc
+                .is_some()
+        );
     }
 }

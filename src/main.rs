@@ -2,8 +2,8 @@ mod attribution_fast;
 mod attribution_logger;
 mod config;
 mod detection;
-mod exits;
 mod execution;
+mod exits;
 mod health;
 mod latency;
 mod latency_monitor;
@@ -14,6 +14,7 @@ mod notifier;
 mod orderbook;
 mod portfolio;
 mod position_registry;
+mod position_resolver;
 mod prediction;
 mod raw_activity_logger;
 mod risk;
@@ -36,10 +37,10 @@ use anyhow::{Result, anyhow};
 use attribution_logger::AttributionLogger;
 use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use detection::trade_inference::ConfirmedTradeSignal;
-use exits::resolution::{ExitResolutionBuffer, SourceExitResolution};
 use execution::{
     ExecutionRequest, ExecutionSide, ExecutionStatus, ExecutionSuccess, TradeExecutor,
 };
+use exits::resolution::{ExitResolutionBuffer, SourceExitResolution};
 use latency::LatencyLogger;
 use latency_monitor::LatencyMonitor;
 use models::{
@@ -50,6 +51,7 @@ use notifier::{SUMMARY_REFRESH_INTERVAL, TelegramNotifier};
 use orderbook::orderbook_state::OrderBookState;
 use portfolio::PortfolioService;
 use position_registry::PositionRegistry;
+use position_resolver::PositionResolver;
 use prediction::{PredictionEngine, build_predicted_trade, signal_cache_key};
 use raw_activity_logger::RawActivityLogger;
 use risk::{CopyDecision, RiskEngine, SkipReason};
@@ -69,8 +71,8 @@ use websocket::stream_router::StreamRouterHandle;
 
 use crate::config::Settings;
 use crate::health::{HealthState, spawn_health_server};
-use crate::runtime::control::RuntimeControl;
 use crate::runtime::backpressure::RuntimeBackpressure;
+use crate::runtime::control::RuntimeControl;
 use crate::runtime::hot_path::{HotPathEnqueue, HotPathQueue, HotPathTaskKind};
 use crate::storage::StateStore;
 
@@ -598,6 +600,7 @@ async fn main() -> Result<()> {
     info!("websocket-only activity mode skips REST prediction warm start");
     let wallet_registry = WalletRegistry::load(&settings)?;
     let position_registry = PositionRegistry::load(&settings)?;
+    let position_resolver = PositionResolver::load(&settings)?;
     let mut prediction_engine = PredictionEngine::with_registries(
         &settings,
         wallet_registry.clone(),
@@ -668,6 +671,7 @@ async fn main() -> Result<()> {
         backpressure.clone(),
     );
     let (hot_path_result_tx, mut hot_path_result_rx) = mpsc::unbounded_channel();
+    let (released_hot_task_tx, mut released_hot_task_rx) = mpsc::unbounded_channel();
     let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
     let (matched_trade_tx, mut matched_trade_rx) = mpsc::unbounded_channel();
     let activity_stream = WalletActivityStream::spawn(
@@ -709,8 +713,13 @@ async fn main() -> Result<()> {
 
     spawn_health_server(settings.health_port, health.clone()).await?;
     let closing_positions: ClosingPositions = Arc::new(Mutex::new(HashSet::new()));
-    warm_start(&portfolio, &health, &position_registry).await;
+    warm_start(&portfolio, &health, &position_registry, &position_resolver).await;
     if let Some(snapshot) = portfolio.snapshot().await {
+        if let Ok(released_exits) = position_resolver.sync_from_portfolio(&snapshot) {
+            for released_exit in released_exits {
+                let _ = released_hot_task_tx.send(source_exit_hot_task(released_exit));
+            }
+        }
         analytics.sync_with_portfolio(&snapshot).await;
         if notifier.async_only() {
             let notifier = notifier.clone();
@@ -729,6 +738,8 @@ async fn main() -> Result<()> {
         health.clone(),
         analytics.clone(),
         position_registry.clone(),
+        position_resolver.clone(),
+        released_hot_task_tx.clone(),
     ));
     tokio::spawn(spawn_periodic_portfolio_summary(
         portfolio.clone(),
@@ -738,12 +749,22 @@ async fn main() -> Result<()> {
         settings.clone(),
         portfolio.clone(),
         position_registry.clone(),
+        position_resolver.clone(),
         executor.clone(),
         orderbooks.clone(),
         closing_positions.clone(),
+        released_hot_task_tx.clone(),
         notifier.clone(),
         health.clone(),
         analytics.clone(),
+    ));
+    tokio::spawn(spawn_unresolved_exit_retry_worker(
+        portfolio.clone(),
+        position_registry.clone(),
+        position_resolver.clone(),
+        exit_resolution.clone(),
+        analytics.clone(),
+        released_hot_task_tx.clone(),
     ));
     tokio::spawn(spawn_log_retention_maintainer(
         attribution_logger.clone(),
@@ -762,6 +783,7 @@ async fn main() -> Result<()> {
             risk.clone(),
             portfolio.clone(),
             position_registry.clone(),
+            position_resolver.clone(),
             exit_resolution.clone(),
             executor.clone(),
             orderbooks.clone(),
@@ -772,6 +794,7 @@ async fn main() -> Result<()> {
             runtime_control.clone(),
             analytics.clone(),
             closing_positions.clone(),
+            released_hot_task_tx.clone(),
         ));
     }
 
@@ -795,7 +818,9 @@ async fn main() -> Result<()> {
                     executor.clone(),
                     orderbooks.clone(),
                     portfolio.clone(),
+                    position_resolver.clone(),
                     closing_positions.clone(),
+                    released_hot_task_tx.clone(),
                     notifier.clone(),
                     attribution_logger.clone(),
                     health.clone(),
@@ -928,6 +953,7 @@ async fn main() -> Result<()> {
                                 &risk,
                                 &portfolio,
                                 &position_registry,
+                                &position_resolver,
                                 exit_resolution.clone(),
                                 executor.clone(),
                                 orderbooks.clone(),
@@ -938,6 +964,7 @@ async fn main() -> Result<()> {
                                 runtime_control.clone(),
                                 analytics.clone(),
                                 closing_positions.clone(),
+                                released_hot_task_tx.clone(),
                             )
                             .await;
                             handle_hot_path_result(
@@ -951,6 +978,7 @@ async fn main() -> Result<()> {
                                 &risk,
                                 &portfolio,
                                 &position_registry,
+                                &position_resolver,
                                 exit_resolution.clone(),
                                 executor.clone(),
                                 orderbooks.clone(),
@@ -961,6 +989,7 @@ async fn main() -> Result<()> {
                                 runtime_control.clone(),
                                 analytics.clone(),
                                 closing_positions.clone(),
+                                released_hot_task_tx.clone(),
                                 attribution_logger.clone(),
                             )
                             .await;
@@ -1149,6 +1178,7 @@ async fn main() -> Result<()> {
                                     &risk,
                                     &portfolio,
                                     &position_registry,
+                                    &position_resolver,
                                     exit_resolution.clone(),
                                     executor.clone(),
                                     orderbooks.clone(),
@@ -1159,6 +1189,7 @@ async fn main() -> Result<()> {
                                     runtime_control.clone(),
                                     analytics.clone(),
                                     closing_positions.clone(),
+                                    released_hot_task_tx.clone(),
                                 )
                                 .await;
                                 handle_hot_path_result(
@@ -1172,6 +1203,7 @@ async fn main() -> Result<()> {
                                     &risk,
                                     &portfolio,
                                     &position_registry,
+                                    &position_resolver,
                                     exit_resolution.clone(),
                                     executor.clone(),
                                     orderbooks.clone(),
@@ -1182,11 +1214,70 @@ async fn main() -> Result<()> {
                                     runtime_control.clone(),
                                     analytics.clone(),
                                     closing_positions.clone(),
+                                    released_hot_task_tx.clone(),
                                     attribution_logger.clone(),
                                 )
                                 .await;
                             }
                         }
+                    }
+                }
+            }
+            Some(task) = released_hot_task_rx.recv() => {
+                let enqueue_result = if settings.hot_path_mode {
+                    hot_path_queue.enqueue(task, HotPathTaskKind::SourceExit)
+                } else {
+                    HotPathEnqueue::ProcessInline(task)
+                };
+
+                match enqueue_result {
+                    HotPathEnqueue::Queued => {}
+                    HotPathEnqueue::ProcessInline(task) | HotPathEnqueue::Dropped(task) => {
+                        let result = execute_hot_path_task(
+                            task,
+                            &risk,
+                            &portfolio,
+                            &position_registry,
+                            &position_resolver,
+                            exit_resolution.clone(),
+                            executor.clone(),
+                            orderbooks.clone(),
+                            latency_logger.clone(),
+                            latency_monitor.clone(),
+                            notifier.clone(),
+                            health.clone(),
+                            runtime_control.clone(),
+                            analytics.clone(),
+                            closing_positions.clone(),
+                            released_hot_task_tx.clone(),
+                        )
+                        .await;
+                        handle_hot_path_result(
+                            result,
+                            &settings,
+                            &mut pending_validations,
+                            &mut inflight_predictions,
+                            &mut deferred_direct_matches,
+                            &mut trade_rate_limiter,
+                            &hot_path_queue,
+                            &risk,
+                            &portfolio,
+                            &position_registry,
+                            &position_resolver,
+                            exit_resolution.clone(),
+                            executor.clone(),
+                            orderbooks.clone(),
+                            latency_logger.clone(),
+                            latency_monitor.clone(),
+                            notifier.clone(),
+                            health.clone(),
+                            runtime_control.clone(),
+                            analytics.clone(),
+                            closing_positions.clone(),
+                            released_hot_task_tx.clone(),
+                            attribution_logger.clone(),
+                        )
+                        .await;
                     }
                 }
             }
@@ -1202,6 +1293,7 @@ async fn main() -> Result<()> {
                     &risk,
                     &portfolio,
                     &position_registry,
+                    &position_resolver,
                     exit_resolution.clone(),
                     executor.clone(),
                     orderbooks.clone(),
@@ -1212,6 +1304,7 @@ async fn main() -> Result<()> {
                     runtime_control.clone(),
                     analytics.clone(),
                     closing_positions.clone(),
+                    released_hot_task_tx.clone(),
                     attribution_logger.clone(),
                 )
                 .await;
@@ -1236,6 +1329,7 @@ async fn run_hot_path_executor(
     risk: RiskEngine,
     portfolio: Arc<PortfolioService>,
     position_registry: PositionRegistry,
+    position_resolver: PositionResolver,
     exit_resolution: Arc<ExitResolutionBuffer>,
     executor: Arc<dyn TradeExecutor>,
     orderbooks: Arc<OrderBookState>,
@@ -1246,6 +1340,7 @@ async fn run_hot_path_executor(
     runtime_control: Arc<RuntimeControl>,
     analytics: Arc<ExecutionAnalyticsTracker>,
     closing_positions: ClosingPositions,
+    released_hot_task_tx: mpsc::UnboundedSender<HotPathTradeTask>,
 ) {
     while let Some(task) = hot_path_rx.recv().await {
         let result = execute_hot_path_task(
@@ -1253,6 +1348,7 @@ async fn run_hot_path_executor(
             &risk,
             &portfolio,
             &position_registry,
+            &position_resolver,
             exit_resolution.clone(),
             executor.clone(),
             orderbooks.clone(),
@@ -1263,6 +1359,7 @@ async fn run_hot_path_executor(
             runtime_control.clone(),
             analytics.clone(),
             closing_positions.clone(),
+            released_hot_task_tx.clone(),
         )
         .await;
         if hot_path_result_tx.send(result).is_err() {
@@ -1276,6 +1373,7 @@ async fn execute_hot_path_task(
     risk: &RiskEngine,
     portfolio: &Arc<PortfolioService>,
     position_registry: &PositionRegistry,
+    position_resolver: &PositionResolver,
     exit_resolution: Arc<ExitResolutionBuffer>,
     executor: Arc<dyn TradeExecutor>,
     orderbooks: Arc<OrderBookState>,
@@ -1286,14 +1384,14 @@ async fn execute_hot_path_task(
     runtime_control: Arc<RuntimeControl>,
     analytics: Arc<ExecutionAnalyticsTracker>,
     closing_positions: ClosingPositions,
+    released_hot_task_tx: mpsc::UnboundedSender<HotPathTradeTask>,
 ) -> HotPathExecutionResult {
     let outcome = process_trade(
-        &task.matched_trade.entry,
-        &task.matched_trade.signal,
-        task.execution_confidence,
+        &task,
         risk,
         portfolio,
         position_registry,
+        position_resolver,
         exit_resolution,
         executor,
         orderbooks,
@@ -1304,7 +1402,7 @@ async fn execute_hot_path_task(
         runtime_control,
         analytics,
         closing_positions,
-        task.quote_policy,
+        released_hot_task_tx,
     )
     .await;
     HotPathExecutionResult { task, outcome }
@@ -1321,6 +1419,7 @@ async fn handle_hot_path_result(
     risk: &RiskEngine,
     portfolio: &Arc<PortfolioService>,
     position_registry: &PositionRegistry,
+    position_resolver: &PositionResolver,
     exit_resolution: Arc<ExitResolutionBuffer>,
     executor: Arc<dyn TradeExecutor>,
     orderbooks: Arc<OrderBookState>,
@@ -1331,6 +1430,7 @@ async fn handle_hot_path_result(
     runtime_control: Arc<RuntimeControl>,
     analytics: Arc<ExecutionAnalyticsTracker>,
     closing_positions: ClosingPositions,
+    released_hot_task_tx: mpsc::UnboundedSender<HotPathTradeTask>,
     attribution_logger: Arc<AttributionLogger>,
 ) {
     match &result.task.source {
@@ -1345,6 +1445,10 @@ async fn handle_hot_path_result(
             match result.outcome {
                 Ok(TradeProcessingOutcome::Skipped(reason)) => {
                     let _ = reason.code;
+                    trade_rate_limiter.release(*claim_id);
+                }
+                Ok(TradeProcessingOutcome::Deferred(deferred)) => {
+                    let _ = deferred.code;
                     trade_rate_limiter.release(*claim_id);
                 }
                 Ok(TradeProcessingOutcome::Executed(executed_trade)) => {
@@ -1399,6 +1503,7 @@ async fn handle_hot_path_result(
                             risk,
                             portfolio,
                             position_registry,
+                            position_resolver,
                             exit_resolution.clone(),
                             executor.clone(),
                             orderbooks.clone(),
@@ -1409,6 +1514,7 @@ async fn handle_hot_path_result(
                             runtime_control.clone(),
                             analytics.clone(),
                             closing_positions.clone(),
+                            released_hot_task_tx.clone(),
                         )
                         .await;
                         Box::pin(handle_hot_path_result(
@@ -1422,6 +1528,7 @@ async fn handle_hot_path_result(
                             risk,
                             portfolio,
                             position_registry,
+                            position_resolver,
                             exit_resolution.clone(),
                             executor.clone(),
                             orderbooks.clone(),
@@ -1432,6 +1539,7 @@ async fn handle_hot_path_result(
                             runtime_control.clone(),
                             analytics.clone(),
                             closing_positions.clone(),
+                            released_hot_task_tx.clone(),
                             attribution_logger.clone(),
                         ))
                         .await;
@@ -1439,12 +1547,16 @@ async fn handle_hot_path_result(
                 }
             }
         }
-        HotPathTradeSource::DirectTrackedTrade => {
-            if let Err(error) = result.outcome {
+        HotPathTradeSource::DirectTrackedTrade => match result.outcome {
+            Ok(TradeProcessingOutcome::Deferred(deferred)) => {
+                let _ = deferred.detail;
+            }
+            Ok(_) => {}
+            Err(error) => {
                 error!(?error, "failed to process direct tracked-wallet trade");
                 health.set_last_error(format!("{error:#}")).await;
             }
-        }
+        },
     }
 }
 
@@ -1465,12 +1577,16 @@ async fn warm_start(
     portfolio: &PortfolioService,
     health: &HealthState,
     position_registry: &PositionRegistry,
+    position_resolver: &PositionResolver,
 ) {
     match portfolio.refresh_snapshot().await {
         Ok(snapshot) => {
             health.set_portfolio_value(snapshot.total_value).await;
             if let Err(error) = position_registry.sync_from_portfolio(&snapshot) {
                 warn!(?error, "failed to sync position registry during warm start");
+            }
+            if let Err(error) = position_resolver.sync_from_portfolio(&snapshot) {
+                warn!(?error, "failed to sync position resolver during warm start");
             }
         }
         Err(error) => warn!(?error, "initial portfolio fetch failed"),
@@ -1562,7 +1678,13 @@ struct HotPathExecutionResult {
 
 enum TradeProcessingOutcome {
     Skipped(SkipReason),
+    Deferred(DeferredTrade),
     Executed(ExecutedTrade),
+}
+
+struct DeferredTrade {
+    code: &'static str,
+    detail: String,
 }
 
 #[derive(Clone)]
@@ -1675,25 +1797,20 @@ impl TradeRateLimiter {
     }
 
     fn evict_expired(&mut self, now: Instant) {
-        while self
-            .recent_claims
-            .front()
-            .is_some_and(|(_, claimed_at)| {
-                now.duration_since(*claimed_at) >= Duration::from_secs(60)
-            })
-        {
+        while self.recent_claims.front().is_some_and(|(_, claimed_at)| {
+            now.duration_since(*claimed_at) >= Duration::from_secs(60)
+        }) {
             self.recent_claims.pop_front();
         }
     }
 }
 
 async fn process_trade(
-    entry: &ActivityEntry,
-    signal: &ConfirmedTradeSignal,
-    execution_confidence: f64,
+    task: &HotPathTradeTask,
     risk: &RiskEngine,
     portfolio: &PortfolioService,
     position_registry: &PositionRegistry,
+    position_resolver: &PositionResolver,
     exit_resolution: Arc<ExitResolutionBuffer>,
     executor: Arc<dyn TradeExecutor>,
     orderbooks: Arc<OrderBookState>,
@@ -1704,9 +1821,14 @@ async fn process_trade(
     runtime_control: Arc<RuntimeControl>,
     analytics: Arc<ExecutionAnalyticsTracker>,
     closing_positions: ClosingPositions,
-    quote_policy: QuotePolicy,
+    released_hot_task_tx: mpsc::UnboundedSender<HotPathTradeTask>,
 ) -> Result<TradeProcessingOutcome> {
+    let entry = &task.matched_trade.entry;
+    let signal = &task.matched_trade.signal;
+    let execution_confidence = task.execution_confidence;
+    let quote_policy = task.quote_policy;
     let side = normalized_execution_side(entry);
+    let requested_key = entry.position_key();
     let mut stage_timestamps = signal.stage_timestamps.clone();
     if runtime_control.is_paused() {
         let reason = SkipReason::new(
@@ -1736,13 +1858,47 @@ async fn process_trade(
     health
         .set_portfolio_value(current_portfolio.total_value)
         .await;
+    let mut resolved_exit_position = if matches!(side, ExecutionSide::Sell) {
+        current_portfolio.resolve_position_to_sell(entry)
+    } else {
+        None
+    };
     let mut has_copied_inventory = match side {
         ExecutionSide::Sell => {
-            current_portfolio.can_resolve_position_to_sell(entry)
+            resolved_exit_position.is_some()
                 || position_registry.has_matching_open_position(entry)
+                || position_resolver.has_resolvable_position(&requested_key)
         }
-        ExecutionSide::Buy => current_portfolio.has_position_key(&entry.position_key()),
+        ExecutionSide::Buy => {
+            current_portfolio.has_position_key(&requested_key)
+                || position_resolver.has_resolvable_position(&requested_key)
+        }
     };
+    if matches!(side, ExecutionSide::Buy)
+        && position_resolver.has_resolvable_position(&requested_key)
+    {
+        let reason = SkipReason::new(
+            "position_exists",
+            format!(
+                "position already pending/open for condition {} outcome {} wallet {}",
+                requested_key.condition_id, requested_key.outcome, requested_key.source_wallet
+            ),
+        );
+        record_trade_skip(
+            entry,
+            signal,
+            risk,
+            health,
+            latency_logger,
+            analytics,
+            Some(&current_portfolio),
+            None,
+            classify_rejected_trade(side, has_copied_inventory),
+            &reason,
+        )
+        .await;
+        return Ok(TradeProcessingOutcome::Skipped(reason));
+    }
     if matches!(side, ExecutionSide::Sell) {
         analytics
             .record_exit_event("source_exit_seen", Some(&current_portfolio))
@@ -1751,15 +1907,21 @@ async fn process_trade(
             .resolve_source_exit(
                 &current_portfolio,
                 position_registry,
-                entry,
+                position_resolver,
+                &task.matched_trade,
                 Utc::now(),
             )
             .await?
         {
             SourceExitResolution::Matched(position_key) => {
                 has_copied_inventory = true;
+                resolved_exit_position = resolved_exit_position
+                    .or_else(|| position_resolver.resolved_position(&position_key));
                 analytics
                     .record_exit_event("source_exit_matched", Some(&current_portfolio))
+                    .await;
+                analytics
+                    .record_exit_event("exit_resolved_against_open", Some(&current_portfolio))
                     .await;
                 info!(
                     event = "source_exit_matched",
@@ -1771,8 +1933,20 @@ async fn process_trade(
             }
             SourceExitResolution::MatchedByFallback(position_key, fallback_reason) => {
                 has_copied_inventory = true;
+                resolved_exit_position = resolved_exit_position.or_else(|| {
+                    position_resolver
+                        .resolved_position(&position_key)
+                        .map(|mut resolved| {
+                            resolved.used_fallback = true;
+                            resolved.fallback_reason = Some(fallback_reason.clone());
+                            resolved
+                        })
+                });
                 analytics
                     .record_exit_event("source_exit_matched_fallback", Some(&current_portfolio))
+                    .await;
+                analytics
+                    .record_exit_event("exit_resolved_against_open", Some(&current_portfolio))
                     .await;
                 info!(
                     event = "source_exit_matched_fallback",
@@ -1783,34 +1957,46 @@ async fn process_trade(
                     "resolved source exit through safe same-owner fallback"
                 );
             }
-            SourceExitResolution::DeferredRetry(retry) => {
-                if retry.already_queued {
-                    let reason = SkipReason::new(
-                        "source_exit_retry_queued",
-                        format!(
-                            "source exit retry {} is already queued: {}",
-                            retry.retry_key, retry.reason
-                        ),
-                    );
-                    record_trade_skip(
-                        entry,
-                        signal,
-                        risk,
-                        health,
-                        latency_logger,
-                        analytics,
-                        Some(&current_portfolio),
-                        None,
-                        classify_rejected_trade(side, has_copied_inventory),
-                        &reason,
-                    )
-                    .await;
-                    return Ok(TradeProcessingOutcome::Skipped(reason));
-                }
-
+            SourceExitResolution::BoundToPending(bound) => {
                 analytics
-                    .record_exit_event("source_exit_retry_queued", Some(&current_portfolio))
+                    .record_exit_event("exit_resolved_against_pending", Some(&current_portfolio))
                     .await;
+                analytics
+                    .record_exit_event("exit_bound_to_pending", Some(&current_portfolio))
+                    .await;
+                analytics
+                    .record_exit_event("retry_attempts_saved_by_binding", Some(&current_portfolio))
+                    .await;
+                info!(
+                    event = "exit_bound_to_pending",
+                    condition_id = %bound.position_key.condition_id,
+                    outcome = %bound.position_key.outcome,
+                    source_wallet = %bound.position_key.source_wallet,
+                    already_bound = bound.already_bound,
+                    bound_exit_count = bound.bound_exit_count,
+                    "bound source exit to pending copied position"
+                );
+                return Ok(TradeProcessingOutcome::Deferred(DeferredTrade {
+                    code: "exit_bound_to_pending",
+                    detail: format!(
+                        "bound source exit to pending position {}:{}:{}",
+                        bound.position_key.condition_id,
+                        bound.position_key.outcome,
+                        bound.position_key.source_wallet
+                    ),
+                }));
+            }
+            SourceExitResolution::DeferredRetry(retry) => {
+                if retry.reason.contains("not_resolved") {
+                    analytics
+                        .record_exit_event("resolver_not_found", Some(&current_portfolio))
+                        .await;
+                }
+                if !retry.already_queued {
+                    analytics
+                        .record_exit_event("source_exit_retry_queued", Some(&current_portfolio))
+                        .await;
+                }
                 info!(
                     event = "source_exit_retry_queued",
                     retry_key = %retry.retry_key,
@@ -1820,92 +2006,29 @@ async fn process_trade(
                     source_wallet = %entry.proxy_wallet,
                     "queued unresolved source exit for retry"
                 );
-
-                loop {
-                    sleep(exit_resolution.retry_interval()).await;
-                    current_portfolio = load_current_portfolio_snapshot(portfolio).await?;
-                    has_copied_inventory = current_portfolio.can_resolve_position_to_sell(entry)
-                        || position_registry.has_matching_open_position(entry);
-
-                    match exit_resolution
-                        .retry_unresolved_exit(
-                            &retry.retry_key,
-                            &current_portfolio,
-                            position_registry,
-                            Utc::now(),
-                        )
-                        .await?
-                    {
-                        SourceExitResolution::Matched(position_key) => {
-                            has_copied_inventory = true;
-                            analytics
-                                .record_exit_event(
-                                    "source_exit_retry_resolved",
-                                    Some(&current_portfolio),
-                                )
-                                .await;
-                            info!(
-                                event = "source_exit_retry_resolved",
-                                retry_key = %retry.retry_key,
-                                condition_id = %position_key.condition_id,
-                                outcome = %position_key.outcome,
-                                source_wallet = %position_key.source_wallet,
-                                "resolved queued source exit before retry expiry"
-                            );
-                            break;
-                        }
-                        SourceExitResolution::MatchedByFallback(position_key, fallback_reason) => {
-                            has_copied_inventory = true;
-                            analytics
-                                .record_exit_event(
-                                    "source_exit_retry_resolved",
-                                    Some(&current_portfolio),
-                                )
-                                .await;
-                            info!(
-                                event = "source_exit_retry_resolved",
-                                retry_key = %retry.retry_key,
-                                condition_id = %position_key.condition_id,
-                                outcome = %position_key.outcome,
-                                source_wallet = %position_key.source_wallet,
-                                fallback_reason = %fallback_reason,
-                                "resolved queued source exit through safe fallback"
-                            );
-                            break;
-                        }
-                        SourceExitResolution::DeferredRetry(_) => continue,
-                        SourceExitResolution::Failed(reason_detail) => {
-                            exit_resolution
-                                .mark_exit_resolution_failed(&retry.retry_key, &reason_detail)
-                                .await?;
-                            analytics
-                                .record_exit_event(
-                                    "source_exit_unresolved_expired",
-                                    Some(&current_portfolio),
-                                )
-                                .await;
-                            let reason = SkipReason::new("source_exit_unresolved", reason_detail);
-                            record_trade_skip(
-                                entry,
-                                signal,
-                                risk,
-                                health,
-                                latency_logger,
-                                analytics,
-                                Some(&current_portfolio),
-                                None,
-                                classify_rejected_trade(side, has_copied_inventory),
-                                &reason,
-                            )
-                            .await;
-                            return Ok(TradeProcessingOutcome::Skipped(reason));
-                        }
-                    }
-                }
+                return Ok(TradeProcessingOutcome::Deferred(DeferredTrade {
+                    code: "source_exit_retry_queued",
+                    detail: format!(
+                        "queued unresolved source exit retry {}: {}",
+                        retry.retry_key, retry.reason
+                    ),
+                }));
             }
             SourceExitResolution::Failed(reason_detail) => {
+                if reason_detail.contains("ambiguous") {
+                    analytics
+                        .record_exit_event("resolver_ambiguous", Some(&current_portfolio))
+                        .await;
+                } else {
+                    analytics
+                        .record_exit_event(
+                            "source_exit_unresolved_expired",
+                            Some(&current_portfolio),
+                        )
+                        .await;
+                }
                 analytics
-                    .record_exit_event("source_exit_unresolved_expired", Some(&current_portfolio))
+                    .record_close_failure_reason("exit_unresolved", Some(&current_portfolio))
                     .await;
                 let reason = SkipReason::new("source_exit_unresolved", reason_detail);
                 record_trade_skip(
@@ -1927,10 +2050,23 @@ async fn process_trade(
     }
 
     let decision = loop {
-        let evaluation = if risk.fast_risk_only_on_hot_path() {
-            risk.evaluate_fast(entry, &current_portfolio)
-        } else {
-            risk.evaluate(entry, &current_portfolio)
+        let evaluation = match side {
+            ExecutionSide::Sell => {
+                if let Some(resolved_position) = resolved_exit_position.clone() {
+                    risk.evaluate_sell_from_resolved_position(entry, resolved_position)
+                } else if risk.fast_risk_only_on_hot_path() {
+                    risk.evaluate_fast(entry, &current_portfolio)
+                } else {
+                    risk.evaluate(entry, &current_portfolio)
+                }
+            }
+            ExecutionSide::Buy => {
+                if risk.fast_risk_only_on_hot_path() {
+                    risk.evaluate_fast(entry, &current_portfolio)
+                } else {
+                    risk.evaluate(entry, &current_portfolio)
+                }
+            }
         };
         match evaluation {
             Ok(decision) => break decision,
@@ -1955,6 +2091,17 @@ async fn process_trade(
     stage_timestamps.fast_risk_completed_at = Some(Instant::now());
     stage_timestamps.fast_risk_completed_at_utc = Some(Utc::now());
     let eligible_class = eligible_class_for_side(side);
+    let mut pending_open_key = None;
+
+    if matches!(side, ExecutionSide::Buy)
+        && let Some(position_key) = decision.position_key.as_ref()
+    {
+        position_resolver.register_pending_open(position_key.clone(), entry)?;
+        analytics
+            .record_exit_event("position_pending_registered", Some(&current_portfolio))
+            .await;
+        pending_open_key = Some(position_key.clone());
+    }
 
     if matches!(side, ExecutionSide::Sell) {
         let Some(position_key) = decision.position_key.as_ref() else {
@@ -1980,7 +2127,8 @@ async fn process_trade(
 
         let close_retry_interval =
             TimeDelta::from_std(risk.exit_retry_interval()).unwrap_or_else(|_| TimeDelta::zero());
-        if current_portfolio.position_is_closing(position_key)
+        if (current_portfolio.position_is_closing(position_key)
+            || position_resolver.is_closing(position_key))
             && !current_portfolio.close_retry_due(position_key, Utc::now(), close_retry_interval)
         {
             let reason = SkipReason::new(
@@ -2030,10 +2178,16 @@ async fn process_trade(
             return Ok(TradeProcessingOutcome::Skipped(reason));
         }
 
-        current_portfolio.mark_position_closing(position_key, ManagedExitReason::SourceExit.as_str());
+        current_portfolio
+            .mark_position_closing(position_key, ManagedExitReason::SourceExit.as_str());
         current_portfolio.note_close_attempt(position_key);
+        let _ =
+            position_resolver.mark_closing(position_key, ManagedExitReason::SourceExit.as_str());
         if let Err(error) = portfolio.store_snapshot(current_portfolio.clone()).await {
-            warn!(?error, "failed to persist closing state for source-follow exit");
+            warn!(
+                ?error,
+                "failed to persist closing state for source-follow exit"
+            );
         }
     }
 
@@ -2065,6 +2219,14 @@ async fn process_trade(
                     &mut current_portfolio,
                     decision.position_key.as_ref(),
                     reason.code,
+                )
+                .await;
+            } else {
+                finalize_failed_pending_open(
+                    position_resolver,
+                    pending_open_key.as_ref(),
+                    &analytics,
+                    "quote_resolution_failed",
                 )
                 .await;
             }
@@ -2102,13 +2264,22 @@ async fn process_trade(
             risk,
             health,
             latency_logger,
-            analytics,
+            analytics.clone(),
             Some(&current_portfolio),
             Some(&resolved_quote.quote),
             classify_rejected_trade(side, has_copied_inventory),
             &reason,
         )
         .await;
+        if matches!(side, ExecutionSide::Buy) {
+            finalize_failed_pending_open(
+                position_resolver,
+                pending_open_key.as_ref(),
+                &analytics,
+                "price_deviation_rejected",
+            )
+            .await;
+        }
         return Ok(TradeProcessingOutcome::Skipped(reason));
     }
     let request = match build_execution_request_with_mode(
@@ -2131,6 +2302,14 @@ async fn process_trade(
                     reason.code,
                 )
                 .await;
+            } else {
+                finalize_failed_pending_open(
+                    position_resolver,
+                    pending_open_key.as_ref(),
+                    &analytics,
+                    reason.code,
+                )
+                .await;
             }
             record_trade_skip(
                 entry,
@@ -2149,9 +2328,7 @@ async fn process_trade(
         }
     };
 
-    if let Some(elapsed_total_ms) =
-        latency_monitor.should_pause_before_submit(&stage_timestamps)
-    {
+    if let Some(elapsed_total_ms) = latency_monitor.should_pause_before_submit(&stage_timestamps) {
         let reason = SkipReason::new(
             "latency_fail_safe_pre_submit",
             format!(
@@ -2185,7 +2362,13 @@ async fn process_trade(
             )
             .await;
         } else {
-            release_closing_position(&closing_positions, decision.position_key.as_ref()).await;
+            finalize_failed_pending_open(
+                position_resolver,
+                pending_open_key.as_ref(),
+                &analytics,
+                reason.code,
+            )
+            .await;
         }
         return Ok(TradeProcessingOutcome::Skipped(reason));
     }
@@ -2225,6 +2408,13 @@ async fn process_trade(
                 .await;
                 return Ok(TradeProcessingOutcome::Skipped(reason));
             }
+            finalize_failed_pending_open(
+                position_resolver,
+                pending_open_key.as_ref(),
+                &analytics,
+                "entry_submission_error",
+            )
+            .await;
             return Err(error);
         }
     };
@@ -2273,13 +2463,22 @@ async fn process_trade(
             risk,
             health,
             latency_logger,
-            analytics,
+            analytics.clone(),
             Some(&current_portfolio),
             Some(&resolved_quote.quote),
             eligible_class,
             &reason,
         )
         .await;
+        if matches!(side, ExecutionSide::Buy) {
+            finalize_failed_pending_open(
+                position_resolver,
+                pending_open_key.as_ref(),
+                &analytics,
+                "close_rejected",
+            )
+            .await;
+        }
         return Ok(TradeProcessingOutcome::Skipped(reason));
     }
     if matches!(result.status, ExecutionStatus::NoFill) {
@@ -2319,6 +2518,15 @@ async fn process_trade(
             &reason,
         )
         .await;
+        if matches!(side, ExecutionSide::Buy) {
+            finalize_failed_pending_open(
+                position_resolver,
+                pending_open_key.as_ref(),
+                &analytics,
+                "entry_nofill",
+            )
+            .await;
+        }
         return Ok(TradeProcessingOutcome::Skipped(reason));
     }
     let close_is_partial = matches!(side, ExecutionSide::Sell)
@@ -2363,11 +2571,32 @@ async fn process_trade(
         warn!(?error, "failed to persist latency event");
     }
 
-    let close_fully_closed = decision
-        .position_key
-        .as_ref()
-        .and_then(|position_key| current_portfolio.position_by_key(position_key))
-        .map(|position| position.size <= result.filled_size)
+    let pre_execution_size = if matches!(side, ExecutionSide::Sell) {
+        resolved_exit_position
+            .as_ref()
+            .map(|position| position.size)
+    } else {
+        None
+    };
+    current_portfolio = project_execution_state_into_cache(
+        portfolio,
+        position_resolver,
+        &current_portfolio,
+        entry,
+        &result,
+        decision.position_key.as_ref(),
+        &analytics,
+        &released_hot_task_tx,
+    )
+    .await;
+    if matches!(side, ExecutionSide::Buy) && decision.position_key.is_some() {
+        analytics
+            .record_exit_event("position_promoted_to_open", Some(&current_portfolio))
+            .await;
+    }
+
+    let close_fully_closed = pre_execution_size
+        .map(|size| size <= result.filled_size)
         .unwrap_or(false);
     if let Err(error) = position_registry
         .record_execution(
@@ -2397,8 +2626,10 @@ async fn process_trade(
         result.clone(),
         current_portfolio,
         portfolio.clone(),
+        (*position_resolver).clone(),
         closing_positions,
         decision.position_key.clone(),
+        released_hot_task_tx,
         notifier,
         health,
         analytics,
@@ -2413,12 +2644,136 @@ async fn process_trade(
     }))
 }
 
+async fn finalize_failed_pending_open(
+    position_resolver: &PositionResolver,
+    position_key: Option<&PositionKey>,
+    analytics: &ExecutionAnalyticsTracker,
+    reason: &str,
+) {
+    let Some(position_key) = position_key else {
+        return;
+    };
+    match position_resolver.remove_position(position_key) {
+        Ok(removed) if !removed.bound_exits.is_empty() => {
+            for _ in removed.bound_exits {
+                analytics
+                    .record_exit_event("deferred_exit_expired", None)
+                    .await;
+                analytics.record_close_failure_reason(reason, None).await;
+            }
+        }
+        Ok(_) => {}
+        Err(error) => warn!(?error, "failed to clear pending-open resolver state"),
+    }
+}
+
+async fn project_execution_state_into_cache(
+    portfolio: &PortfolioService,
+    position_resolver: &PositionResolver,
+    current_portfolio: &models::PortfolioSnapshot,
+    entry: &ActivityEntry,
+    result: &ExecutionSuccess,
+    position_key: Option<&PositionKey>,
+    analytics: &ExecutionAnalyticsTracker,
+    released_hot_task_tx: &mpsc::UnboundedSender<HotPathTradeTask>,
+) -> models::PortfolioSnapshot {
+    let projected =
+        match portfolio.project_fill_on_snapshot(current_portfolio, entry, result, position_key) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                warn!(
+                    ?error,
+                    "failed to project execution result onto in-memory portfolio"
+                );
+                return current_portfolio.clone();
+            }
+        };
+
+    let stored = match portfolio.store_snapshot(projected.clone()).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            warn!(?error, "failed to store projected execution snapshot");
+            projected
+        }
+    };
+
+    match position_resolver.sync_from_portfolio(&stored) {
+        Ok(released_exits) => {
+            for released_exit in released_exits {
+                analytics
+                    .record_exit_event("deferred_exit_released", Some(&stored))
+                    .await;
+                if released_hot_task_tx
+                    .send(source_exit_hot_task(released_exit))
+                    .is_err()
+                {
+                    warn!("failed to enqueue released deferred source exit");
+                }
+            }
+        }
+        Err(error) => warn!(
+            ?error,
+            "failed to sync position resolver from projected snapshot"
+        ),
+    }
+
+    stored
+}
+
 async fn load_current_portfolio_snapshot(
     portfolio: &PortfolioService,
 ) -> Result<models::PortfolioSnapshot> {
     match portfolio.snapshot().await {
         Some(snapshot) => Ok(snapshot),
         None => portfolio.refresh_snapshot().await,
+    }
+}
+
+fn source_exit_hot_task(matched_trade: MatchedTrackedTrade) -> HotPathTradeTask {
+    HotPathTradeTask {
+        matched_trade,
+        execution_confidence: 1.0,
+        quote_policy: QuotePolicy::CacheOnly,
+        source: HotPathTradeSource::DirectTrackedTrade,
+    }
+}
+
+fn deferred_source_exit_hot_task(entry: ActivityEntry) -> HotPathTradeTask {
+    source_exit_hot_task(MatchedTrackedTrade {
+        entry: entry.clone(),
+        signal: synthetic_confirmed_signal(&entry),
+        source: "deferred_exit",
+        validation_correlation_kind: None,
+        validation_match_window: None,
+        tx_hash_matched: true,
+        validation_signal: None,
+    })
+}
+
+fn synthetic_confirmed_signal(entry: &ActivityEntry) -> ConfirmedTradeSignal {
+    let now = Utc::now();
+    let instant = Instant::now();
+    ConfirmedTradeSignal {
+        asset_id: entry.asset.clone(),
+        condition_id: entry.condition_id.clone(),
+        transaction_hash: Some(entry.transaction_hash.clone()),
+        side: normalized_execution_side(entry),
+        price: entry.price,
+        estimated_size: entry.size,
+        stage_timestamps: models::TradeStageTimestamps {
+            websocket_event_received_at: instant,
+            websocket_event_received_at_utc: now,
+            parse_completed_at: instant,
+            parse_completed_at_utc: now,
+            detection_triggered_at: instant,
+            detection_triggered_at_utc: now,
+            attribution_completed_at: None,
+            attribution_completed_at_utc: None,
+            fast_risk_completed_at: None,
+            fast_risk_completed_at_utc: None,
+        },
+        confirmed_at: now,
+        generation: 0,
     }
 }
 
@@ -2467,8 +2822,10 @@ fn spawn_post_trade_side_effects(
     result: ExecutionSuccess,
     current_portfolio: models::PortfolioSnapshot,
     portfolio: PortfolioService,
+    position_resolver: PositionResolver,
     closing_positions: ClosingPositions,
     closing_position_key: Option<PositionKey>,
+    released_hot_task_tx: mpsc::UnboundedSender<HotPathTradeTask>,
     notifier: Arc<TelegramNotifier>,
     health: Arc<HealthState>,
     analytics: Arc<ExecutionAnalyticsTracker>,
@@ -2493,15 +2850,15 @@ fn spawn_post_trade_side_effects(
                 &result,
                 decision.position_key.as_ref(),
             ) {
-                    Ok(snapshot) => Some(snapshot),
-                    Err(error) => {
-                        warn!(
-                            ?error,
-                            "failed to project wallet-attributed layout for live fill"
-                        );
-                        None
-                    }
-                };
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        "failed to project wallet-attributed layout for live fill"
+                    );
+                    None
+                }
+            };
             match portfolio
                 .refresh_and_persist_with_layout_hint(projected_layout.as_ref())
                 .await
@@ -2526,6 +2883,25 @@ fn spawn_post_trade_side_effects(
                 }
             }
         };
+        match position_resolver.sync_from_portfolio(&refreshed) {
+            Ok(released_exits) => {
+                for released_exit in released_exits {
+                    analytics
+                        .record_exit_event("deferred_exit_released", Some(&refreshed))
+                        .await;
+                    if released_hot_task_tx
+                        .send(source_exit_hot_task(released_exit))
+                        .is_err()
+                    {
+                        warn!("failed to enqueue deferred exit released after post-trade refresh");
+                    }
+                }
+            }
+            Err(error) => warn!(
+                ?error,
+                "failed to sync position resolver after post-trade refresh"
+            ),
+        }
         health.set_portfolio_value(refreshed.total_value).await;
         analytics.sync_with_portfolio(&refreshed).await;
 
@@ -2798,7 +3174,9 @@ async fn handle_expired_prediction_validations(
     executor: Arc<dyn TradeExecutor>,
     orderbooks: Arc<OrderBookState>,
     portfolio: Arc<PortfolioService>,
+    position_resolver: PositionResolver,
     closing_positions: ClosingPositions,
+    released_hot_task_tx: mpsc::UnboundedSender<HotPathTradeTask>,
     notifier: Arc<TelegramNotifier>,
     attribution_logger: Arc<AttributionLogger>,
     health: Arc<HealthState>,
@@ -2866,7 +3244,9 @@ async fn handle_expired_prediction_validations(
                     executor.clone(),
                     orderbooks.clone(),
                     portfolio.clone(),
+                    position_resolver.clone(),
                     closing_positions.clone(),
+                    released_hot_task_tx.clone(),
                     notifier.clone(),
                     attribution_logger.clone(),
                     health.clone(),
@@ -2896,7 +3276,9 @@ async fn handle_expired_prediction_validations(
                     executor.clone(),
                     orderbooks.clone(),
                     portfolio.clone(),
+                    position_resolver.clone(),
                     closing_positions.clone(),
+                    released_hot_task_tx.clone(),
                     notifier.clone(),
                     attribution_logger.clone(),
                     health.clone(),
@@ -2914,7 +3296,9 @@ async fn attempt_fail_safe_hedge(
     executor: Arc<dyn TradeExecutor>,
     orderbooks: Arc<OrderBookState>,
     portfolio: Arc<PortfolioService>,
+    position_resolver: PositionResolver,
     closing_positions: ClosingPositions,
+    released_hot_task_tx: mpsc::UnboundedSender<HotPathTradeTask>,
     notifier: Arc<TelegramNotifier>,
     attribution_logger: Arc<AttributionLogger>,
     health: Arc<HealthState>,
@@ -3001,8 +3385,10 @@ async fn attempt_fail_safe_hedge(
                     result,
                     current_portfolio,
                     portfolio.as_ref().clone(),
+                    position_resolver,
                     closing_positions.clone(),
                     None,
+                    released_hot_task_tx,
                     notifier,
                     health,
                     analytics.clone(),
@@ -3210,6 +3596,8 @@ async fn spawn_portfolio_refresher(
     health: Arc<HealthState>,
     analytics: Arc<ExecutionAnalyticsTracker>,
     position_registry: PositionRegistry,
+    position_resolver: PositionResolver,
+    released_hot_task_tx: mpsc::UnboundedSender<HotPathTradeTask>,
 ) {
     loop {
         sleep(Duration::from_secs(15)).await;
@@ -3223,8 +3611,165 @@ async fn spawn_portfolio_refresher(
                         "failed to sync position registry from refreshed portfolio"
                     );
                 }
+                match position_resolver.sync_from_portfolio(&snapshot) {
+                    Ok(released_exits) => {
+                        for released_exit in released_exits {
+                            analytics
+                                .record_exit_event("deferred_exit_released", Some(&snapshot))
+                                .await;
+                            if released_hot_task_tx
+                                .send(source_exit_hot_task(released_exit))
+                                .is_err()
+                            {
+                                warn!(
+                                    "failed to enqueue deferred exit released by portfolio refresh"
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => warn!(
+                        ?error,
+                        "failed to sync position resolver from refreshed portfolio"
+                    ),
+                }
             }
             Err(error) => warn!(?error, "background portfolio refresh failed"),
+        }
+    }
+}
+
+async fn spawn_unresolved_exit_retry_worker(
+    portfolio: Arc<PortfolioService>,
+    position_registry: PositionRegistry,
+    position_resolver: PositionResolver,
+    exit_resolution: Arc<ExitResolutionBuffer>,
+    analytics: Arc<ExecutionAnalyticsTracker>,
+    released_hot_task_tx: mpsc::UnboundedSender<HotPathTradeTask>,
+) {
+    let mut ticker = interval(Duration::from_millis(100));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        ticker.tick().await;
+        let now = Utc::now();
+
+        match position_resolver.take_expired_pending(now) {
+            Ok(expired_pending) => {
+                for expired in expired_pending {
+                    for bound_exit in expired.bound_exits {
+                        analytics
+                            .record_exit_event("deferred_exit_expired", None)
+                            .await;
+                        if let Err(error) = exit_resolution
+                            .enqueue_unresolved_exit(
+                                &bound_exit.entry,
+                                "pending_open_ttl_expired",
+                                now,
+                            )
+                            .await
+                        {
+                            warn!(
+                                ?error,
+                                condition_id = %expired.key.condition_id,
+                                outcome = %expired.key.outcome,
+                                source_wallet = %expired.key.source_wallet,
+                                "failed to queue deferred exit after pending-open expiry"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(error) => warn!(?error, "failed to expire pending resolver positions"),
+        }
+
+        let retry_keys = exit_resolution.due_retry_keys(now).await;
+        if retry_keys.is_empty() {
+            continue;
+        }
+
+        let Some(snapshot) = portfolio.snapshot().await else {
+            continue;
+        };
+
+        for retry_key in retry_keys {
+            let Some(event) = exit_resolution.retry_event(&retry_key).await else {
+                continue;
+            };
+
+            match exit_resolution
+                .retry_unresolved_exit(
+                    &retry_key,
+                    &snapshot,
+                    &position_registry,
+                    &position_resolver,
+                    now,
+                )
+                .await
+            {
+                Ok(SourceExitResolution::Matched(position_key)) => {
+                    analytics
+                        .record_exit_event("source_exit_retry_resolved", Some(&snapshot))
+                        .await;
+                    info!(
+                        event = "source_exit_retry_resolved",
+                        retry_key = %retry_key,
+                        condition_id = %position_key.condition_id,
+                        outcome = %position_key.outcome,
+                        source_wallet = %position_key.source_wallet,
+                        "resolved queued source exit through local state"
+                    );
+                    if released_hot_task_tx
+                        .send(deferred_source_exit_hot_task(event))
+                        .is_err()
+                    {
+                        warn!("failed to enqueue retry-resolved source exit");
+                    }
+                }
+                Ok(SourceExitResolution::MatchedByFallback(position_key, fallback_reason)) => {
+                    analytics
+                        .record_exit_event("source_exit_retry_resolved", Some(&snapshot))
+                        .await;
+                    info!(
+                        event = "source_exit_retry_resolved",
+                        retry_key = %retry_key,
+                        condition_id = %position_key.condition_id,
+                        outcome = %position_key.outcome,
+                        source_wallet = %position_key.source_wallet,
+                        fallback_reason = %fallback_reason,
+                        "resolved queued source exit through safe fallback"
+                    );
+                    if released_hot_task_tx
+                        .send(deferred_source_exit_hot_task(event))
+                        .is_err()
+                    {
+                        warn!("failed to enqueue retry-resolved fallback source exit");
+                    }
+                }
+                Ok(SourceExitResolution::BoundToPending(_)) => {
+                    analytics
+                        .record_exit_event("exit_bound_to_pending", Some(&snapshot))
+                        .await;
+                }
+                Ok(SourceExitResolution::DeferredRetry(_)) => {}
+                Ok(SourceExitResolution::Failed(reason_detail)) => {
+                    analytics
+                        .record_exit_event("source_exit_unresolved_expired", Some(&snapshot))
+                        .await;
+                    analytics
+                        .record_close_failure_reason("exit_unresolved", Some(&snapshot))
+                        .await;
+                    warn!(
+                        retry_key = %retry_key,
+                        reason = %reason_detail,
+                        "unresolved source exit expired"
+                    );
+                }
+                Err(error) => warn!(
+                    ?error,
+                    retry_key = %retry_key,
+                    "failed to retry unresolved source exit"
+                ),
+            }
         }
     }
 }
@@ -3233,9 +3778,11 @@ async fn spawn_force_exit_watcher(
     settings: Settings,
     portfolio: Arc<PortfolioService>,
     position_registry: PositionRegistry,
+    position_resolver: PositionResolver,
     executor: Arc<dyn TradeExecutor>,
     orderbooks: Arc<OrderBookState>,
     closing_positions: ClosingPositions,
+    released_hot_task_tx: mpsc::UnboundedSender<HotPathTradeTask>,
     notifier: Arc<TelegramNotifier>,
     health: Arc<HealthState>,
     analytics: Arc<ExecutionAnalyticsTracker>,
@@ -3292,8 +3839,10 @@ async fn spawn_force_exit_watcher(
                 true,
                 portfolio.clone(),
                 position_registry.clone(),
+                position_resolver.clone(),
                 executor.clone(),
                 closing_positions.clone(),
+                released_hot_task_tx.clone(),
                 notifier.clone(),
                 health.clone(),
                 analytics.clone(),
@@ -3311,7 +3860,9 @@ async fn spawn_force_exit_watcher(
         let closing_positions_due = snapshot
             .positions
             .iter()
-            .filter(|position| position.state == models::PositionState::Closing && position.is_active())
+            .filter(|position| {
+                position.state == models::PositionState::Closing && position.is_active()
+            })
             .cloned()
             .collect::<Vec<_>>();
 
@@ -3359,8 +3910,10 @@ async fn spawn_force_exit_watcher(
                         false,
                         portfolio.clone(),
                         position_registry.clone(),
+                        position_resolver.clone(),
                         executor.clone(),
                         closing_positions.clone(),
+                        released_hot_task_tx.clone(),
                         notifier.clone(),
                         health.clone(),
                         analytics.clone(),
@@ -3379,6 +3932,7 @@ async fn spawn_force_exit_watcher(
                         portfolio.as_ref(),
                         &closing_positions,
                         &position,
+                        &position_resolver,
                         reason,
                         analytics.clone(),
                     )
@@ -3471,8 +4025,10 @@ async fn attempt_managed_exit_position(
     record_managed_metric: bool,
     portfolio: Arc<PortfolioService>,
     position_registry: PositionRegistry,
+    position_resolver: PositionResolver,
     executor: Arc<dyn TradeExecutor>,
     closing_positions: ClosingPositions,
+    released_hot_task_tx: mpsc::UnboundedSender<HotPathTradeTask>,
     notifier: Arc<TelegramNotifier>,
     health: Arc<HealthState>,
     analytics: Arc<ExecutionAnalyticsTracker>,
@@ -3496,6 +4052,7 @@ async fn attempt_managed_exit_position(
         return Ok(());
     }
     closing_snapshot.note_close_attempt(&position_key);
+    let _ = position_resolver.mark_closing(&position_key, reason.as_str());
     if let Err(error) = portfolio.store_snapshot(closing_snapshot.clone()).await {
         release_closing_position(&closing_positions, Some(&position_key)).await;
         return Err(error.into());
@@ -3522,12 +4079,8 @@ async fn attempt_managed_exit_position(
 
     let entry = build_managed_exit_entry(&position, &quote, reason);
     let decision = build_managed_exit_decision(&position, settings);
-    let request = match build_execution_request_with_mode(
-        &entry,
-        &decision,
-        &quote,
-        execution_mode,
-    ) {
+    let request = match build_execution_request_with_mode(&entry, &decision, &quote, execution_mode)
+    {
         Ok(request) => request,
         Err(reason) => {
             analytics
@@ -3610,8 +4163,8 @@ async fn attempt_managed_exit_position(
             result.status
         ));
     }
-    let close_is_partial =
-        result.filled_size < request.size || matches!(result.status, ExecutionStatus::PartiallyFilled);
+    let close_is_partial = result.filled_size < request.size
+        || matches!(result.status, ExecutionStatus::PartiallyFilled);
     analytics
         .record_exit_event(
             if close_is_partial {
@@ -3653,8 +4206,10 @@ async fn attempt_managed_exit_position(
         result,
         closing_snapshot,
         portfolio.as_ref().clone(),
+        position_resolver,
         closing_positions,
         Some(position_key),
+        released_hot_task_tx,
         notifier,
         health,
         analytics,
@@ -3744,8 +4299,13 @@ fn effective_time_exit_seconds(configured_seconds: u64) -> i64 {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ClosingActionPlan {
-    Retry { mode: ExecutionMode, escalation_level: u8 },
-    Fail { reason: &'static str },
+    Retry {
+        mode: ExecutionMode,
+        escalation_level: u8,
+    },
+    Fail {
+        reason: &'static str,
+    },
 }
 
 fn managed_exit_event_name(reason: ManagedExitReason) -> Option<&'static str> {
@@ -3835,7 +4395,8 @@ async fn persist_closing_escalation(
     escalation_level: u8,
 ) -> Result<()> {
     let mut snapshot = load_current_portfolio_snapshot(portfolio).await?;
-    let Some(previous_level) = snapshot.set_closing_escalation_level(position_key, escalation_level)
+    let Some(previous_level) =
+        snapshot.set_closing_escalation_level(position_key, escalation_level)
     else {
         return Ok(());
     };
@@ -3862,6 +4423,7 @@ async fn mark_failed_closing_position_stale(
     portfolio: &PortfolioService,
     closing_positions: &ClosingPositions,
     position: &models::PortfolioPosition,
+    position_resolver: &PositionResolver,
     failure_reason: &str,
     analytics: Arc<ExecutionAnalyticsTracker>,
 ) -> Result<()> {
@@ -3876,6 +4438,7 @@ async fn mark_failed_closing_position_stale(
         .record_close_failure_reason(failure_reason, Some(&snapshot))
         .await;
     analytics.sync_with_portfolio(&snapshot).await;
+    let _ = position_resolver.remove_position(&position_key);
     portfolio.store_snapshot(snapshot).await?;
     Ok(())
 }
@@ -4662,6 +5225,12 @@ mod tests {
             enable_exit_retry: true,
             exit_retry_window: Duration::from_secs(30),
             exit_retry_interval: Duration::from_millis(500),
+            unresolved_exit_initial_retry: Duration::from_millis(250),
+            unresolved_exit_total_window: Duration::from_secs(30),
+            unresolved_exit_max_retry: Duration::from_secs(4),
+            position_pending_open_ttl: Duration::from_secs(20),
+            rpc_global_rate_limit_per_second: 10,
+            rpc_per_market_rate_limit_per_second: 3,
             closing_max_age: Duration::from_secs(30),
             force_exit_on_closing_timeout: true,
             telegram_bot_token: "token".to_owned(),
@@ -5399,8 +5968,10 @@ mod tests {
     #[tokio::test]
     async fn analytics_counters_distinguish_source_and_managed_exits() {
         let tracker = ExecutionAnalyticsTracker {
-            path: std::env::temp_dir()
-                .join(format!("copytrade-analytics-{}.json", Utc::now().timestamp_nanos_opt().unwrap_or_default())),
+            path: std::env::temp_dir().join(format!(
+                "copytrade-analytics-{}.json",
+                Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            )),
             start_capital_usd: dec!(200),
             state: Arc::new(Mutex::new(ExecutionAnalyticsState::default())),
             dirty: Arc::new(AtomicBool::new(false)),
@@ -5409,11 +5980,16 @@ mod tests {
 
         tracker.record_exit_event("source_exit_matched", None).await;
         tracker.record_exit_event("close_filled", None).await;
-        tracker.record_exit_event("managed_exit_time_limit", None).await;
+        tracker
+            .record_exit_event("managed_exit_time_limit", None)
+            .await;
 
         let state = tracker.state.lock().await.clone();
         assert_eq!(state.exit_event_counts.get("source_exit_matched"), Some(&1));
-        assert_eq!(state.exit_event_counts.get("managed_exit_time_limit"), Some(&1));
+        assert_eq!(
+            state.exit_event_counts.get("managed_exit_time_limit"),
+            Some(&1)
+        );
         assert_eq!(state.exit_event_counts.get("close_filled"), Some(&1));
     }
 

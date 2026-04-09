@@ -88,7 +88,10 @@ impl PositionRegistry {
             })
     }
 
-    pub fn resolve_open_position(&self, requested_key: &PositionKey) -> Option<ResolvedTrackedPosition> {
+    pub fn resolve_open_position(
+        &self,
+        requested_key: &PositionKey,
+    ) -> Option<ResolvedTrackedPosition> {
         let state = self.positions.read().expect("position registry read lock");
         if let Some(position) = state.values().find(|position| {
             position.status == PositionLifecycleStatus::Open

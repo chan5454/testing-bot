@@ -11,12 +11,15 @@ use tokio::sync::Mutex;
 use crate::config::Settings;
 use crate::models::{ActivityEntry, PortfolioSnapshot, PositionKey};
 use crate::position_registry::PositionRegistry;
+use crate::position_resolver::{PositionResolver, ResolveResult, ResolvedResolverPosition};
+use crate::wallet::wallet_matching::MatchedTrackedTrade;
 
 #[derive(Clone)]
 pub struct ExitResolutionBuffer {
     path: Arc<PathBuf>,
     retry_window: Duration,
-    retry_interval: Duration,
+    initial_retry_interval: Duration,
+    max_retry_interval: Duration,
     pending: Arc<Mutex<HashMap<String, PendingExitIntent>>>,
 }
 
@@ -24,8 +27,16 @@ pub struct ExitResolutionBuffer {
 pub enum SourceExitResolution {
     Matched(PositionKey),
     MatchedByFallback(PositionKey, String),
+    BoundToPending(BoundPendingDisposition),
     DeferredRetry(RetryDisposition),
     Failed(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct BoundPendingDisposition {
+    pub position_key: PositionKey,
+    pub already_bound: bool,
+    pub bound_exit_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +58,7 @@ pub struct PendingExitIntent {
     pub next_retry_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub attempts: u32,
+    pub current_retry_interval_ms: u64,
     pub last_reason: String,
     pub event: ActivityEntry,
 }
@@ -57,24 +69,22 @@ impl ExitResolutionBuffer {
         let pending = load_pending_exits(&path)?;
         Ok(Self {
             path: Arc::new(path),
-            retry_window: settings.exit_retry_window,
-            retry_interval: settings.exit_retry_interval,
+            retry_window: settings.unresolved_exit_total_window,
+            initial_retry_interval: settings.unresolved_exit_initial_retry,
+            max_retry_interval: settings.unresolved_exit_max_retry,
             pending: Arc::new(Mutex::new(pending)),
         })
-    }
-
-    pub fn retry_interval(&self) -> Duration {
-        self.retry_interval
     }
 
     pub async fn resolve_source_exit(
         &self,
         snapshot: &PortfolioSnapshot,
         position_registry: &PositionRegistry,
-        entry: &ActivityEntry,
+        position_resolver: &PositionResolver,
+        matched_trade: &MatchedTrackedTrade,
         now: DateTime<Utc>,
     ) -> Result<SourceExitResolution> {
-        if let Some(resolved_position) = snapshot.resolve_position_to_sell(entry) {
+        if let Some(resolved_position) = snapshot.resolve_position_to_sell(&matched_trade.entry) {
             return Ok(match resolved_position.fallback_reason {
                 Some(fallback_reason) => {
                     SourceExitResolution::MatchedByFallback(resolved_position.key, fallback_reason)
@@ -83,10 +93,63 @@ impl ExitResolutionBuffer {
             });
         }
 
-        let requested_key = entry.position_key();
-        let reason = unresolved_exit_reason(position_registry, &requested_key);
-        let retry = self.enqueue_retry(entry, &reason, now).await?;
+        match position_resolver.resolve_owned_position(&matched_trade.entry, now) {
+            ResolveResult::FoundOpen(resolved) | ResolveResult::FoundClosing(resolved) => {
+                return Ok(position_resolution_from_record(resolved));
+            }
+            ResolveResult::FoundPendingOpen(resolved) => {
+                let bind =
+                    position_resolver.bind_exit_to_pending(&resolved.key, matched_trade.clone())?;
+                return Ok(SourceExitResolution::BoundToPending(
+                    BoundPendingDisposition {
+                        position_key: resolved.key,
+                        already_bound: bind.already_bound,
+                        bound_exit_count: bind.bound_exit_count,
+                    },
+                ));
+            }
+            ResolveResult::Ambiguous => {
+                return Ok(SourceExitResolution::Failed(
+                    "resolver_ambiguous_same_wallet_same_condition".to_owned(),
+                ));
+            }
+            ResolveResult::NotFound => {}
+        }
+
+        let requested_key = matched_trade.entry.position_key();
+        let reason =
+            unresolved_exit_reason(position_registry, position_resolver, &requested_key, now);
+        let retry = self
+            .enqueue_retry(&matched_trade.entry, &reason, now)
+            .await?;
         Ok(SourceExitResolution::DeferredRetry(retry))
+    }
+
+    pub async fn enqueue_unresolved_exit(
+        &self,
+        entry: &ActivityEntry,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<RetryDisposition> {
+        self.enqueue_retry(entry, reason, now).await
+    }
+
+    pub async fn due_retry_keys(&self, now: DateTime<Utc>) -> Vec<String> {
+        self.pending
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, intent)| intent.next_retry_at <= now)
+            .map(|(retry_key, _)| retry_key.clone())
+            .collect()
+    }
+
+    pub async fn retry_event(&self, retry_key: &str) -> Option<ActivityEntry> {
+        self.pending
+            .lock()
+            .await
+            .get(retry_key)
+            .map(|intent| intent.event.clone())
     }
 
     pub async fn retry_unresolved_exit(
@@ -94,6 +157,7 @@ impl ExitResolutionBuffer {
         retry_key: &str,
         snapshot: &PortfolioSnapshot,
         position_registry: &PositionRegistry,
+        position_resolver: &PositionResolver,
         now: DateTime<Utc>,
     ) -> Result<SourceExitResolution> {
         let event = {
@@ -116,8 +180,39 @@ impl ExitResolutionBuffer {
             });
         }
 
+        match position_resolver.resolve_owned_position(&event, now) {
+            ResolveResult::FoundOpen(resolved) | ResolveResult::FoundClosing(resolved) => {
+                self.remove_retry(retry_key).await?;
+                return Ok(position_resolution_from_record(resolved));
+            }
+            ResolveResult::FoundPendingOpen(resolved) => {
+                let bind = position_resolver
+                    .bind_exit_to_pending(&resolved.key, matched_trade_from_entry(&event))?;
+                self.remove_retry(retry_key).await?;
+                return Ok(SourceExitResolution::BoundToPending(
+                    BoundPendingDisposition {
+                        position_key: resolved.key,
+                        already_bound: bind.already_bound,
+                        bound_exit_count: bind.bound_exit_count,
+                    },
+                ));
+            }
+            ResolveResult::Ambiguous => {
+                self.mark_exit_resolution_failed(
+                    retry_key,
+                    "resolver_ambiguous_same_wallet_same_condition",
+                )
+                .await?;
+                return Ok(SourceExitResolution::Failed(
+                    "resolver_ambiguous_same_wallet_same_condition".to_owned(),
+                ));
+            }
+            ResolveResult::NotFound => {}
+        }
+
         let requested_key = event.position_key();
-        let reason = unresolved_exit_reason(position_registry, &requested_key);
+        let reason =
+            unresolved_exit_reason(position_registry, position_resolver, &requested_key, now);
         let mut pending = self.pending.lock().await;
         let Some(intent) = pending.get_mut(retry_key) else {
             return Ok(SourceExitResolution::Failed(format!(
@@ -132,8 +227,14 @@ impl ExitResolutionBuffer {
         }
 
         intent.last_seen_at = now;
-        intent.next_retry_at = now + chrono::TimeDelta::from_std(self.retry_interval).unwrap_or_default();
         intent.attempts = intent.attempts.saturating_add(1);
+        intent.current_retry_interval_ms = next_retry_interval_ms(
+            self.initial_retry_interval,
+            self.max_retry_interval,
+            intent.attempts,
+        );
+        intent.next_retry_at =
+            now + chrono::TimeDelta::milliseconds(intent.current_retry_interval_ms as i64);
         intent.last_reason = reason.clone();
         self.persist_locked(&pending)?;
         Ok(SourceExitResolution::DeferredRetry(RetryDisposition {
@@ -143,17 +244,10 @@ impl ExitResolutionBuffer {
         }))
     }
 
-    pub async fn mark_exit_resolution_failed(
-        &self,
-        retry_key: &str,
-        reason: &str,
-    ) -> Result<()> {
+    pub async fn mark_exit_resolution_failed(&self, retry_key: &str, _reason: &str) -> Result<()> {
         let mut pending = self.pending.lock().await;
         if pending.remove(retry_key).is_some() {
             self.persist_locked(&pending)?;
-        }
-        if !reason.is_empty() {
-            let _ = reason;
         }
         Ok(())
     }
@@ -169,12 +263,14 @@ impl ExitResolutionBuffer {
         reason: &str,
         now: DateTime<Utc>,
     ) -> Result<RetryDisposition> {
-        let retry_key = exit_intent_key(entry, self.retry_interval);
+        let retry_key = exit_intent_key(entry, self.initial_retry_interval);
         let mut pending = self.pending.lock().await;
-        let expires_at =
-            now + chrono::TimeDelta::from_std(self.retry_window).unwrap_or_default();
-        let next_retry_at =
-            now + chrono::TimeDelta::from_std(self.retry_interval).unwrap_or_default();
+        let expires_at = now
+            + chrono::TimeDelta::from_std(self.retry_window)
+                .unwrap_or_else(|_| chrono::TimeDelta::zero());
+        let initial_retry_interval_ms =
+            next_retry_interval_ms(self.initial_retry_interval, self.max_retry_interval, 0);
+        let next_retry_at = now + chrono::TimeDelta::milliseconds(initial_retry_interval_ms as i64);
 
         let already_queued = match pending.get_mut(&retry_key) {
             Some(intent) if intent.expires_at > now => {
@@ -194,6 +290,7 @@ impl ExitResolutionBuffer {
                     next_retry_at,
                     expires_at,
                     attempts: 0,
+                    current_retry_interval_ms: initial_retry_interval_ms,
                     last_reason: reason.to_owned(),
                     event: entry.clone(),
                 };
@@ -213,6 +310,7 @@ impl ExitResolutionBuffer {
                         next_retry_at,
                         expires_at,
                         attempts: 0,
+                        current_retry_interval_ms: initial_retry_interval_ms,
                         last_reason: reason.to_owned(),
                         event: entry.clone(),
                     },
@@ -266,8 +364,43 @@ fn load_pending_exits(path: &PathBuf) -> Result<HashMap<String, PendingExitInten
         .collect())
 }
 
-fn unresolved_exit_reason(position_registry: &PositionRegistry, requested_key: &PositionKey) -> String {
-    if position_registry.has_open_position_key(requested_key) {
+fn unresolved_exit_reason(
+    position_registry: &PositionRegistry,
+    position_resolver: &PositionResolver,
+    requested_key: &PositionKey,
+    now: DateTime<Utc>,
+) -> String {
+    if position_resolver.has_resolvable_position(requested_key) {
+        match position_resolver.resolve_owned_position(
+            &ActivityEntry {
+                proxy_wallet: requested_key.source_wallet.clone(),
+                timestamp: now.timestamp_millis(),
+                condition_id: requested_key.condition_id.clone(),
+                type_name: "TRADE".to_owned(),
+                size: 0.0,
+                usdc_size: 0.0,
+                transaction_hash: "resolver-check".to_owned(),
+                price: 0.0,
+                asset: String::new(),
+                side: "SELL".to_owned(),
+                outcome_index: 0,
+                title: String::new(),
+                slug: String::new(),
+                event_slug: String::new(),
+                outcome: requested_key.outcome.clone(),
+            },
+            now,
+        ) {
+            ResolveResult::FoundPendingOpen(_) => {
+                "owned_position_pending_open_waiting_for_fill".to_owned()
+            }
+            ResolveResult::FoundOpen(_) | ResolveResult::FoundClosing(_) => {
+                "owned_position_local_state_waiting_for_portfolio".to_owned()
+            }
+            ResolveResult::Ambiguous => "resolver_ambiguous_same_wallet_same_condition".to_owned(),
+            ResolveResult::NotFound => "owned_position_not_resolved_yet".to_owned(),
+        }
+    } else if position_registry.has_open_position_key(requested_key) {
         "owned_position_exact_match_waiting_for_portfolio".to_owned()
     } else if let Some(resolved_position) = position_registry.resolve_open_position(requested_key) {
         resolved_position
@@ -278,9 +411,68 @@ fn unresolved_exit_reason(position_registry: &PositionRegistry, requested_key: &
     }
 }
 
+fn position_resolution_from_record(resolved: ResolvedResolverPosition) -> SourceExitResolution {
+    match resolved.fallback_reason {
+        Some(fallback_reason) => {
+            SourceExitResolution::MatchedByFallback(resolved.key, fallback_reason)
+        }
+        None => SourceExitResolution::Matched(resolved.key),
+    }
+}
+
+fn matched_trade_from_entry(entry: &ActivityEntry) -> MatchedTrackedTrade {
+    let now = Utc::now();
+    let instant = std::time::Instant::now();
+    MatchedTrackedTrade {
+        entry: entry.clone(),
+        signal: crate::detection::trade_inference::ConfirmedTradeSignal {
+            asset_id: entry.asset.clone(),
+            condition_id: entry.condition_id.clone(),
+            transaction_hash: Some(entry.transaction_hash.clone()),
+            side: normalized_execution_side(entry),
+            price: entry.price,
+            estimated_size: entry.size,
+            stage_timestamps: crate::models::TradeStageTimestamps {
+                websocket_event_received_at: instant,
+                websocket_event_received_at_utc: now,
+                parse_completed_at: instant,
+                parse_completed_at_utc: now,
+                detection_triggered_at: instant,
+                detection_triggered_at_utc: now,
+                attribution_completed_at: None,
+                attribution_completed_at_utc: None,
+                fast_risk_completed_at: None,
+                fast_risk_completed_at_utc: None,
+            },
+            confirmed_at: now,
+            generation: 0,
+        },
+        source: "deferred_exit_retry",
+        validation_correlation_kind: None,
+        validation_match_window: None,
+        tx_hash_matched: true,
+        validation_signal: None,
+    }
+}
+
+fn normalized_execution_side(entry: &ActivityEntry) -> crate::execution::ExecutionSide {
+    if entry.side.eq_ignore_ascii_case("SELL") {
+        crate::execution::ExecutionSide::Sell
+    } else {
+        crate::execution::ExecutionSide::Buy
+    }
+}
+
+fn next_retry_interval_ms(initial: Duration, max: Duration, attempts: u32) -> u64 {
+    let initial_ms = initial.as_millis().max(1) as u64;
+    let max_ms = max.as_millis().max(initial.as_millis().max(1)) as u64;
+    let multiplier = 1_u64 << attempts.min(8);
+    (initial_ms.saturating_mul(multiplier)).min(max_ms)
+}
+
 fn exit_intent_key(entry: &ActivityEntry, retry_interval: Duration) -> String {
-    let timestamp_bucket = normalized_timestamp_ms(entry.timestamp)
-        / retry_interval.as_millis().max(1) as i64;
+    let timestamp_bucket =
+        normalized_timestamp_ms(entry.timestamp) / retry_interval.as_millis().max(1) as i64;
     let requested_key = entry.position_key();
     format!(
         "{}:{}:{}:{}:{}",
@@ -314,7 +506,6 @@ mod tests {
     use super::*;
     use crate::config::{ExecutionMode, Settings};
     use crate::models::{PortfolioPosition, PortfolioSnapshot, PositionState};
-    use crate::position_registry::PositionRegistry;
 
     fn sample_settings(data_dir: std::path::PathBuf) -> Settings {
         Settings {
@@ -422,8 +613,14 @@ mod tests {
             max_position_age_hours: 6,
             max_hold_time_seconds: 1_800,
             enable_exit_retry: true,
-            exit_retry_window: Duration::from_secs(30),
-            exit_retry_interval: Duration::from_millis(500),
+            exit_retry_window: Duration::from_secs(12),
+            exit_retry_interval: Duration::from_millis(250),
+            unresolved_exit_initial_retry: Duration::from_millis(250),
+            unresolved_exit_total_window: Duration::from_secs(12),
+            unresolved_exit_max_retry: Duration::from_secs(4),
+            position_pending_open_ttl: Duration::from_secs(20),
+            rpc_global_rate_limit_per_second: 10,
+            rpc_per_market_rate_limit_per_second: 3,
             closing_max_age: Duration::from_secs(30),
             force_exit_on_closing_timeout: true,
             telegram_bot_token: "token".to_owned(),
@@ -433,7 +630,7 @@ mod tests {
         }
     }
 
-    fn sample_entry() -> ActivityEntry {
+    fn sample_entry(side: &str) -> ActivityEntry {
         ActivityEntry {
             proxy_wallet: "0xsource".to_owned(),
             timestamp: Utc::now().timestamp_millis(),
@@ -441,10 +638,10 @@ mod tests {
             type_name: "TRADE".to_owned(),
             size: 10.0,
             usdc_size: 5.0,
-            transaction_hash: "0xhash".to_owned(),
+            transaction_hash: format!("0xhash-{side}"),
             price: 0.5,
             asset: "asset-1".to_owned(),
-            side: "SELL".to_owned(),
+            side: side.to_owned(),
             outcome_index: 0,
             title: "Sample".to_owned(),
             slug: "sample".to_owned(),
@@ -489,17 +686,21 @@ mod tests {
 
     #[tokio::test]
     async fn exact_source_exit_matches_owned_position_key() {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "copytrade-exit-exact-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        let settings = sample_settings(temp_dir);
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let settings = sample_settings(temp_dir.path().to_path_buf());
         let buffer = ExitResolutionBuffer::load(&settings).expect("buffer");
         let registry = PositionRegistry::load(&settings).expect("registry");
-        let entry = sample_entry();
+        let resolver = PositionResolver::load(&settings).expect("resolver");
+        let matched_trade = matched_trade_from_entry(&sample_entry("SELL"));
 
         let resolution = buffer
-            .resolve_source_exit(&sample_snapshot(), &registry, &entry, Utc::now())
+            .resolve_source_exit(
+                &sample_snapshot(),
+                &registry,
+                &resolver,
+                &matched_trade,
+                Utc::now(),
+            )
             .await
             .expect("resolution");
 
@@ -511,59 +712,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_exit_retry_works_without_wallet_registry_membership() {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "copytrade-exit-owned-retry-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        let settings = sample_settings(temp_dir);
+    async fn pending_exit_binds_without_entering_retry_loop() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let settings = sample_settings(temp_dir.path().to_path_buf());
         let buffer = ExitResolutionBuffer::load(&settings).expect("buffer");
         let registry = PositionRegistry::load(&settings).expect("registry");
-        registry
-            .sync_from_portfolio(&sample_snapshot())
-            .expect("sync registry");
-        let entry = sample_entry();
-        let empty_snapshot = PortfolioSnapshot {
-            fetched_at: Utc::now(),
-            total_value: dec!(200),
-            total_exposure: dec!(0),
-            cash_balance: dec!(200),
-            realized_pnl: dec!(0),
-            unrealized_pnl: dec!(0),
-            positions: Vec::new(),
-        };
+        let resolver = PositionResolver::load(&settings).expect("resolver");
+        let buy_entry = sample_entry("BUY");
+        resolver
+            .register_pending_open(buy_entry.position_key(), &buy_entry)
+            .expect("register pending");
 
-        let queued = buffer
-            .resolve_source_exit(&empty_snapshot, &registry, &entry, Utc::now())
+        let resolution = buffer
+            .resolve_source_exit(
+                &PortfolioSnapshot {
+                    fetched_at: Utc::now(),
+                    total_value: dec!(200),
+                    total_exposure: dec!(0),
+                    cash_balance: dec!(200),
+                    realized_pnl: dec!(0),
+                    unrealized_pnl: dec!(0),
+                    positions: Vec::new(),
+                },
+                &registry,
+                &resolver,
+                &matched_trade_from_entry(&sample_entry("SELL")),
+                Utc::now(),
+            )
             .await
-            .expect("queued");
+            .expect("resolution");
 
-        let retry_key = match queued {
-            SourceExitResolution::DeferredRetry(retry) => {
-                assert!(retry.reason.contains("owned_position_exact_match"));
-                retry.retry_key
-            }
-            other => panic!("expected deferred retry, got {other:?}"),
-        };
-
-        let resolved = buffer
-            .retry_unresolved_exit(&retry_key, &sample_snapshot(), &registry, Utc::now())
-            .await
-            .expect("retry");
-
-        assert!(matches!(resolved, SourceExitResolution::Matched(_)));
+        assert!(matches!(
+            resolution,
+            SourceExitResolution::BoundToPending(BoundPendingDisposition {
+                already_bound: false,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
-    async fn unresolved_exit_retries_and_then_resolves() {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "copytrade-exit-buffer-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        let settings = sample_settings(temp_dir);
+    async fn unresolved_exit_uses_stepped_backoff_before_expiry() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let settings = sample_settings(temp_dir.path().to_path_buf());
         let buffer = ExitResolutionBuffer::load(&settings).expect("buffer");
         let registry = PositionRegistry::load(&settings).expect("registry");
-        let entry = sample_entry();
+        let resolver = PositionResolver::load(&settings).expect("resolver");
+        let entry = sample_entry("SELL");
         let now = Utc::now();
 
         let first = buffer
@@ -578,7 +773,8 @@ mod tests {
                     positions: Vec::new(),
                 },
                 &registry,
-                &entry,
+                &resolver,
+                &matched_trade_from_entry(&entry),
                 now,
             )
             .await
@@ -588,14 +784,31 @@ mod tests {
             SourceExitResolution::DeferredRetry(retry) => retry.retry_key,
             other => panic!("expected deferred retry, got {other:?}"),
         };
-        assert!(buffer.pending_intent(&retry_key).await.is_some());
 
-        let resolved = buffer
-            .retry_unresolved_exit(&retry_key, &sample_snapshot(), &registry, Utc::now())
+        let initial = buffer.pending_intent(&retry_key).await.expect("pending");
+        assert_eq!(initial.current_retry_interval_ms, 250);
+
+        let retried = buffer
+            .retry_unresolved_exit(
+                &retry_key,
+                &PortfolioSnapshot {
+                    fetched_at: now,
+                    total_value: dec!(200),
+                    total_exposure: dec!(0),
+                    cash_balance: dec!(200),
+                    realized_pnl: dec!(0),
+                    unrealized_pnl: dec!(0),
+                    positions: Vec::new(),
+                },
+                &registry,
+                &resolver,
+                now + chrono::TimeDelta::milliseconds(250),
+            )
             .await
             .expect("retry");
 
-        assert!(matches!(resolved, SourceExitResolution::Matched(_)));
-        assert!(buffer.pending_intent(&retry_key).await.is_none());
+        assert!(matches!(retried, SourceExitResolution::DeferredRetry(_)));
+        let updated = buffer.pending_intent(&retry_key).await.expect("updated");
+        assert_eq!(updated.current_retry_interval_ms, 500);
     }
 }

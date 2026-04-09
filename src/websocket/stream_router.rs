@@ -95,7 +95,9 @@ impl StreamRouterHandle {
 
         spawn_worker_pool(
             "market-parser",
-            settings.parse_tasks_market.max(settings.market_parser_workers),
+            settings
+                .parse_tasks_market
+                .max(settings.market_parser_workers),
             input.clone(),
             handler,
         );
@@ -262,18 +264,16 @@ fn parse_market_message(raw: RawMarketMessage) -> Result<SequencedParsedMessage>
             parse_completed_at,
             parse_completed_at_utc,
         )?,
-        "last_trade_price" => {
-            parse_last_trade_event(
-                &raw.payload,
-                raw.received_at,
-                raw.received_at_utc,
-                parse_completed_at,
-                parse_completed_at_utc,
-                raw.generation,
-            )
-            .map(|event| vec![ParsedMarketEvent::LastTrade(event)])
-            .unwrap_or_default()
-        }
+        "last_trade_price" => parse_last_trade_event(
+            &raw.payload,
+            raw.received_at,
+            raw.received_at_utc,
+            parse_completed_at,
+            parse_completed_at_utc,
+            raw.generation,
+        )
+        .map(|event| vec![ParsedMarketEvent::LastTrade(event)])
+        .unwrap_or_default(),
         _ => Vec::new(),
     };
 
@@ -390,7 +390,11 @@ struct LastTradeMessage {
     asset_id: String,
     #[serde(alias = "market", alias = "condition_id")]
     condition_id: Option<String>,
-    #[serde(alias = "price", alias = "last_trade_price", deserialize_with = "deserialize_f64")]
+    #[serde(
+        alias = "price",
+        alias = "last_trade_price",
+        deserialize_with = "deserialize_f64"
+    )]
     price: f64,
     #[serde(default, deserialize_with = "deserialize_optional_execution_side")]
     side: Option<ExecutionSide>,
@@ -443,9 +447,7 @@ where
     deserializer.deserialize_any(NumberVisitor)
 }
 
-fn deserialize_optional_f64<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<f64>, D::Error>
+fn deserialize_optional_f64<'de, D>(deserializer: D) -> std::result::Result<Option<f64>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

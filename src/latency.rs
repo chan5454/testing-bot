@@ -13,8 +13,8 @@ use crate::execution::{ExecutionRequest, ExecutionSuccess};
 use crate::latency_monitor::LatencyMeasurement;
 use crate::log_retention::{RetentionOutcome, enforce_jsonl_retention};
 use crate::models::{ActivityEntry, TradeStageTimestamps};
-use crate::runtime::backpressure::RuntimeBackpressure;
 use crate::risk::SkipReason;
+use crate::runtime::backpressure::RuntimeBackpressure;
 
 const TIMESTAMP_MILLIS_THRESHOLD: i64 = 10_000_000_000;
 
@@ -43,7 +43,12 @@ impl LatencyLogger {
         let write_lock = Arc::new(Mutex::new(()));
         let line_tx = if settings.log_latency_events {
             let (line_tx, line_rx) = mpsc::channel(settings.cold_path_queue_capacity.max(1));
-            spawn_writer(line_rx, path.clone(), write_lock.clone(), backpressure.clone());
+            spawn_writer(
+                line_rx,
+                path.clone(),
+                write_lock.clone(),
+                backpressure.clone(),
+            );
             Some(line_tx)
         } else {
             None

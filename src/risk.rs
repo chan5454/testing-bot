@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Settings;
 use crate::execution::ExecutionSide;
-use crate::models::{ActivityEntry, PortfolioSnapshot, PositionKey};
+use crate::models::{ActivityEntry, PortfolioSnapshot, PositionKey, ResolvedPosition};
 
 #[derive(Clone, Debug)]
 pub struct CopyDecision {
@@ -321,55 +321,13 @@ impl RiskEngine {
                         ),
                     ));
                 };
-                if resolved_position.used_fallback {
-                    tracing::info!(
-                        event = "fallback_exit_resolution",
-                        reason_code = "fallback_exit_used",
-                        requested_condition_id = %entry.condition_id,
-                        requested_outcome = %entry.outcome,
-                        requested_wallet = %entry.proxy_wallet,
-                        resolved_condition_id = %resolved_position.key.condition_id,
-                        resolved_outcome = %resolved_position.outcome,
-                        resolved_wallet = %resolved_position.source_wallet,
-                        resolved_asset = %resolved_position.asset,
-                        fallback_reason = %resolved_position
-                            .fallback_reason
-                            .as_deref()
-                            .unwrap_or("same_wallet_same_condition"),
-                        "fallback_exit_resolution"
-                    );
-                }
-                let scaled_size = scaled_size(
+                self.evaluate_sell_from_resolved_position_internal(
+                    entry,
+                    resolved_position,
                     source_notional,
                     source_size,
-                    self.settings.copy_scale_above_five_usd,
-                )
-                .min(resolved_position.size)
-                .round_dp_with_strategy(6, RoundingStrategy::ToZero);
-                if scaled_size <= dec!(0) {
-                    return Err(SkipReason::new(
-                        "sell_size_rounded_to_zero",
-                        format!(
-                            "scaled sell size {} rounded to zero against held size {}",
-                            source_size.round_dp(6),
-                            resolved_position.size.round_dp(6)
-                        ),
-                    ));
-                }
-                Ok(CopyDecision {
-                    token_id: resolved_position.asset.clone(),
-                    side: ExecutionSide::Sell,
-                    notional: source_notional.min(resolved_position.current_value),
-                    size: scaled_size,
-                    position_key: Some(resolved_position.key),
                     price_band,
-                    max_market_spread_bps: self.settings.max_market_spread_bps,
-                    min_top_of_book_ratio: self.settings.min_top_of_book_ratio,
-                    min_visible_liquidity_usd: self.settings.min_liquidity.max(Decimal::ZERO),
-                    max_slippage_bps: self.settings.max_slippage_bps,
-                    max_source_price_slippage_bps: self.settings.max_source_price_slippage_bps,
-                    min_edge_threshold: self.settings.min_edge_threshold.max(Decimal::ZERO),
-                })
+                )
             }
             "BUY" => Err(SkipReason::new(
                 "buy_disabled",
@@ -386,6 +344,38 @@ impl RiskEngine {
         }
     }
 
+    pub fn evaluate_sell_from_resolved_position(
+        &self,
+        entry: &ActivityEntry,
+        resolved_position: ResolvedPosition,
+    ) -> Result<CopyDecision, SkipReason> {
+        let source_notional = entry.usdc_decimal().map_err(|error| {
+            SkipReason::new(
+                "invalid_source_notional",
+                format!("failed to parse usdc size: {error}"),
+            )
+        })?;
+        let source_size = entry.size_decimal().map_err(|error| {
+            SkipReason::new(
+                "invalid_source_size",
+                format!("failed to parse source size: {error}"),
+            )
+        })?;
+        let source_price = entry.price_decimal().map_err(|error| {
+            SkipReason::new(
+                "invalid_source_price",
+                format!("failed to parse source price: {error}"),
+            )
+        })?;
+        self.evaluate_sell_from_resolved_position_internal(
+            entry,
+            resolved_position,
+            source_notional,
+            source_size,
+            get_price_band(source_price),
+        )
+    }
+
     fn total_exposure_cap(&self, portfolio: &PortfolioSnapshot) -> Decimal {
         let configured_cap = self.settings.max_total_exposure_usd.max(Decimal::ZERO);
         let starting_capital = self.settings.start_capital_usd;
@@ -396,6 +386,68 @@ impl RiskEngine {
         let realized_equity = (starting_capital + portfolio.realized_pnl).max(Decimal::ZERO);
         let exposure_ratio = configured_cap / starting_capital;
         (realized_equity * exposure_ratio).max(Decimal::ZERO)
+    }
+}
+
+impl RiskEngine {
+    fn evaluate_sell_from_resolved_position_internal(
+        &self,
+        entry: &ActivityEntry,
+        resolved_position: ResolvedPosition,
+        source_notional: Decimal,
+        source_size: Decimal,
+        price_band: PriceBand,
+    ) -> Result<CopyDecision, SkipReason> {
+        let _ = price_band;
+        if resolved_position.used_fallback {
+            tracing::info!(
+                event = "fallback_exit_resolution",
+                reason_code = "fallback_exit_used",
+                requested_condition_id = %entry.condition_id,
+                requested_outcome = %entry.outcome,
+                requested_wallet = %entry.proxy_wallet,
+                resolved_condition_id = %resolved_position.key.condition_id,
+                resolved_outcome = %resolved_position.outcome,
+                resolved_wallet = %resolved_position.source_wallet,
+                resolved_asset = %resolved_position.asset,
+                fallback_reason = %resolved_position
+                    .fallback_reason
+                    .as_deref()
+                    .unwrap_or("same_wallet_same_condition"),
+                "fallback_exit_resolution"
+            );
+        }
+        let scaled_size = scaled_size(
+            source_notional,
+            source_size,
+            self.settings.copy_scale_above_five_usd,
+        )
+        .min(resolved_position.size)
+        .round_dp_with_strategy(6, RoundingStrategy::ToZero);
+        if scaled_size <= dec!(0) {
+            return Err(SkipReason::new(
+                "sell_size_rounded_to_zero",
+                format!(
+                    "scaled sell size {} rounded to zero against held size {}",
+                    source_size.round_dp(6),
+                    resolved_position.size.round_dp(6)
+                ),
+            ));
+        }
+        Ok(CopyDecision {
+            token_id: resolved_position.asset.clone(),
+            side: ExecutionSide::Sell,
+            notional: source_notional.min(resolved_position.current_value),
+            size: scaled_size,
+            position_key: Some(resolved_position.key),
+            price_band,
+            max_market_spread_bps: self.settings.max_market_spread_bps,
+            min_top_of_book_ratio: self.settings.min_top_of_book_ratio,
+            min_visible_liquidity_usd: self.settings.min_liquidity.max(Decimal::ZERO),
+            max_slippage_bps: self.settings.max_slippage_bps,
+            max_source_price_slippage_bps: self.settings.max_source_price_slippage_bps,
+            min_edge_threshold: self.settings.min_edge_threshold.max(Decimal::ZERO),
+        })
     }
 }
 
@@ -693,6 +745,12 @@ mod tests {
             enable_exit_retry: true,
             exit_retry_window: Duration::from_secs(30),
             exit_retry_interval: Duration::from_millis(500),
+            unresolved_exit_initial_retry: Duration::from_millis(250),
+            unresolved_exit_total_window: Duration::from_secs(30),
+            unresolved_exit_max_retry: Duration::from_secs(4),
+            position_pending_open_ttl: Duration::from_secs(20),
+            rpc_global_rate_limit_per_second: 10,
+            rpc_per_market_rate_limit_per_second: 3,
             closing_max_age: Duration::from_secs(30),
             force_exit_on_closing_timeout: true,
             telegram_bot_token: "token".to_owned(),

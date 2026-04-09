@@ -384,7 +384,9 @@ impl WalletActivityStream {
             });
             spawn_worker_pool(
                 "wallet-user-parser",
-                settings.parse_tasks_wallet.max(settings.wallet_parser_workers),
+                settings
+                    .parse_tasks_wallet
+                    .max(settings.wallet_parser_workers),
                 raw_ring,
                 handler,
             );
@@ -439,7 +441,9 @@ impl WalletActivityStream {
             });
             spawn_worker_pool(
                 "wallet-activity-parser",
-                settings.parse_tasks_wallet.max(settings.wallet_parser_workers),
+                settings
+                    .parse_tasks_wallet
+                    .max(settings.wallet_parser_workers),
                 raw_ring,
                 handler,
             );
@@ -2398,19 +2402,18 @@ fn merge_activity_events(
     } else {
         (tracked_event.observed_at, tracked_event.observed_at_utc)
     };
-    let (parse_completed_at, parse_completed_at_utc) = if walletless_event.parse_completed_at
-        < tracked_event.parse_completed_at
-    {
-        (
-            walletless_event.parse_completed_at,
-            walletless_event.parse_completed_at_utc,
-        )
-    } else {
-        (
-            tracked_event.parse_completed_at,
-            tracked_event.parse_completed_at_utc,
-        )
-    };
+    let (parse_completed_at, parse_completed_at_utc) =
+        if walletless_event.parse_completed_at < tracked_event.parse_completed_at {
+            (
+                walletless_event.parse_completed_at,
+                walletless_event.parse_completed_at_utc,
+            )
+        } else {
+            (
+                tracked_event.parse_completed_at,
+                tracked_event.parse_completed_at_utc,
+            )
+        };
 
     ActivityTradeEvent {
         event_id: tracked_event.event_id,
@@ -2773,6 +2776,12 @@ mod tests {
             enable_exit_retry: true,
             exit_retry_window: Duration::from_secs(30),
             exit_retry_interval: Duration::from_millis(500),
+            unresolved_exit_initial_retry: Duration::from_millis(250),
+            unresolved_exit_total_window: Duration::from_secs(30),
+            unresolved_exit_max_retry: Duration::from_secs(4),
+            position_pending_open_ttl: Duration::from_secs(20),
+            rpc_global_rate_limit_per_second: 10,
+            rpc_per_market_rate_limit_per_second: 3,
             closing_max_age: Duration::from_secs(30),
             force_exit_on_closing_timeout: true,
             telegram_bot_token: "token".to_owned(),

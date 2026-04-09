@@ -164,6 +164,14 @@ pub struct Settings {
     pub enable_exit_retry: bool,
     pub exit_retry_window: Duration,
     pub exit_retry_interval: Duration,
+    pub unresolved_exit_initial_retry: Duration,
+    pub unresolved_exit_total_window: Duration,
+    pub unresolved_exit_max_retry: Duration,
+    pub position_pending_open_ttl: Duration,
+    #[allow(dead_code)]
+    pub rpc_global_rate_limit_per_second: u32,
+    #[allow(dead_code)]
+    pub rpc_per_market_rate_limit_per_second: u32,
     pub closing_max_age: Duration,
     pub force_exit_on_closing_timeout: bool,
     pub telegram_bot_token: String,
@@ -398,22 +406,43 @@ impl Settings {
             max_position_age_hours: parse_or_default("MAX_POSITION_AGE_HOURS", 6_u64)?,
             max_hold_time_seconds: parse_or_default("MAX_HOLD_TIME_SECONDS", 1_800_u64)?,
             enable_exit_retry: parse_or_default("ENABLE_EXIT_RETRY", true)?,
-            exit_retry_window: Duration::from_millis(parse_or_default(
-                "EXIT_RETRY_WINDOW_MS",
+            exit_retry_window: Duration::from_millis(parse_or_default_u64_alias(
+                &["EXIT_RETRY_WINDOW_MS"],
                 30_000_u64,
             )?),
-            exit_retry_interval: Duration::from_millis(parse_or_default(
-                "EXIT_RETRY_INTERVAL_MS",
+            exit_retry_interval: Duration::from_millis(parse_or_default_u64_alias(
+                &["EXIT_RETRY_INTERVAL_MS"],
                 500_u64,
             )?),
+            unresolved_exit_initial_retry: Duration::from_millis(parse_or_default(
+                "UNRESOLVED_EXIT_INITIAL_RETRY_MS",
+                250_u64,
+            )?),
+            unresolved_exit_total_window: Duration::from_millis(parse_or_default(
+                "UNRESOLVED_EXIT_TOTAL_WINDOW_MS",
+                30_000_u64,
+            )?),
+            unresolved_exit_max_retry: Duration::from_millis(parse_or_default(
+                "UNRESOLVED_EXIT_MAX_RETRY_MS",
+                4_000_u64,
+            )?),
+            position_pending_open_ttl: Duration::from_millis(parse_or_default(
+                "POSITION_PENDING_OPEN_TTL_MS",
+                20_000_u64,
+            )?),
+            rpc_global_rate_limit_per_second: parse_or_default(
+                "RPC_GLOBAL_RATE_LIMIT_PER_SECOND",
+                10_u32,
+            )?,
+            rpc_per_market_rate_limit_per_second: parse_or_default(
+                "RPC_PER_MARKET_RATE_LIMIT_PER_SECOND",
+                3_u32,
+            )?,
             closing_max_age: Duration::from_millis(parse_or_default(
                 "CLOSING_MAX_AGE_MS",
                 30_000_u64,
             )?),
-            force_exit_on_closing_timeout: parse_or_default(
-                "FORCE_EXIT_ON_CLOSING_TIMEOUT",
-                true,
-            )?,
+            force_exit_on_closing_timeout: parse_or_default("FORCE_EXIT_ON_CLOSING_TIMEOUT", true)?,
             telegram_bot_token: required("TELEGRAM_BOT_TOKEN")?,
             telegram_chat_id: required("TELEGRAM_CHAT_ID")?,
             health_port: parse("HEALTH_PORT")?,

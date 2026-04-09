@@ -189,7 +189,10 @@ impl RawActivityLogger {
         }
         match serde_json::to_vec(value) {
             Ok(line) => self.enqueue_line(line, context).await,
-            Err(error) => warn!(?error, context, "failed to encode raw activity debug record"),
+            Err(error) => warn!(
+                ?error,
+                context, "failed to encode raw activity debug record"
+            ),
         }
     }
 
@@ -204,7 +207,10 @@ impl RawActivityLogger {
             | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 self.backpressure.decrement_cold_path_depth();
                 self.backpressure.note_diagnostic_drop();
-                warn!(context, "dropping raw activity debug record due to cold-path backpressure");
+                warn!(
+                    context,
+                    "dropping raw activity debug record due to cold-path backpressure"
+                );
             }
         }
     }
@@ -227,7 +233,8 @@ fn spawn_writer(
 ) {
     tokio::spawn(async move {
         while let Some(line) = line_rx.recv().await {
-            if let Err(error) = write_line(&path, rotating_logger.as_ref(), &write_lock, &line).await
+            if let Err(error) =
+                write_line(&path, rotating_logger.as_ref(), &write_lock, &line).await
             {
                 warn!(?error, "failed to persist raw activity debug record");
             }
