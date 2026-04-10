@@ -187,6 +187,14 @@ impl ExitResolutionBuffer {
             .map(|intent| intent.event.clone())
     }
 
+    pub async fn has_pending_source_exit_for_position(&self, position_key: &PositionKey) -> bool {
+        self.pending.lock().await.values().any(|intent| {
+            intent.source_wallet == position_key.source_wallet
+                && intent.condition_id == position_key.condition_id
+                && intent.outcome == position_key.outcome
+        })
+    }
+
     pub async fn retry_unresolved_exit(
         &self,
         retry_key: &str,

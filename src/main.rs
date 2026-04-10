@@ -88,6 +88,13 @@ const EXIT_MANAGER_SWEEP_INTERVAL: Duration = Duration::from_millis(200);
 const EMERGENCY_EXIT_STAGE_TWO_AFTER: Duration = Duration::from_secs(3);
 const EMERGENCY_EXIT_STAGE_THREE_AFTER: Duration = Duration::from_secs(6);
 const TIME_EXIT_MAX_HOLD_SECONDS: i64 = 15 * 60;
+const TIME_EXIT_STAGNATION_BPS: Decimal = rust_decimal_macros::dec!(0.01);
+const TIME_EXIT_FAVORABLE_TREND_BPS: Decimal = rust_decimal_macros::dec!(0.02);
+const TIME_EXIT_MILD_LOSS_BPS: Decimal = rust_decimal_macros::dec!(0.02);
+const TIME_EXIT_SMALL_PNL_ABS: Decimal = rust_decimal_macros::dec!(0.50);
+const TIME_EXIT_EXTENSION_MULTIPLIER: i64 = 2;
+const PROFIT_PROTECTION_MIN_GAIN_BPS: Decimal = rust_decimal_macros::dec!(0.03);
+const PROFIT_PROTECTION_REVERSAL_BPS: Decimal = rust_decimal_macros::dec!(0.02);
 const PREDICTION_HISTORY_SEED_LIMIT: usize = 512;
 const LOG_RETENTION_WINDOW: Duration = Duration::from_secs(6 * 60 * 60);
 const LOG_RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -109,6 +116,7 @@ struct ExecutionAnalyticsTracker {
 enum ManagedExitReason {
     SourceExit,
     TakeProfit,
+    ProfitProtection,
     StopLoss,
     TimeExit,
     HardStop,
@@ -119,11 +127,19 @@ impl ManagedExitReason {
         match self {
             Self::SourceExit => "SOURCE_EXIT",
             Self::TakeProfit => "TAKE_PROFIT",
+            Self::ProfitProtection => "PROFIT_PROTECTION",
             Self::StopLoss => "STOP_LOSS",
             Self::TimeExit => "TIME_EXIT",
             Self::HardStop => "HARD_STOP",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagedExitEvaluation {
+    Trigger(ManagedExitReason),
+    SuppressTimeExit(&'static str),
+    None,
 }
 
 impl ExecutionAnalyticsTracker {
@@ -449,6 +465,23 @@ fn warn_if_exit_noise_suspicious(state: &ExecutionAnalyticsState, last_event: &s
                 copied_position_reference,
                 threshold,
                 "resolver_not_found volume dwarfs copied-position count"
+            );
+        }
+    }
+
+    if last_event == "managed_exit_time_limit" {
+        let actionable = exit_event_count(state, "actionable_source_exit_seen");
+        let time_exits = exit_event_count(state, "managed_exit_time_limit");
+        if copied_position_reference >= 10
+            && actionable.saturating_mul(4) < copied_position_reference
+            && should_emit_exit_noise_warning(time_exits, copied_position_reference.max(10))
+        {
+            warn!(
+                event = "EXIT_PIPELINE_FAILURE",
+                actionable_source_exit_seen = actionable,
+                open_position_reference = copied_position_reference,
+                managed_exit_time_limit = time_exits,
+                "EXIT PIPELINE FAILURE: actionable source exits are far below open-position scale while time exits dominate"
             );
         }
     }
@@ -857,6 +890,7 @@ async fn main() -> Result<()> {
         portfolio.clone(),
         position_registry.clone(),
         position_resolver.clone(),
+        exit_resolution.clone(),
         executor.clone(),
         orderbooks.clone(),
         closing_positions.clone(),
@@ -2022,6 +2056,9 @@ async fn process_trade(
             analytics
                 .record_exit_event("source_exit_duplicate_suppressed", Some(&current_portfolio))
                 .await;
+            analytics
+                .record_exit_event("exit_noise_filtered", Some(&current_portfolio))
+                .await;
             info!(
                 event = "source_exit_duplicate_suppressed",
                 condition_id = %entry.condition_id,
@@ -2049,6 +2086,9 @@ async fn process_trade(
             analytics
                 .record_exit_event(non_actionable.reason, Some(&current_portfolio))
                 .await;
+            analytics
+                .record_exit_event("exit_noise_filtered", Some(&current_portfolio))
+                .await;
             info!(
                 event = non_actionable.reason,
                 detail = %non_actionable.detail,
@@ -2069,6 +2109,9 @@ async fn process_trade(
         analytics
             .record_exit_event("actionable_source_exit_seen", Some(&current_portfolio))
             .await;
+        analytics
+            .record_exit_event("actionable_source_exit", Some(&current_portfolio))
+            .await;
 
         match source_exit_resolution {
             SourceExitResolution::Matched(position_key) => {
@@ -2086,6 +2129,9 @@ async fn process_trade(
                         "source_exit_resolved_against_open",
                         Some(&current_portfolio),
                     )
+                    .await;
+                analytics
+                    .record_exit_event("exit_resolved_success", Some(&current_portfolio))
                     .await;
                 info!(
                     event = "source_exit_matched",
@@ -2118,6 +2164,9 @@ async fn process_trade(
                         Some(&current_portfolio),
                     )
                     .await;
+                analytics
+                    .record_exit_event("exit_resolved_success", Some(&current_portfolio))
+                    .await;
                 info!(
                     event = "source_exit_matched_fallback",
                     condition_id = %position_key.condition_id,
@@ -2142,6 +2191,9 @@ async fn process_trade(
                     .await;
                 analytics
                     .record_exit_event("retry_attempts_saved_by_binding", Some(&current_portfolio))
+                    .await;
+                analytics
+                    .record_exit_event("exit_resolved_success", Some(&current_portfolio))
                     .await;
                 info!(
                     event = "exit_bound_to_pending",
@@ -2205,6 +2257,9 @@ async fn process_trade(
                 }
                 analytics
                     .record_close_failure_reason("exit_unresolved", Some(&current_portfolio))
+                    .await;
+                analytics
+                    .record_exit_event("exit_resolved_failed", Some(&current_portfolio))
                     .await;
                 let reason = SkipReason::new("source_exit_unresolved", reason_detail);
                 record_trade_skip(
@@ -4043,6 +4098,9 @@ async fn spawn_unresolved_exit_retry_worker(
                     analytics
                         .record_exit_event("source_exit_retry_resolved", Some(&snapshot))
                         .await;
+                    analytics
+                        .record_exit_event("exit_resolved_success", Some(&snapshot))
+                        .await;
                     info!(
                         event = "source_exit_retry_resolved",
                         retry_key = %retry_key,
@@ -4061,6 +4119,9 @@ async fn spawn_unresolved_exit_retry_worker(
                 Ok(SourceExitResolution::MatchedByFallback(position_key, fallback_reason)) => {
                     analytics
                         .record_exit_event("source_exit_retry_resolved", Some(&snapshot))
+                        .await;
+                    analytics
+                        .record_exit_event("exit_resolved_success", Some(&snapshot))
                         .await;
                     info!(
                         event = "source_exit_retry_resolved",
@@ -4087,6 +4148,9 @@ async fn spawn_unresolved_exit_retry_worker(
                     analytics
                         .record_exit_event(non_actionable.reason, Some(&snapshot))
                         .await;
+                    analytics
+                        .record_exit_event("exit_noise_filtered", Some(&snapshot))
+                        .await;
                     info!(
                         retry_key = %retry_key,
                         reason = non_actionable.reason,
@@ -4098,6 +4162,9 @@ async fn spawn_unresolved_exit_retry_worker(
                 Ok(SourceExitResolution::Failed(reason_detail)) => {
                     analytics
                         .record_exit_event("source_exit_unresolved_expired", Some(&snapshot))
+                        .await;
+                    analytics
+                        .record_exit_event("exit_resolved_failed", Some(&snapshot))
                         .await;
                     analytics
                         .record_close_failure_reason("exit_unresolved", Some(&snapshot))
@@ -4124,6 +4191,7 @@ async fn spawn_force_exit_watcher(
     portfolio: Arc<PortfolioService>,
     position_registry: PositionRegistry,
     position_resolver: PositionResolver,
+    exit_resolution: Arc<ExitResolutionBuffer>,
     executor: Arc<dyn TradeExecutor>,
     orderbooks: Arc<OrderBookState>,
     closing_positions: ClosingPositions,
@@ -4198,13 +4266,35 @@ async fn spawn_force_exit_watcher(
             let Some(best_bid) = quote.best_bid else {
                 continue;
             };
-            let Some(reason) = managed_exit_reason(
+            let source_exit_pending = exit_resolution
+                .has_pending_source_exit_for_position(&position.position_key())
+                .await;
+            let exit_evaluation = managed_exit_reason(
                 &position,
                 now,
                 best_bid,
                 effective_time_exit_seconds(settings.max_hold_time_seconds),
-            ) else {
-                continue;
+                source_exit_pending,
+            );
+            let reason = match exit_evaluation {
+                ManagedExitEvaluation::Trigger(reason) => reason,
+                ManagedExitEvaluation::SuppressTimeExit(suppressed_reason) => {
+                    analytics
+                        .record_exit_event("premature_time_exit", Some(&snapshot))
+                        .await;
+                    info!(
+                        event = "time_exit_suppressed",
+                        reason = suppressed_reason,
+                        condition_id = %position.condition_id,
+                        outcome = %position.outcome,
+                        source_wallet = %position.source_wallet,
+                        "suppressed premature time exit"
+                    );
+                    continue;
+                }
+                ManagedExitEvaluation::None => {
+                    continue;
+                }
             };
 
             if let Err(error) = attempt_managed_exit_position(
@@ -4439,6 +4529,11 @@ async fn attempt_managed_exit_position(
         analytics
             .record_exit_event(event_name, Some(&closing_snapshot))
             .await;
+        if reason == ManagedExitReason::TimeExit {
+            analytics
+                .record_exit_event("managed_exit_time_limit", Some(&closing_snapshot))
+                .await;
+        }
     }
 
     info!(
@@ -4652,24 +4747,118 @@ fn build_managed_exit_decision(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimeExitEvaluation {
+    Trigger,
+    Suppress(&'static str),
+    None,
+}
+
+fn profit_protection_triggered(
+    position: &models::PortfolioPosition,
+    best_bid: rust_decimal::Decimal,
+) -> bool {
+    if position.average_entry_price <= rust_decimal::Decimal::ZERO
+        || position.current_price <= rust_decimal::Decimal::ZERO
+    {
+        return false;
+    }
+
+    let profitable = best_bid
+        >= position.average_entry_price
+            * (rust_decimal::Decimal::ONE + PROFIT_PROTECTION_MIN_GAIN_BPS);
+    let reversal = best_bid
+        <= position.current_price * (rust_decimal::Decimal::ONE - PROFIT_PROTECTION_REVERSAL_BPS);
+    profitable && reversal
+}
+
+fn evaluate_time_exit(
+    position: &models::PortfolioPosition,
+    now: DateTime<Utc>,
+    best_bid: rust_decimal::Decimal,
+    max_hold_time_seconds: i64,
+    source_exit_pending: bool,
+) -> TimeExitEvaluation {
+    if !position.should_force_exit(now, max_hold_time_seconds) {
+        return TimeExitEvaluation::None;
+    }
+    if source_exit_pending {
+        return TimeExitEvaluation::Suppress("source_exit_pending");
+    }
+
+    let reference_price = position
+        .current_price
+        .max(position.average_entry_price)
+        .max(rust_decimal::Decimal::ZERO);
+    let movement_ratio = if reference_price > rust_decimal::Decimal::ZERO {
+        ((best_bid - position.current_price).abs() / reference_price).abs()
+    } else {
+        rust_decimal::Decimal::ZERO
+    };
+    let stagnant = movement_ratio <= TIME_EXIT_STAGNATION_BPS;
+    let favorable_trend = best_bid
+        >= position.current_price * (rust_decimal::Decimal::ONE + TIME_EXIT_FAVORABLE_TREND_BPS)
+        || position.unrealized_pnl > TIME_EXIT_SMALL_PNL_ABS;
+    let mild_loss = position.cost_basis > rust_decimal::Decimal::ZERO
+        && ((-position.unrealized_pnl) / position.cost_basis) <= TIME_EXIT_MILD_LOSS_BPS
+        && position.unrealized_pnl < rust_decimal::Decimal::ZERO;
+    let strong_reversal = best_bid
+        <= position.current_price * (rust_decimal::Decimal::ONE - TIME_EXIT_FAVORABLE_TREND_BPS);
+    let extended_hold = position.age(now).is_some_and(|age| {
+        age >= TimeDelta::seconds(
+            max_hold_time_seconds.saturating_mul(TIME_EXIT_EXTENSION_MULTIPLIER),
+        )
+    });
+
+    if mild_loss && !strong_reversal && !extended_hold {
+        return TimeExitEvaluation::Suppress("mild_loss_extension");
+    }
+    if favorable_trend && !extended_hold {
+        return TimeExitEvaluation::Suppress("favorable_trend");
+    }
+    if stagnant || position.unrealized_pnl <= TIME_EXIT_SMALL_PNL_ABS || extended_hold {
+        return TimeExitEvaluation::Trigger;
+    }
+
+    TimeExitEvaluation::Suppress("still_moving")
+}
+
 fn managed_exit_reason(
     position: &models::PortfolioPosition,
     now: DateTime<Utc>,
     best_bid: rust_decimal::Decimal,
     max_hold_time_seconds: i64,
-) -> Option<ManagedExitReason> {
+    source_exit_pending: bool,
+) -> ManagedExitEvaluation {
     if position.average_entry_price > rust_decimal::Decimal::ZERO {
-        if best_bid >= position.average_entry_price * rust_decimal::Decimal::new(115, 2) {
-            return Some(ManagedExitReason::TakeProfit);
+        if profit_protection_triggered(position, best_bid) {
+            return ManagedExitEvaluation::Trigger(ManagedExitReason::ProfitProtection);
         }
-        if best_bid <= position.average_entry_price * rust_decimal::Decimal::new(90, 2) {
-            return Some(ManagedExitReason::StopLoss);
+        if !source_exit_pending
+            && best_bid >= position.average_entry_price * rust_decimal::Decimal::new(115, 2)
+        {
+            return ManagedExitEvaluation::Trigger(ManagedExitReason::TakeProfit);
+        }
+        let catastrophic_stop =
+            best_bid <= position.average_entry_price * rust_decimal::Decimal::new(80, 2);
+        if best_bid <= position.average_entry_price * rust_decimal::Decimal::new(90, 2)
+            && (!source_exit_pending || catastrophic_stop)
+        {
+            return ManagedExitEvaluation::Trigger(ManagedExitReason::StopLoss);
         }
     }
 
-    position
-        .should_force_exit(now, max_hold_time_seconds)
-        .then_some(ManagedExitReason::TimeExit)
+    match evaluate_time_exit(
+        position,
+        now,
+        best_bid,
+        max_hold_time_seconds,
+        source_exit_pending,
+    ) {
+        TimeExitEvaluation::Trigger => ManagedExitEvaluation::Trigger(ManagedExitReason::TimeExit),
+        TimeExitEvaluation::Suppress(reason) => ManagedExitEvaluation::SuppressTimeExit(reason),
+        TimeExitEvaluation::None => ManagedExitEvaluation::None,
+    }
 }
 
 fn effective_time_exit_seconds(configured_seconds: u64) -> i64 {
@@ -4695,8 +4884,9 @@ enum ClosingActionPlan {
 fn managed_exit_event_name(reason: ManagedExitReason) -> Option<&'static str> {
     match reason {
         ManagedExitReason::TakeProfit => Some("managed_exit_take_profit"),
+        ManagedExitReason::ProfitProtection => Some("managed_exit_profit_protection"),
         ManagedExitReason::StopLoss => Some("managed_exit_stop_loss"),
-        ManagedExitReason::TimeExit => Some("managed_exit_time_limit"),
+        ManagedExitReason::TimeExit => Some("time_exit_triggered"),
         ManagedExitReason::SourceExit | ManagedExitReason::HardStop => None,
     }
 }
@@ -4704,6 +4894,7 @@ fn managed_exit_event_name(reason: ManagedExitReason) -> Option<&'static str> {
 fn closing_reason_from_position(position: &models::PortfolioPosition) -> ManagedExitReason {
     match position.closing_reason.as_deref().unwrap_or("SOURCE_EXIT") {
         "TAKE_PROFIT" => ManagedExitReason::TakeProfit,
+        "PROFIT_PROTECTION" => ManagedExitReason::ProfitProtection,
         "STOP_LOSS" => ManagedExitReason::StopLoss,
         "TIME_EXIT" => ManagedExitReason::TimeExit,
         "HARD_STOP" => ManagedExitReason::HardStop,
@@ -6126,7 +6317,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_exit_reason_selects_profit_then_loss_then_time() {
+    fn managed_exit_reason_selects_profit_protection_loss_and_conditional_time_exit() {
         let position = models::PortfolioPosition {
             asset: "asset-1".to_owned(),
             condition_id: "condition-1".to_owned(),
@@ -6156,27 +6347,145 @@ mod tests {
                 &position,
                 Utc::now(),
                 dec!(0.58),
-                TIME_EXIT_MAX_HOLD_SECONDS
+                TIME_EXIT_MAX_HOLD_SECONDS,
+                false,
             ),
-            Some(ManagedExitReason::TakeProfit)
+            ManagedExitEvaluation::Trigger(ManagedExitReason::TakeProfit)
+        );
+        assert_eq!(
+            managed_exit_reason(
+                &models::PortfolioPosition {
+                    current_price: dec!(0.56),
+                    unrealized_pnl: dec!(0.6),
+                    ..position.clone()
+                },
+                Utc::now(),
+                dec!(0.53),
+                TIME_EXIT_MAX_HOLD_SECONDS,
+                false,
+            ),
+            ManagedExitEvaluation::Trigger(ManagedExitReason::ProfitProtection)
         );
         assert_eq!(
             managed_exit_reason(
                 &position,
                 Utc::now(),
                 dec!(0.44),
-                TIME_EXIT_MAX_HOLD_SECONDS
+                TIME_EXIT_MAX_HOLD_SECONDS,
+                false,
             ),
-            Some(ManagedExitReason::StopLoss)
+            ManagedExitEvaluation::Trigger(ManagedExitReason::StopLoss)
         );
         assert_eq!(
             managed_exit_reason(
                 &position,
                 Utc::now(),
                 dec!(0.50),
-                TIME_EXIT_MAX_HOLD_SECONDS
+                TIME_EXIT_MAX_HOLD_SECONDS,
+                false,
             ),
-            Some(ManagedExitReason::TimeExit)
+            ManagedExitEvaluation::Trigger(ManagedExitReason::TimeExit)
+        );
+        assert_eq!(
+            managed_exit_reason(
+                &position,
+                Utc::now(),
+                dec!(0.50),
+                TIME_EXIT_MAX_HOLD_SECONDS,
+                true,
+            ),
+            ManagedExitEvaluation::SuppressTimeExit("source_exit_pending")
+        );
+    }
+
+    #[test]
+    fn time_exit_requires_stagnation_or_small_pnl() {
+        let position = models::PortfolioPosition {
+            asset: "asset-1".to_owned(),
+            condition_id: "condition-1".to_owned(),
+            title: "Sample market".to_owned(),
+            outcome: "YES".to_owned(),
+            source_wallet: "0xsource".to_owned(),
+            state: models::PositionState::Open,
+            size: dec!(10),
+            current_value: dec!(5.8),
+            average_entry_price: dec!(0.5),
+            current_price: dec!(0.55),
+            cost_basis: dec!(5),
+            unrealized_pnl: dec!(0.8),
+            opened_at: Some(Utc::now() - chrono::TimeDelta::minutes(20)),
+            source_trade_timestamp_unix: 0,
+            closing_started_at: None,
+            closing_reason: None,
+            last_close_attempt_at: None,
+            close_attempts: 0,
+            close_failure_reason: None,
+            closing_escalation_level: 0,
+            stale_reason: None,
+        };
+
+        assert_eq!(
+            managed_exit_reason(
+                &position,
+                Utc::now(),
+                dec!(0.56),
+                TIME_EXIT_MAX_HOLD_SECONDS,
+                false,
+            ),
+            ManagedExitEvaluation::SuppressTimeExit("favorable_trend")
+        );
+        assert_eq!(
+            managed_exit_reason(
+                &models::PortfolioPosition {
+                    current_price: dec!(0.50),
+                    current_value: dec!(5),
+                    unrealized_pnl: dec!(0),
+                    ..position
+                },
+                Utc::now(),
+                dec!(0.50),
+                TIME_EXIT_MAX_HOLD_SECONDS,
+                false,
+            ),
+            ManagedExitEvaluation::Trigger(ManagedExitReason::TimeExit)
+        );
+    }
+
+    #[test]
+    fn time_exit_extends_mild_losers_without_reversal() {
+        let position = models::PortfolioPosition {
+            asset: "asset-1".to_owned(),
+            condition_id: "condition-1".to_owned(),
+            title: "Sample market".to_owned(),
+            outcome: "YES".to_owned(),
+            source_wallet: "0xsource".to_owned(),
+            state: models::PositionState::Open,
+            size: dec!(10),
+            current_value: dec!(4.95),
+            average_entry_price: dec!(0.5),
+            current_price: dec!(0.50),
+            cost_basis: dec!(5),
+            unrealized_pnl: dec!(-0.05),
+            opened_at: Some(Utc::now() - chrono::TimeDelta::minutes(20)),
+            source_trade_timestamp_unix: 0,
+            closing_started_at: None,
+            closing_reason: None,
+            last_close_attempt_at: None,
+            close_attempts: 0,
+            close_failure_reason: None,
+            closing_escalation_level: 0,
+            stale_reason: None,
+        };
+
+        assert_eq!(
+            managed_exit_reason(
+                &position,
+                Utc::now(),
+                dec!(0.499),
+                TIME_EXIT_MAX_HOLD_SECONDS,
+                false,
+            ),
+            ManagedExitEvaluation::SuppressTimeExit("mild_loss_extension")
         );
     }
 

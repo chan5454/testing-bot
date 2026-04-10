@@ -195,10 +195,10 @@ The runtime in `src/main.rs` applies three exit layers:
    Source SELL events attempt to close the matching copied position immediately.
 
 2. Price-based exits
-   The exit watcher can trigger `TAKE_PROFIT` and `STOP_LOSS` exits from live quotes.
+   The exit watcher can trigger `TAKE_PROFIT`, `PROFIT_PROTECTION`, and `STOP_LOSS` exits from live quotes.
 
 3. Time-based exits
-   Positions older than the configured hold limit are force-exited.
+   Positions older than the configured hold limit are only exited when source-follow is not pending and the position is stagnant or no longer trending favorably.
 
 Important protections:
 
@@ -210,6 +210,8 @@ Important protections:
 - source SELL resolution always tries exact `PositionKey { condition_id, outcome, source_wallet }` ownership first
 - source SELL resolution checks both `PendingOpen` and fully open copied positions
 - pending-open exits bind locally and are released on the position-open event instead of polling
+- managed exits consult pending unresolved source exits before firing time-based closes
+- stop-loss exits yield to pending source exits unless the move is catastrophic
 - safe fallback resolution is limited to the same source wallet and same market/condition, and broad condition-only fallback is used only when there is exactly one active candidate
 - unresolved source exits are persisted to a short retry buffer in `data/unresolved-exits.json`, but only after local ownership candidates exist
 - UNKNOWN or unresolved outcomes are treated as attribution misses instead of actionable retry work unless a deterministic single-candidate fallback resolves them
@@ -276,6 +278,12 @@ The analytics summary now separates:
 - `source_exit_retry_queued`
 - `source_exit_retry_resolved`
 - `source_exit_unresolved_expired`
+- `exit_noise_filtered`
+- `exit_resolved_success`
+- `exit_resolved_failed`
+- `time_exit_triggered`
+- `premature_time_exit`
+- `managed_exit_profit_protection`
 
 ### 14. Persistence boundaries
 
