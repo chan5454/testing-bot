@@ -347,6 +347,30 @@ impl PositionResolver {
             .is_some_and(|record| !pending_record_expired(record, now))
     }
 
+    pub fn candidate_count_for_source_condition(
+        &self,
+        source_wallet: &str,
+        condition_id: &str,
+        now: DateTime<Utc>,
+    ) -> usize {
+        let normalized_wallet = PositionKey::new(condition_id, "", source_wallet).source_wallet;
+        if normalized_wallet.is_empty() || condition_id.trim().is_empty() {
+            return 0;
+        }
+
+        self.state
+            .read()
+            .expect("position resolver read lock")
+            .positions
+            .values()
+            .filter(|record| {
+                !pending_record_expired(record, now)
+                    && record.key.source_wallet == normalized_wallet
+                    && record.key.condition_id == condition_id
+            })
+            .count()
+    }
+
     pub fn is_closing(&self, key: &PositionKey) -> bool {
         self.state
             .read()

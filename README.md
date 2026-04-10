@@ -100,6 +100,7 @@ The rescanner remains enabled, but it is now firmly off the hot path. Active-wal
 - rejects ultra-short markets unless `ENABLE_ULTRA_SHORT_MARKETS=true`
 - rejects thin books via visible-liquidity and spread checks
 - rejects price chasing, market cooldown churn, conflicting wallet signals, and hyperactive scalp wallets
+- downweights source wallets with negative recent realized or open PnL before sizing new entries
 - computes a weighted trade-quality score before submit
 - sizes entries as the minimum of risk-percent-of-equity, absolute size cap, remaining total exposure, remaining market exposure, and available cash
 - blocks entries during drawdown guard, hard-stop, loss-streak cooldown, total exposure limit, or per-market exposure limit
@@ -193,12 +194,16 @@ Important protections:
 - exits have priority over entries
 - exits are consumed from the hot queue before entries when `EXIT_PRIORITY_STRICT=true`
 - duplicate exits are blocked with a shared closing set
+- raw source SELL activity is counted separately from actionable copied-position exits
+- source SELLs must normalize to a known condition/outcome and map to a plausible owned position before entering the retry buffer
 - source SELL resolution always tries exact `PositionKey { condition_id, outcome, source_wallet }` ownership first
 - source SELL resolution checks both `PendingOpen` and fully open copied positions
 - pending-open exits bind locally and are released on the position-open event instead of polling
-- safe fallback resolution is limited to the same source wallet and same market/condition
-- unresolved source exits are persisted to a short retry buffer in `data/unresolved-exits.json`
+- safe fallback resolution is limited to the same source wallet and same market/condition, and broad condition-only fallback is used only when there is exactly one active candidate
+- unresolved source exits are persisted to a short retry buffer in `data/unresolved-exits.json`, but only after local ownership candidates exist
+- UNKNOWN or unresolved outcomes are treated as attribution misses instead of actionable retry work unless a deterministic single-candidate fallback resolves them
 - unresolved retry now uses stepped backoff (`UNRESOLVED_EXIT_INITIAL_RETRY_MS`, `UNRESOLVED_EXIT_MAX_RETRY_MS`, `UNRESOLVED_EXIT_TOTAL_WINDOW_MS`) and runs off the hot path
+- duplicate public/authenticated source SELLs are suppressed for `SOURCE_EXIT_DEDUPE_WINDOW_MS`
 - `Closing` positions are revisited until they fill, escalate through mandatory/emergency unwind, or record an explicit failed-close reason
 - exit logic uses the position registry, so wallet removal does not strand positions
 
@@ -241,10 +246,17 @@ and warns when exits have not executed yet.
 
 The analytics summary now separates:
 
+- `raw_source_sell_seen`
+- `actionable_source_exit_seen`
+- `source_exit_normalization_failed`
+- `source_exit_not_owned`
+- `source_exit_duplicate_suppressed`
 - `position_pending_registered`
 - `position_promoted_to_open`
 - `exit_resolved_against_pending`
 - `exit_resolved_against_open`
+- `source_exit_resolved_against_pending`
+- `source_exit_resolved_against_open`
 - `exit_bound_to_pending`
 - `deferred_exit_released`
 - `deferred_exit_expired`
@@ -296,14 +308,15 @@ The latency-sensitive flow is now:
 
 1. Read market deltas from the market WebSocket.
 2. Parse the minimal market/activity fields needed for an immediate decision.
-3. Resolve direct tracked-wallet entries and source-follow exits through fast attribution.
+3. Resolve direct tracked-wallet entries and normalize source SELLs through fast attribution.
 4. Register `PendingOpen` ownership before entry submission so later exits can resolve locally.
-5. Apply the fast in-memory risk gate.
-6. Submit an order through the live or paper executor.
-7. Project the fill into the in-memory portfolio and promote the resolver entry immediately.
-8. Release any exit that was bound to the pending position.
-9. Flush diagnostics, summaries, and non-critical persistence on the cold path.
-10. Continue managing the position until source exit, TP/SL, or time exit closes it.
+5. For source SELLs, require a known condition/outcome and a pending/open/closing owned-position candidate before treating the event as actionable.
+6. Apply the fast in-memory risk gate.
+7. Submit an order through the live or paper executor.
+8. Project the fill into the in-memory portfolio and promote the resolver entry immediately.
+9. Release any exit that was bound to the pending position.
+10. Flush diagnostics, summaries, and non-critical persistence on the cold path.
+11. Continue managing the position until source exit, TP/SL, or time exit closes it.
 
 ## Execution Modes
 

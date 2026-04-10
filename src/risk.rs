@@ -994,11 +994,16 @@ fn size_multiplier_for_price(price: Decimal) -> Decimal {
 }
 
 fn wallet_performance_multiplier(portfolio: &PortfolioSnapshot, wallet: &str) -> Decimal {
-    if portfolio.wallet_unrealized_pnl(wallet) < Decimal::ZERO {
-        dec!(0.5)
-    } else {
-        Decimal::ONE
+    let realized_pnl = portfolio.wallet_realized_pnl(wallet);
+    let unrealized_pnl = portfolio.wallet_unrealized_pnl(wallet);
+    let mut multiplier = Decimal::ONE;
+    if realized_pnl < Decimal::ZERO {
+        multiplier *= dec!(0.75);
     }
+    if unrealized_pnl < Decimal::ZERO {
+        multiplier *= dec!(0.5);
+    }
+    multiplier
 }
 
 fn average_hold_ms(stats: &WalletBehaviorStats) -> Option<u64> {
@@ -1127,7 +1132,7 @@ mod tests {
 
     use super::*;
     use crate::config::Settings;
-    use crate::models::{PortfolioPosition, PortfolioSnapshot};
+    use crate::models::{PortfolioPosition, PortfolioSnapshot, RealizedTradePoint};
 
     #[test]
     fn scales_only_after_five_dollars() {
@@ -1498,6 +1503,29 @@ mod tests {
             .expect("buy should remain eligible");
 
         assert_eq!(decision.notional, dec!(5));
+    }
+
+    #[test]
+    fn buy_notional_is_reduced_when_wallet_realized_pnl_is_negative() {
+        let mut settings = sample_settings();
+        settings.copy_scale_above_five_usd = Decimal::ONE;
+        let engine = RiskEngine::new(settings);
+        let entry = sample_entry("BUY", "asset-2", 20.0, 10.0, "0xsource");
+        let mut portfolio = sample_portfolio();
+        portfolio.positions.clear();
+        portfolio
+            .recent_realized_trade_points
+            .push(RealizedTradePoint {
+                observed_at: Utc::now(),
+                pnl: dec!(-3),
+                source_wallet: "0xsource".to_owned(),
+            });
+
+        let decision = engine
+            .evaluate(&entry, &portfolio)
+            .expect("buy should remain eligible");
+
+        assert_eq!(decision.notional, dec!(7.5));
     }
 
     #[test]

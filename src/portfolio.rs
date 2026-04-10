@@ -566,9 +566,10 @@ fn apply_position_fill(
             }
 
             let average_entry_price = snapshot.positions[index].average_entry_price;
+            let source_wallet = snapshot.positions[index].source_wallet.clone();
             let realized_pnl = (result.filled_price - average_entry_price) * result.filled_size;
             snapshot.realized_pnl += realized_pnl;
-            record_realized_trade(snapshot, realized_pnl);
+            record_realized_trade(snapshot, &source_wallet, realized_pnl);
             let position = &mut snapshot.positions[index];
             position.state = PositionState::Closing;
             position.closing_started_at = Some(Utc::now());
@@ -808,13 +809,18 @@ fn recalculate_snapshot_totals(snapshot: &mut PortfolioSnapshot) {
     snapshot.total_value = snapshot.cash_balance + snapshot.total_exposure;
 }
 
-fn record_realized_trade(snapshot: &mut PortfolioSnapshot, realized_pnl: Decimal) {
+fn record_realized_trade(
+    snapshot: &mut PortfolioSnapshot,
+    source_wallet: &str,
+    realized_pnl: Decimal,
+) {
     let now = Utc::now();
     snapshot
         .recent_realized_trade_points
         .push(RealizedTradePoint {
             observed_at: now,
             pnl: realized_pnl,
+            source_wallet: normalize_wallet(source_wallet),
         });
     if snapshot.recent_realized_trade_points.len() > RECENT_REALIZED_TRADE_LIMIT {
         let drop_count = snapshot.recent_realized_trade_points.len() - RECENT_REALIZED_TRADE_LIMIT;

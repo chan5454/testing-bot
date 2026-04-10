@@ -279,6 +279,7 @@ impl ExecutionAnalyticsTracker {
             if let Some(portfolio) = portfolio {
                 refresh_analytics_from_portfolio(&mut state, portfolio, self.start_capital_usd);
             }
+            warn_if_exit_noise_suspicious(&state, event_name);
             state.clone()
         };
         self.persist_snapshot(snapshot);
@@ -382,6 +383,79 @@ fn recompute_analytics_rates(state: &mut ExecutionAnalyticsState) {
 
 fn increment_string_counter(map: &mut BTreeMap<String, u64>, key: impl Into<String>) {
     *map.entry(key.into()).or_insert(0) += 1;
+}
+
+fn exit_event_count(state: &ExecutionAnalyticsState, event_name: &str) -> u64 {
+    state
+        .exit_event_counts
+        .get(event_name)
+        .copied()
+        .unwrap_or_default()
+}
+
+fn warn_if_exit_noise_suspicious(state: &ExecutionAnalyticsState, last_event: &str) {
+    let copied_position_reference = (state.open_positions_count as u64)
+        .max(state.processed_entry_events)
+        .max(1);
+
+    if last_event == "actionable_source_exit_seen" {
+        let actionable = exit_event_count(state, "actionable_source_exit_seen");
+        let threshold = copied_position_reference.saturating_mul(20).max(100);
+        if should_emit_exit_noise_warning(actionable, threshold) {
+            warn!(
+                event = "exit_noise_actionable_ratio_high",
+                actionable_source_exit_seen = actionable,
+                copied_position_reference,
+                threshold,
+                "actionable source exits exceed copied-position scale; inspect attribution normalization"
+            );
+        }
+    }
+
+    if last_event == "source_exit_retry_queued" {
+        let queued = exit_event_count(state, "source_exit_retry_queued");
+        let threshold = copied_position_reference.saturating_mul(10).max(100);
+        if should_emit_exit_noise_warning(queued, threshold) {
+            warn!(
+                event = "exit_noise_retry_queue_high",
+                source_exit_retry_queued = queued,
+                copied_position_reference,
+                threshold,
+                "unresolved source-exit retry volume is high relative to copied positions"
+            );
+        }
+    }
+
+    if last_event == "source_exit_normalization_failed" {
+        let failed = exit_event_count(state, "source_exit_normalization_failed");
+        let raw = exit_event_count(state, "raw_source_sell_seen").max(1);
+        if failed >= 1_000 && failed.saturating_mul(2) >= raw && failed.is_multiple_of(1_000) {
+            warn!(
+                event = "exit_noise_normalization_failures_high",
+                source_exit_normalization_failed = failed,
+                raw_source_sell_seen = raw,
+                "UNKNOWN or incomplete source sells dominate raw exit activity"
+            );
+        }
+    }
+
+    if last_event == "resolver_not_found" {
+        let resolver_not_found = exit_event_count(state, "resolver_not_found");
+        let threshold = copied_position_reference.saturating_mul(20).max(100);
+        if should_emit_exit_noise_warning(resolver_not_found, threshold) {
+            warn!(
+                event = "exit_noise_resolver_not_found_high",
+                resolver_not_found,
+                copied_position_reference,
+                threshold,
+                "resolver_not_found volume dwarfs copied-position count"
+            );
+        }
+    }
+}
+
+fn should_emit_exit_noise_warning(count: u64, threshold: u64) -> bool {
+    threshold > 0 && count >= threshold && count.is_multiple_of(threshold)
 }
 
 fn refresh_analytics_from_portfolio(
@@ -1939,19 +2013,63 @@ async fn process_trade(
         return Ok(TradeProcessingOutcome::Skipped(reason));
     }
     if matches!(side, ExecutionSide::Sell) {
+        let now = Utc::now();
         analytics
-            .record_exit_event("source_exit_seen", Some(&current_portfolio))
+            .record_exit_event("raw_source_sell_seen", Some(&current_portfolio))
             .await;
-        match exit_resolution
+        if !exit_resolution.claim_source_exit(entry, now).await {
+            analytics
+                .record_exit_event("source_exit_duplicate_suppressed", Some(&current_portfolio))
+                .await;
+            info!(
+                event = "source_exit_duplicate_suppressed",
+                condition_id = %entry.condition_id,
+                outcome = %entry.outcome,
+                source_wallet = %entry.proxy_wallet,
+                transaction_hash = %entry.transaction_hash,
+                "suppressed duplicate source sell before exit resolution"
+            );
+            return Ok(TradeProcessingOutcome::Deferred(DeferredTrade {
+                code: "source_exit_duplicate_suppressed",
+                detail: "duplicate source sell suppressed before exit resolution".to_owned(),
+            }));
+        }
+
+        let source_exit_resolution = exit_resolution
             .resolve_source_exit(
                 &current_portfolio,
                 position_registry,
                 position_resolver,
                 &task.matched_trade,
-                Utc::now(),
+                now,
             )
-            .await?
-        {
+            .await?;
+        if let SourceExitResolution::NotActionable(non_actionable) = source_exit_resolution {
+            analytics
+                .record_exit_event(non_actionable.reason, Some(&current_portfolio))
+                .await;
+            info!(
+                event = non_actionable.reason,
+                detail = %non_actionable.detail,
+                condition_id = %entry.condition_id,
+                outcome = %entry.outcome,
+                source_wallet = %entry.proxy_wallet,
+                "ignored non-actionable source sell before retry queue"
+            );
+            return Ok(TradeProcessingOutcome::Deferred(DeferredTrade {
+                code: non_actionable.reason,
+                detail: non_actionable.detail,
+            }));
+        }
+
+        analytics
+            .record_exit_event("source_exit_seen", Some(&current_portfolio))
+            .await;
+        analytics
+            .record_exit_event("actionable_source_exit_seen", Some(&current_portfolio))
+            .await;
+
+        match source_exit_resolution {
             SourceExitResolution::Matched(position_key) => {
                 has_copied_inventory = true;
                 resolved_exit_position = resolved_exit_position
@@ -1961,6 +2079,12 @@ async fn process_trade(
                     .await;
                 analytics
                     .record_exit_event("exit_resolved_against_open", Some(&current_portfolio))
+                    .await;
+                analytics
+                    .record_exit_event(
+                        "source_exit_resolved_against_open",
+                        Some(&current_portfolio),
+                    )
                     .await;
                 info!(
                     event = "source_exit_matched",
@@ -1987,6 +2111,12 @@ async fn process_trade(
                 analytics
                     .record_exit_event("exit_resolved_against_open", Some(&current_portfolio))
                     .await;
+                analytics
+                    .record_exit_event(
+                        "source_exit_resolved_against_open",
+                        Some(&current_portfolio),
+                    )
+                    .await;
                 info!(
                     event = "source_exit_matched_fallback",
                     condition_id = %position_key.condition_id,
@@ -1999,6 +2129,12 @@ async fn process_trade(
             SourceExitResolution::BoundToPending(bound) => {
                 analytics
                     .record_exit_event("exit_resolved_against_pending", Some(&current_portfolio))
+                    .await;
+                analytics
+                    .record_exit_event(
+                        "source_exit_resolved_against_pending",
+                        Some(&current_portfolio),
+                    )
                     .await;
                 analytics
                     .record_exit_event("exit_bound_to_pending", Some(&current_portfolio))
@@ -2084,6 +2220,9 @@ async fn process_trade(
                 )
                 .await;
                 return Ok(TradeProcessingOutcome::Skipped(reason));
+            }
+            SourceExitResolution::NotActionable(_) => {
+                unreachable!("handled before actionable exit metrics")
             }
         }
     }
@@ -3896,6 +4035,17 @@ async fn spawn_unresolved_exit_retry_worker(
                     analytics
                         .record_exit_event("exit_bound_to_pending", Some(&snapshot))
                         .await;
+                }
+                Ok(SourceExitResolution::NotActionable(non_actionable)) => {
+                    analytics
+                        .record_exit_event(non_actionable.reason, Some(&snapshot))
+                        .await;
+                    info!(
+                        retry_key = %retry_key,
+                        reason = non_actionable.reason,
+                        detail = %non_actionable.detail,
+                        "dropped non-actionable unresolved source exit during retry"
+                    );
                 }
                 Ok(SourceExitResolution::DeferredRetry(_)) => {}
                 Ok(SourceExitResolution::Failed(reason_detail)) => {

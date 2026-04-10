@@ -255,6 +255,8 @@ pub struct EquityPoint {
 pub struct RealizedTradePoint {
     pub observed_at: DateTime<Utc>,
     pub pnl: Decimal,
+    #[serde(default)]
+    pub source_wallet: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -622,6 +624,25 @@ impl PortfolioSnapshot {
         self.position_by_key(key).is_some()
     }
 
+    pub fn active_position_count_for_wallet_condition(
+        &self,
+        wallet: &str,
+        condition_id: &str,
+    ) -> usize {
+        let wallet = normalize_portfolio_wallet(wallet);
+        if wallet.is_empty() || condition_id.trim().is_empty() {
+            return 0;
+        }
+
+        self.active_positions()
+            .iter()
+            .filter(|position| {
+                position.condition_id == condition_id
+                    && normalize_portfolio_wallet(&position.source_wallet) == wallet
+            })
+            .count()
+    }
+
     pub fn has_stale_position_key(&self, key: &PositionKey) -> bool {
         self.positions
             .iter()
@@ -703,17 +724,16 @@ impl PortfolioSnapshot {
                     && normalize_portfolio_wallet(&position.source_wallet) == requested_wallet
             })
             .collect::<Vec<_>>();
-        select_safe_exit_fallback(candidates, asset_hint).map(|(position, fallback_reason)| {
-            ResolvedPosition {
-                key: position.position_key(),
-                asset: position.asset.clone(),
-                outcome: position.outcome.clone(),
-                source_wallet: position.source_wallet.clone(),
-                size: position.size,
-                current_value: position.current_value,
-                used_fallback: true,
-                fallback_reason: Some(fallback_reason),
-            }
+        let _ = asset_hint;
+        select_safe_exit_fallback(candidates).map(|(position, fallback_reason)| ResolvedPosition {
+            key: position.position_key(),
+            asset: position.asset.clone(),
+            outcome: position.outcome.clone(),
+            source_wallet: position.source_wallet.clone(),
+            size: position.size,
+            current_value: position.current_value,
+            used_fallback: true,
+            fallback_reason: Some(fallback_reason),
         })
     }
 
@@ -820,6 +840,19 @@ impl PortfolioSnapshot {
             .sum()
     }
 
+    pub fn wallet_realized_pnl(&self, wallet: &str) -> Decimal {
+        let wallet = normalize_portfolio_wallet(wallet);
+        if wallet.is_empty() {
+            return Decimal::ZERO;
+        }
+
+        self.recent_realized_trade_points
+            .iter()
+            .filter(|point| normalize_portfolio_wallet(&point.source_wallet) == wallet)
+            .map(|point| point.pnl)
+            .sum()
+    }
+
     pub fn window_split(&self, window_day: NaiveDate) -> PortfolioWindowSummary {
         let mut summary = PortfolioWindowSummary::default();
         for position in self.active_positions() {
@@ -850,32 +883,27 @@ fn normalize_portfolio_wallet(wallet: &str) -> String {
     wallet.trim().to_ascii_lowercase()
 }
 
-fn normalize_position_outcome(outcome: &str) -> String {
+pub fn normalize_position_outcome(outcome: &str) -> String {
     outcome.trim().to_ascii_uppercase()
 }
 
-fn select_safe_exit_fallback<'a>(
-    candidates: Vec<&'a PortfolioPosition>,
-    asset_hint: Option<&str>,
-) -> Option<(&'a PortfolioPosition, String)> {
+pub fn position_outcome_is_unknown(outcome: &str) -> bool {
+    let outcome = normalize_position_outcome(outcome);
+    outcome.is_empty()
+        || matches!(
+            outcome.as_str(),
+            "UNKNOWN" | "UNK" | "N/A" | "NA" | "NULL" | "NONE" | "UNRESOLVED"
+        )
+}
+
+fn select_safe_exit_fallback(
+    candidates: Vec<&PortfolioPosition>,
+) -> Option<(&PortfolioPosition, String)> {
     if candidates.len() == 1 {
         return Some((
             candidates[0],
             "same_wallet_same_condition_single_candidate".to_owned(),
         ));
-    }
-
-    if let Some(asset) = asset_hint {
-        let asset_matches = candidates
-            .into_iter()
-            .filter(|position| position.asset == asset)
-            .collect::<Vec<_>>();
-        if asset_matches.len() == 1 {
-            return Some((
-                asset_matches[0],
-                "same_wallet_same_condition_asset_hint".to_owned(),
-            ));
-        }
     }
 
     None

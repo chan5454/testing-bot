@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::config::Settings;
-use crate::models::{ActivityEntry, PortfolioSnapshot, PositionKey};
+use crate::models::{ActivityEntry, PortfolioSnapshot, PositionKey, position_outcome_is_unknown};
 use crate::position_registry::PositionRegistry;
 use crate::position_resolver::{PositionResolver, ResolveResult, ResolvedResolverPosition};
 use crate::wallet::wallet_matching::MatchedTrackedTrade;
@@ -21,6 +21,8 @@ pub struct ExitResolutionBuffer {
     initial_retry_interval: Duration,
     max_retry_interval: Duration,
     pending: Arc<Mutex<HashMap<String, PendingExitIntent>>>,
+    dedupe_window: Duration,
+    recent_source_exits: Arc<Mutex<HashMap<String, DateTime<Utc>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -29,7 +31,14 @@ pub enum SourceExitResolution {
     MatchedByFallback(PositionKey, String),
     BoundToPending(BoundPendingDisposition),
     DeferredRetry(RetryDisposition),
+    NotActionable(NonActionableExit),
     Failed(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct NonActionableExit {
+    pub reason: &'static str,
+    pub detail: String,
 }
 
 #[derive(Clone, Debug)]
@@ -73,7 +82,23 @@ impl ExitResolutionBuffer {
             initial_retry_interval: settings.unresolved_exit_initial_retry,
             max_retry_interval: settings.unresolved_exit_max_retry,
             pending: Arc::new(Mutex::new(pending)),
+            dedupe_window: settings.source_exit_dedupe_window,
+            recent_source_exits: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    pub async fn claim_source_exit(&self, entry: &ActivityEntry, now: DateTime<Utc>) -> bool {
+        let key = source_exit_dedupe_key(entry, self.dedupe_window);
+        let retain_after = now
+            - chrono::TimeDelta::from_std(self.dedupe_window.max(Duration::from_millis(1)))
+                .unwrap_or_else(|_| chrono::TimeDelta::zero());
+        let mut recent = self.recent_source_exits.lock().await;
+        recent.retain(|_, seen_at| *seen_at >= retain_after);
+        if recent.contains_key(&key) {
+            return false;
+        }
+        recent.insert(key, now);
+        true
     }
 
     pub async fn resolve_source_exit(
@@ -114,6 +139,16 @@ impl ExitResolutionBuffer {
                 ));
             }
             ResolveResult::NotFound => {}
+        }
+
+        if let Some(non_actionable) = non_actionable_exit(
+            snapshot,
+            position_registry,
+            position_resolver,
+            &matched_trade.entry,
+            now,
+        ) {
+            return Ok(SourceExitResolution::NotActionable(non_actionable));
         }
 
         let requested_key = matched_trade.entry.position_key();
@@ -208,6 +243,13 @@ impl ExitResolutionBuffer {
                 ));
             }
             ResolveResult::NotFound => {}
+        }
+
+        if let Some(non_actionable) =
+            non_actionable_exit(snapshot, position_registry, position_resolver, &event, now)
+        {
+            self.remove_retry(retry_key).await?;
+            return Ok(SourceExitResolution::NotActionable(non_actionable));
         }
 
         let requested_key = event.position_key();
@@ -359,9 +401,73 @@ fn load_pending_exits(path: &PathBuf) -> Result<HashMap<String, PendingExitInten
 
     Ok(intents
         .into_iter()
-        .filter(|intent| intent.expires_at > now)
+        .filter(|intent| intent.expires_at > now && !position_outcome_is_unknown(&intent.outcome))
         .map(|intent| (intent.retry_key.clone(), intent))
         .collect())
+}
+
+fn non_actionable_exit(
+    snapshot: &PortfolioSnapshot,
+    position_registry: &PositionRegistry,
+    position_resolver: &PositionResolver,
+    entry: &ActivityEntry,
+    now: DateTime<Utc>,
+) -> Option<NonActionableExit> {
+    let requested_key = entry.position_key();
+    if !entry.side.eq_ignore_ascii_case("SELL") {
+        return Some(NonActionableExit {
+            reason: "source_exit_normalization_failed",
+            detail: format!("source exit side is not SELL: {}", entry.side),
+        });
+    }
+    if requested_key.source_wallet.is_empty() {
+        return Some(NonActionableExit {
+            reason: "source_exit_normalization_failed",
+            detail: "source exit wallet is empty after normalization".to_owned(),
+        });
+    }
+    if requested_key.condition_id.trim().is_empty()
+        || requested_key.condition_id.eq_ignore_ascii_case("UNKNOWN")
+    {
+        return Some(NonActionableExit {
+            reason: "source_exit_normalization_failed",
+            detail: "source exit condition_id is missing or UNKNOWN".to_owned(),
+        });
+    }
+    if position_outcome_is_unknown(&requested_key.outcome) {
+        return Some(NonActionableExit {
+            reason: "source_exit_normalization_failed",
+            detail: format!(
+                "source exit outcome is not PositionKey-actionable: {}",
+                entry.outcome
+            ),
+        });
+    }
+
+    let has_candidate = snapshot.active_position_count_for_wallet_condition(
+        &requested_key.source_wallet,
+        &requested_key.condition_id,
+    ) > 0
+        || position_resolver.candidate_count_for_source_condition(
+            &requested_key.source_wallet,
+            &requested_key.condition_id,
+            now,
+        ) > 0
+        || position_registry.has_open_position_for_wallet_market(
+            &requested_key.source_wallet,
+            &requested_key.condition_id,
+        );
+    if !has_candidate {
+        return Some(NonActionableExit {
+            reason: "source_exit_not_owned",
+            detail: format!(
+                "no pending/open/closing copied position candidate for wallet {} condition {}",
+                requested_key.source_wallet, requested_key.condition_id
+            ),
+        });
+    }
+
+    None
 }
 
 fn unresolved_exit_reason(
@@ -475,13 +581,48 @@ fn exit_intent_key(entry: &ActivityEntry, retry_interval: Duration) -> String {
         normalized_timestamp_ms(entry.timestamp) / retry_interval.as_millis().max(1) as i64;
     let requested_key = entry.position_key();
     format!(
-        "{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}",
         requested_key.source_wallet,
+        stable_transaction_component(entry),
+        stable_asset_component(entry),
         requested_key.condition_id,
         requested_key.outcome,
         entry.side.to_ascii_uppercase(),
         timestamp_bucket
     )
+}
+
+fn source_exit_dedupe_key(entry: &ActivityEntry, dedupe_window: Duration) -> String {
+    let timestamp_bucket =
+        normalized_timestamp_ms(entry.timestamp) / dedupe_window.as_millis().max(1) as i64;
+    let requested_key = entry.position_key();
+    format!(
+        "{}:{}:{}:{}:{}:{}",
+        requested_key.source_wallet,
+        stable_transaction_component(entry),
+        stable_asset_component(entry),
+        requested_key.condition_id,
+        entry.side.to_ascii_uppercase(),
+        timestamp_bucket
+    )
+}
+
+fn stable_transaction_component(entry: &ActivityEntry) -> String {
+    let tx_hash = entry.transaction_hash.trim();
+    if tx_hash.is_empty() {
+        entry.dedupe_key()
+    } else {
+        tx_hash.to_ascii_lowercase()
+    }
+}
+
+fn stable_asset_component(entry: &ActivityEntry) -> String {
+    let asset = entry.asset.trim();
+    if asset.is_empty() {
+        entry.condition_id.clone()
+    } else {
+        asset.to_owned()
+    }
 }
 
 fn normalized_timestamp_ms(timestamp: i64) -> i64 {
@@ -548,6 +689,14 @@ mod tests {
             slug: "sample".to_owned(),
             event_slug: "sample".to_owned(),
             outcome: "YES".to_owned(),
+        }
+    }
+
+    fn sample_entry_with_outcome(side: &str, outcome: &str) -> ActivityEntry {
+        ActivityEntry {
+            outcome: outcome.to_owned(),
+            transaction_hash: format!("0xhash-{side}-{outcome}"),
+            ..sample_entry(side)
         }
     }
 
@@ -655,11 +804,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unresolved_exit_uses_stepped_backoff_before_expiry() {
+    async fn unknown_outcome_without_owned_candidate_is_not_queued() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let settings = sample_settings(temp_dir.path().to_path_buf());
         let buffer = ExitResolutionBuffer::load(&settings).expect("buffer");
         let registry = PositionRegistry::load(&settings).expect("registry");
+        let resolver = PositionResolver::load(&settings).expect("resolver");
+        let now = Utc::now();
+        let entry = sample_entry_with_outcome("SELL", "UNKNOWN");
+
+        let resolution = buffer
+            .resolve_source_exit(
+                &PortfolioSnapshot {
+                    fetched_at: now,
+                    total_value: dec!(200),
+                    total_exposure: dec!(0),
+                    cash_balance: dec!(200),
+                    realized_pnl: dec!(0),
+                    unrealized_pnl: dec!(0),
+                    positions: Vec::new(),
+                    ..PortfolioSnapshot::default()
+                },
+                &registry,
+                &resolver,
+                &matched_trade_from_entry(&entry),
+                now,
+            )
+            .await
+            .expect("resolution");
+
+        match resolution {
+            SourceExitResolution::NotActionable(non_actionable) => {
+                assert_eq!(non_actionable.reason, "source_exit_normalization_failed");
+            }
+            other => panic!("expected non-actionable exit, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sell_for_wallet_with_no_owned_position_is_not_queued() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let settings = sample_settings(temp_dir.path().to_path_buf());
+        let buffer = ExitResolutionBuffer::load(&settings).expect("buffer");
+        let registry = PositionRegistry::load(&settings).expect("registry");
+        let resolver = PositionResolver::load(&settings).expect("resolver");
+        let now = Utc::now();
+        let entry = sample_entry("SELL");
+
+        let resolution = buffer
+            .resolve_source_exit(
+                &PortfolioSnapshot {
+                    fetched_at: now,
+                    total_value: dec!(200),
+                    total_exposure: dec!(0),
+                    cash_balance: dec!(200),
+                    realized_pnl: dec!(0),
+                    unrealized_pnl: dec!(0),
+                    positions: Vec::new(),
+                    ..PortfolioSnapshot::default()
+                },
+                &registry,
+                &resolver,
+                &matched_trade_from_entry(&entry),
+                now,
+            )
+            .await
+            .expect("resolution");
+
+        match resolution {
+            SourceExitResolution::NotActionable(non_actionable) => {
+                assert_eq!(non_actionable.reason, "source_exit_not_owned");
+            }
+            other => panic!("expected non-actionable not-owned exit, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_source_exit_claim_is_suppressed() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let settings = sample_settings(temp_dir.path().to_path_buf());
+        let buffer = ExitResolutionBuffer::load(&settings).expect("buffer");
+        let entry = sample_entry("SELL");
+        let now = Utc::now();
+
+        assert!(buffer.claim_source_exit(&entry, now).await);
+        assert!(
+            !buffer
+                .claim_source_exit(&entry, now + chrono::TimeDelta::milliseconds(100))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_exit_uses_stepped_backoff_only_for_owned_registry_candidate() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let settings = sample_settings(temp_dir.path().to_path_buf());
+        let buffer = ExitResolutionBuffer::load(&settings).expect("buffer");
+        let registry = PositionRegistry::load(&settings).expect("registry");
+        registry
+            .sync_from_portfolio(&sample_snapshot())
+            .expect("seed registry candidate");
         let resolver = PositionResolver::load(&settings).expect("resolver");
         let entry = sample_entry("SELL");
         let now = Utc::now();

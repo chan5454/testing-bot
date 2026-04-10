@@ -183,6 +183,7 @@ pub struct Settings {
     pub unresolved_exit_initial_retry: Duration,
     pub unresolved_exit_total_window: Duration,
     pub unresolved_exit_max_retry: Duration,
+    pub source_exit_dedupe_window: Duration,
     pub position_pending_open_ttl: Duration,
     #[allow(dead_code)]
     pub rpc_global_rate_limit_per_second: u32,
@@ -333,6 +334,7 @@ impl Settings {
             unresolved_exit_initial_retry: Duration::from_millis(250),
             unresolved_exit_total_window: Duration::from_secs(30),
             unresolved_exit_max_retry: Duration::from_secs(4),
+            source_exit_dedupe_window: Duration::from_millis(2_000),
             position_pending_open_ttl: Duration::from_secs(20),
             rpc_global_rate_limit_per_second: 10,
             rpc_per_market_rate_limit_per_second: 3,
@@ -624,6 +626,10 @@ impl Settings {
             unresolved_exit_max_retry: Duration::from_millis(parse_or_default(
                 "UNRESOLVED_EXIT_MAX_RETRY_MS",
                 4_000_u64,
+            )?),
+            source_exit_dedupe_window: Duration::from_millis(parse_or_default(
+                "SOURCE_EXIT_DEDUPE_WINDOW_MS",
+                2_000_u64,
             )?),
             position_pending_open_ttl: Duration::from_millis(parse_or_default(
                 "POSITION_PENDING_OPEN_TTL_MS",
