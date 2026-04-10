@@ -54,7 +54,7 @@ use position_registry::PositionRegistry;
 use position_resolver::PositionResolver;
 use prediction::{PredictionEngine, build_predicted_trade, signal_cache_key};
 use raw_activity_logger::RawActivityLogger;
-use risk::{CopyDecision, RiskEngine, SkipReason};
+use risk::{CopyDecision, RiskEngine, SkipReason, TradingMode};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -305,14 +305,14 @@ impl ExecutionAnalyticsTracker {
 
     async fn record_risk_event(
         &self,
-        event_name: &str,
+        event_name: impl AsRef<str>,
         portfolio: Option<&models::PortfolioSnapshot>,
     ) {
         let snapshot = {
             let mut state = self.state.lock().await;
             state.summary_generated_at = Utc::now();
             state.trade_day = Utc::now().date_naive().to_string();
-            increment_string_counter(&mut state.risk_event_counts, event_name);
+            increment_string_counter(&mut state.risk_event_counts, event_name.as_ref());
             if let Some(portfolio) = portfolio {
                 refresh_analytics_from_portfolio(&mut state, portfolio, self.start_capital_usd);
             }
@@ -1971,6 +1971,7 @@ async fn process_trade(
         .set_portfolio_value(current_portfolio.total_value)
         .await;
     let market_quality_observation = risk.observe_source_trade(entry);
+    let risk_context = risk.entry_context(&current_portfolio);
     let mut resolved_exit_position = if matches!(side, ExecutionSide::Sell) {
         current_portfolio.resolve_position_to_sell(entry)
     } else {
@@ -2237,7 +2238,7 @@ async fn process_trade(
                 "source exit was resolved, but no local owned-position metadata was available",
             )),
         },
-        ExecutionSide::Buy => risk.evaluate(entry, &current_portfolio),
+        ExecutionSide::Buy => risk.evaluate_with_context(entry, &current_portfolio, risk_context),
     };
     let decision = match evaluation {
         Ok(decision) => decision,
@@ -2265,7 +2266,7 @@ async fn process_trade(
     }
     if matches!(side, ExecutionSide::Buy)
         && let Err(reason) =
-            risk.enforce_entry_quality_pre_quote(entry, &market_quality_observation)
+            risk.enforce_entry_quality_pre_quote(entry, &market_quality_observation, risk_context)
     {
         record_trade_skip(
             entry,
@@ -2477,6 +2478,7 @@ async fn process_trade(
             entry,
             &resolved_quote.quote,
             &market_quality_observation,
+            risk_context,
         )
     {
         finalize_failed_pending_open(
@@ -2617,6 +2619,23 @@ async fn process_trade(
             .await;
         }
         return Ok(TradeProcessingOutcome::Skipped(reason));
+    }
+
+    if matches!(side, ExecutionSide::Buy) {
+        risk.record_entry_allowed();
+        analytics
+            .record_risk_event(risk_context.mode.metric_name(), Some(&current_portfolio))
+            .await;
+        if risk_context.mode == TradingMode::Drawdown {
+            analytics
+                .record_risk_event("trades_allowed_in_drawdown", Some(&current_portfolio))
+                .await;
+        }
+        if risk_context.no_trade_relaxation_active {
+            analytics
+                .record_risk_event("no_trade_relaxation_active", Some(&current_portfolio))
+                .await;
+        }
     }
 
     let execution_started = Instant::now();
@@ -3235,6 +3254,19 @@ async fn record_trade_skip(
     ) {
         analytics.record_risk_event(reason.code, portfolio).await;
     }
+    if reason.code == "hard_stop_triggered" {
+        analytics
+            .record_risk_event("trades_blocked_by_drawdown", portfolio)
+            .await;
+    }
+    if entry.side.eq_ignore_ascii_case("BUY") && is_filter_rejection_reason(reason.code) {
+        analytics
+            .record_risk_event(
+                format!("filter_rejections_by_reason:{}", reason.code),
+                portfolio,
+            )
+            .await;
+    }
     health
         .record_skip_latency(skip_processing_ms, reason.code)
         .await;
@@ -3251,6 +3283,21 @@ async fn record_trade_skip(
         warn!(?error, "failed to persist skipped trade latency event");
     }
     health.increment_skipped().await;
+}
+
+fn is_filter_rejection_reason(reason_code: &str) -> bool {
+    matches!(
+        reason_code,
+        "market_ultra_short_filtered"
+            | "low_visible_liquidity"
+            | "spread_too_wide"
+            | "price_chased_strict"
+            | "too_late_strict"
+            | "wallet_too_fast"
+            | "market_cooldown"
+            | "conflicting_wallet_signal"
+            | "trade_quality_rejected"
+    )
 }
 
 fn normalized_execution_side(entry: &ActivityEntry) -> ExecutionSide {

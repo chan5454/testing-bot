@@ -1,5 +1,6 @@
 use rust_decimal::Decimal;
 use rust_decimal::RoundingStrategy;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{Display, Formatter};
@@ -31,6 +32,29 @@ pub struct CopyDecision {
     pub max_slippage_bps: u32,
     pub max_source_price_slippage_bps: u32,
     pub min_edge_threshold: Decimal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TradingMode {
+    Normal,
+    Drawdown,
+    HardStop,
+}
+
+impl TradingMode {
+    pub fn metric_name(self) -> &'static str {
+        match self {
+            Self::Normal => "trading_mode_normal",
+            Self::Drawdown => "trading_mode_drawdown",
+            Self::HardStop => "trading_mode_hard_stop",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdaptiveRiskContext {
+    pub mode: TradingMode,
+    pub no_trade_relaxation_active: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +114,10 @@ pub struct MarketQualityObservation {
 struct MarketQualityState {
     wallets: HashMap<String, WalletBehaviorStats>,
     markets: HashMap<String, MarketBehaviorStats>,
+    first_entry_signal_after_last_allow_ms: Option<i64>,
+    last_entry_signal_seen_at_ms: Option<i64>,
+    entry_signals_seen_since_last_allow: u32,
+    last_entry_allowed_at_ms: Option<i64>,
 }
 
 #[derive(Default)]
@@ -154,38 +182,54 @@ impl RiskEngine {
             .market_quality_state
             .write()
             .expect("market quality write lock");
-        let wallet_stats = state.wallets.entry(wallet.clone()).or_default();
-        while wallet_stats
-            .recent_trade_timestamps_ms
-            .front()
-            .is_some_and(|timestamp_ms| event_timestamp_ms.saturating_sub(*timestamp_ms) >= 60_000)
-        {
-            wallet_stats.recent_trade_timestamps_ms.pop_front();
-        }
+        let (wallet_trades_per_minute, wallet_avg_hold_ms, wallet_hold_samples) = {
+            let wallet_stats = state.wallets.entry(wallet.clone()).or_default();
+            while wallet_stats
+                .recent_trade_timestamps_ms
+                .front()
+                .is_some_and(|timestamp_ms| {
+                    event_timestamp_ms.saturating_sub(*timestamp_ms) >= 60_000
+                })
+            {
+                wallet_stats.recent_trade_timestamps_ms.pop_front();
+            }
 
-        if matches!(side, ExecutionSide::Sell)
-            && let Some(open_timestamp_ms) = wallet_stats
-                .open_entries_by_key
-                .remove(&entry.position_key())
-            && event_timestamp_ms > open_timestamp_ms
-        {
-            wallet_stats.total_hold_ms = wallet_stats
-                .total_hold_ms
-                .saturating_add(event_timestamp_ms.saturating_sub(open_timestamp_ms) as u128);
-            wallet_stats.hold_samples = wallet_stats.hold_samples.saturating_add(1);
-        }
+            if matches!(side, ExecutionSide::Sell)
+                && let Some(open_timestamp_ms) = wallet_stats
+                    .open_entries_by_key
+                    .remove(&entry.position_key())
+                && event_timestamp_ms > open_timestamp_ms
+            {
+                wallet_stats.total_hold_ms = wallet_stats
+                    .total_hold_ms
+                    .saturating_add(event_timestamp_ms.saturating_sub(open_timestamp_ms) as u128);
+                wallet_stats.hold_samples = wallet_stats.hold_samples.saturating_add(1);
+            }
 
-        wallet_stats
-            .recent_trade_timestamps_ms
-            .push_back(event_timestamp_ms);
-        if matches!(side, ExecutionSide::Buy) {
             wallet_stats
-                .open_entries_by_key
-                .insert(entry.position_key(), event_timestamp_ms);
+                .recent_trade_timestamps_ms
+                .push_back(event_timestamp_ms);
+            if matches!(side, ExecutionSide::Buy) {
+                wallet_stats
+                    .open_entries_by_key
+                    .insert(entry.position_key(), event_timestamp_ms);
+            }
+
+            (
+                wallet_stats.recent_trade_timestamps_ms.len() as u32,
+                average_hold_ms(wallet_stats),
+                wallet_stats.hold_samples,
+            )
+        };
+
+        if matches!(side, ExecutionSide::Buy) {
+            state.entry_signals_seen_since_last_allow =
+                state.entry_signals_seen_since_last_allow.saturating_add(1);
+            state.last_entry_signal_seen_at_ms = Some(event_timestamp_ms);
+            if state.first_entry_signal_after_last_allow_ms.is_none() {
+                state.first_entry_signal_after_last_allow_ms = Some(event_timestamp_ms);
+            }
         }
-        let wallet_trades_per_minute = wallet_stats.recent_trade_timestamps_ms.len() as u32;
-        let wallet_avg_hold_ms = average_hold_ms(wallet_stats);
-        let wallet_hold_samples = wallet_stats.hold_samples;
 
         let market_stats = state.markets.entry(entry.condition_id.clone()).or_default();
         while market_stats.recent_signals.front().is_some_and(|recent| {
@@ -228,20 +272,80 @@ impl RiskEngine {
         }
     }
 
+    pub fn entry_context(&self, portfolio: &PortfolioSnapshot) -> AdaptiveRiskContext {
+        AdaptiveRiskContext {
+            mode: self.trading_mode(portfolio),
+            no_trade_relaxation_active: self.no_trade_relaxation_active(),
+        }
+    }
+
+    pub fn trading_mode(&self, portfolio: &PortfolioSnapshot) -> TradingMode {
+        let current_drawdown = portfolio.current_drawdown_pct.max(Decimal::ZERO);
+        if portfolio.hard_stop_active
+            || (self.settings.hard_stop_drawdown_pct > Decimal::ZERO
+                && current_drawdown >= self.settings.hard_stop_drawdown_pct)
+        {
+            return TradingMode::HardStop;
+        }
+
+        if portfolio.drawdown_guard_active
+            || (self.settings.max_drawdown_pct > Decimal::ZERO
+                && current_drawdown >= self.settings.max_drawdown_pct)
+        {
+            return TradingMode::Drawdown;
+        }
+
+        TradingMode::Normal
+    }
+
+    pub fn record_entry_allowed(&self) {
+        let now_ms = current_time_ms().unwrap_or_default() as i64;
+        let mut state = self
+            .market_quality_state
+            .write()
+            .expect("market quality write lock");
+        state.last_entry_allowed_at_ms = Some(now_ms);
+        state.entry_signals_seen_since_last_allow = 0;
+        state.first_entry_signal_after_last_allow_ms = None;
+        state.last_entry_signal_seen_at_ms = None;
+    }
+
+    fn no_trade_relaxation_active(&self) -> bool {
+        if self.settings.no_trade_timeout.is_zero() {
+            return false;
+        }
+
+        let now_ms = current_time_ms().unwrap_or_default() as i64;
+        let timeout_ms = self
+            .settings
+            .no_trade_timeout
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let state = self
+            .market_quality_state
+            .read()
+            .expect("market quality read lock");
+        if state.entry_signals_seen_since_last_allow == 0 {
+            return false;
+        }
+
+        let Some(first_signal_ms) = state.first_entry_signal_after_last_allow_ms else {
+            return false;
+        };
+        let Some(last_signal_ms) = state.last_entry_signal_seen_at_ms else {
+            return false;
+        };
+
+        now_ms.saturating_sub(first_signal_ms) >= timeout_ms
+            && now_ms.saturating_sub(last_signal_ms) <= timeout_ms
+    }
+
     pub fn enforce_entry_quality_pre_quote(
         &self,
         entry: &ActivityEntry,
         observation: &MarketQualityObservation,
+        context: AdaptiveRiskContext,
     ) -> Result<(), SkipReason> {
-        if !self.settings.enable_ultra_short_markets
-            && observation.market_type == MarketType::UltraShort
-        {
-            return Err(SkipReason::new(
-                "market_ultra_short_filtered",
-                format!("market '{}' was classified as ultra-short", entry.title),
-            ));
-        }
-
         if let Some(delay_ms) = observation.signal_age_ms
             && delay_ms > self.settings.max_copy_delay_ms
         {
@@ -254,8 +358,9 @@ impl RiskEngine {
             ));
         }
 
-        if self.settings.max_wallet_trades_per_min > 0
-            && observation.wallet_trades_per_minute > self.settings.max_wallet_trades_per_min
+        let max_wallet_trades_per_min = effective_wallet_trades_per_minute(&self.settings, context);
+        if max_wallet_trades_per_min > 0
+            && observation.wallet_trades_per_minute > max_wallet_trades_per_min
         {
             return Err(SkipReason::new(
                 "wallet_too_fast",
@@ -263,16 +368,17 @@ impl RiskEngine {
                     "wallet {} traded {} times in the last minute above max {}",
                     entry.proxy_wallet,
                     observation.wallet_trades_per_minute,
-                    self.settings.max_wallet_trades_per_min
+                    max_wallet_trades_per_min
                 ),
             ));
         }
 
-        if self.settings.min_wallet_avg_hold_ms > 0
+        let min_wallet_avg_hold_ms = effective_min_wallet_avg_hold_ms(&self.settings, context);
+        if min_wallet_avg_hold_ms > 0
             && observation.wallet_hold_samples > 0
             && observation
                 .wallet_avg_hold_ms
-                .is_some_and(|hold_ms| hold_ms < self.settings.min_wallet_avg_hold_ms)
+                .is_some_and(|hold_ms| hold_ms < min_wallet_avg_hold_ms)
         {
             return Err(SkipReason::new(
                 "wallet_too_fast",
@@ -280,7 +386,7 @@ impl RiskEngine {
                     "wallet {} average hold {}ms is below minimum {}ms",
                     entry.proxy_wallet,
                     observation.wallet_avg_hold_ms.unwrap_or_default(),
-                    self.settings.min_wallet_avg_hold_ms
+                    min_wallet_avg_hold_ms
                 ),
             ));
         }
@@ -314,19 +420,19 @@ impl RiskEngine {
         entry: &ActivityEntry,
         quote: &BestQuote,
         observation: &MarketQualityObservation,
+        context: AdaptiveRiskContext,
     ) -> Result<TradeQualityScore, SkipReason> {
         let best_bid_size = quote.best_bid_size.unwrap_or(Decimal::ZERO);
         let best_ask_size = quote.best_ask_size.unwrap_or(Decimal::ZERO);
-        if best_bid_size < self.settings.min_visible_liquidity
-            || best_ask_size < self.settings.min_visible_liquidity
-        {
+        let min_visible_liquidity = effective_min_visible_liquidity(&self.settings, context);
+        if best_bid_size < min_visible_liquidity || best_ask_size < min_visible_liquidity {
             return Err(SkipReason::new(
                 "low_visible_liquidity",
                 format!(
                     "visible top-of-book liquidity bid={} ask={} is below minimum {}",
                     best_bid_size.round_dp(4),
                     best_ask_size.round_dp(4),
-                    self.settings.min_visible_liquidity.round_dp(4)
+                    min_visible_liquidity.round_dp(4)
                 ),
             ));
         }
@@ -354,15 +460,14 @@ impl RiskEngine {
                 ),
             ));
         };
-        if self.settings.max_spread_bps > 0
-            && spread_bps > Decimal::from(self.settings.max_spread_bps)
-        {
+        let max_spread_bps = effective_max_spread_bps(&self.settings, context);
+        if max_spread_bps > 0 && spread_bps > Decimal::from(max_spread_bps) {
             return Err(SkipReason::new(
                 "spread_too_wide",
                 format!(
                     "spread {} bps is above max {} bps",
                     spread_bps.round_dp(2),
-                    self.settings.max_spread_bps
+                    max_spread_bps
                 ),
             ));
         }
@@ -374,16 +479,15 @@ impl RiskEngine {
             )
         })?;
         let slippage = (best_ask - source_price).abs();
-        if self.settings.max_entry_slippage > Decimal::ZERO
-            && slippage > self.settings.max_entry_slippage
-        {
+        let max_entry_slippage = effective_max_entry_slippage(&self.settings, context);
+        if max_entry_slippage > Decimal::ZERO && slippage > max_entry_slippage {
             return Err(SkipReason::new(
                 "price_chased_strict",
                 format!(
                     "entry price moved {} above source price {} with max {}",
                     slippage.round_dp(4),
                     source_price.round_dp(4),
-                    self.settings.max_entry_slippage.round_dp(4)
+                    max_entry_slippage.round_dp(4)
                 ),
             ));
         }
@@ -391,16 +495,10 @@ impl RiskEngine {
         let quality = TradeQualityScore {
             liquidity_score: positive_ratio_score(
                 best_bid_size.min(best_ask_size),
-                self.settings.min_visible_liquidity,
+                min_visible_liquidity,
             ),
-            spread_score: inverse_ratio_score(
-                spread_bps,
-                Decimal::from(self.settings.max_spread_bps.max(1)),
-            ),
-            slippage_score: inverse_ratio_score(
-                slippage,
-                self.settings.max_entry_slippage.max(dec!(0.0001)),
-            ),
+            spread_score: inverse_ratio_score(spread_bps, Decimal::from(max_spread_bps.max(1))),
+            slippage_score: inverse_ratio_score(slippage, max_entry_slippage.max(dec!(0.0001))),
             wallet_score: wallet_quality_score(&self.settings, observation),
             latency_score: latency_quality_score(self.settings.max_copy_delay_ms, observation),
             total_score: Decimal::ZERO,
@@ -416,13 +514,44 @@ impl RiskEngine {
             ..quality
         };
 
-        if quality.total_score < self.settings.min_trade_quality_score {
+        let min_quality = effective_min_trade_quality_score(
+            &self.settings,
+            observation.market_type == MarketType::UltraShort,
+            context,
+        );
+        if observation.market_type == MarketType::UltraShort
+            && !self.settings.enable_ultra_short_markets
+        {
+            let ultra_liquidity_min = (min_visible_liquidity * dec!(1.5)).round_dp(4);
+            let ultra_slippage_max = (max_entry_slippage * dec!(0.5)).round_dp(4);
+            if best_bid_size < ultra_liquidity_min
+                || best_ask_size < ultra_liquidity_min
+                || slippage > ultra_slippage_max
+                || quality.total_score < min_quality
+            {
+                return Err(SkipReason::new(
+                    "market_ultra_short_filtered",
+                    format!(
+                        "ultra-short market requires quality >= {}, liquidity >= {}, slippage <= {}; got quality {}, bid {}, ask {}, slippage {}",
+                        min_quality.round_dp(4),
+                        ultra_liquidity_min,
+                        ultra_slippage_max,
+                        quality.total_score.round_dp(4),
+                        best_bid_size.round_dp(4),
+                        best_ask_size.round_dp(4),
+                        slippage.round_dp(4)
+                    ),
+                ));
+            }
+        }
+
+        if quality.total_score < min_quality {
             return Err(SkipReason::new(
                 "trade_quality_rejected",
                 format!(
                     "trade quality {} is below minimum {} (liq={} spread={} slip={} wallet={} latency={})",
                     quality.total_score.round_dp(4),
-                    self.settings.min_trade_quality_score.round_dp(4),
+                    min_quality.round_dp(4),
                     quality.liquidity_score.round_dp(4),
                     quality.spread_score.round_dp(4),
                     quality.slippage_score.round_dp(4),
@@ -484,13 +613,24 @@ impl RiskEngine {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn evaluate(
         &self,
         entry: &ActivityEntry,
         portfolio: &PortfolioSnapshot,
     ) -> Result<CopyDecision, SkipReason> {
+        let context = self.entry_context(portfolio);
+        self.evaluate_with_context(entry, portfolio, context)
+    }
+
+    pub fn evaluate_with_context(
+        &self,
+        entry: &ActivityEntry,
+        portfolio: &PortfolioSnapshot,
+        context: AdaptiveRiskContext,
+    ) -> Result<CopyDecision, SkipReason> {
         match entry.side.as_str() {
-            "BUY" if self.settings.allow_buy => self.evaluate_buy(entry, portfolio),
+            "BUY" if self.settings.allow_buy => self.evaluate_buy(entry, portfolio, context),
             "SELL" if self.settings.allow_sell => Err(SkipReason::new(
                 "sell_requires_resolved_position",
                 "sell risk evaluation requires a resolver/portfolio-owned position; use evaluate_sell_from_resolved_position",
@@ -514,6 +654,7 @@ impl RiskEngine {
         &self,
         entry: &ActivityEntry,
         portfolio: &PortfolioSnapshot,
+        context: AdaptiveRiskContext,
     ) -> Result<CopyDecision, SkipReason> {
         let source_notional = entry.usdc_decimal().map_err(|error| {
             SkipReason::new(
@@ -555,7 +696,7 @@ impl RiskEngine {
         let remaining_market =
             (self.market_exposure_cap(portfolio) - market_exposure).max(Decimal::ZERO);
 
-        self.enforce_entry_risk_limits(entry, portfolio)?;
+        self.enforce_entry_risk_limits(entry, portfolio, context)?;
         let price_band_rules = self.price_band_rules(source_price, price_band)?;
         tracing::info!(
             price_band = price_band.as_str(),
@@ -632,6 +773,7 @@ impl RiskEngine {
         }
         let scaled_notional = (base_scaled_notional
             * price_band_rules.size_multiplier
+            * mode_size_multiplier(&self.settings, context.mode)
             * wallet_performance_multiplier(portfolio, &entry.proxy_wallet))
         .min(self.settings.max_copy_notional_usd)
         .max(Decimal::ZERO);
@@ -659,11 +801,19 @@ impl RiskEngine {
             size_was_scaled: allowed_notional < scaled_notional,
             position_key: Some(requested_key),
             price_band,
-            max_market_spread_bps: price_band_rules.max_spread_bps,
+            max_market_spread_bps: relax_bps(
+                price_band_rules.max_spread_bps,
+                &self.settings,
+                context,
+            ),
             min_top_of_book_ratio: self.settings.min_top_of_book_ratio,
-            min_visible_liquidity_usd: self.settings.min_liquidity.max(Decimal::ZERO),
-            max_slippage_bps: price_band_rules.max_slippage_bps,
-            max_source_price_slippage_bps: price_band_rules.max_slippage_bps,
+            min_visible_liquidity_usd: effective_execution_min_liquidity(&self.settings, context),
+            max_slippage_bps: relax_bps(price_band_rules.max_slippage_bps, &self.settings, context),
+            max_source_price_slippage_bps: relax_bps(
+                price_band_rules.max_slippage_bps,
+                &self.settings,
+                context,
+            ),
             min_edge_threshold: self.settings.min_edge_threshold.max(Decimal::ZERO),
         })
     }
@@ -763,34 +913,18 @@ impl RiskEngine {
         &self,
         entry: &ActivityEntry,
         portfolio: &PortfolioSnapshot,
+        context: AdaptiveRiskContext,
     ) -> Result<(), SkipReason> {
         let now = Utc::now();
         let current_drawdown = portfolio.current_drawdown_pct.max(Decimal::ZERO);
 
-        if portfolio.hard_stop_active
-            || (self.settings.hard_stop_drawdown_pct > Decimal::ZERO
-                && current_drawdown >= self.settings.hard_stop_drawdown_pct)
-        {
+        if context.mode == TradingMode::HardStop {
             return Err(SkipReason::new(
                 "hard_stop_triggered",
                 format!(
                     "hard stop active at drawdown {} with threshold {}",
                     current_drawdown.round_dp(4),
                     self.settings.hard_stop_drawdown_pct.round_dp(4)
-                ),
-            ));
-        }
-
-        if portfolio.drawdown_guard_active
-            || (self.settings.max_drawdown_pct > Decimal::ZERO
-                && current_drawdown >= self.settings.max_drawdown_pct)
-        {
-            return Err(SkipReason::new(
-                "drawdown_guard_triggered",
-                format!(
-                    "current drawdown {} is above max {}",
-                    current_drawdown.round_dp(4),
-                    self.settings.max_drawdown_pct.round_dp(4)
                 ),
             ));
         }
@@ -1006,6 +1140,110 @@ fn wallet_performance_multiplier(portfolio: &PortfolioSnapshot, wallet: &str) ->
     multiplier
 }
 
+fn mode_size_multiplier(settings: &Settings, mode: TradingMode) -> Decimal {
+    match mode {
+        TradingMode::Normal => Decimal::ONE,
+        TradingMode::Drawdown => settings
+            .drawdown_size_multiplier
+            .max(dec!(0.05))
+            .min(Decimal::ONE),
+        TradingMode::HardStop => Decimal::ZERO,
+    }
+}
+
+fn adaptive_relaxation_factor(settings: &Settings, context: AdaptiveRiskContext) -> Decimal {
+    let configured = settings
+        .drawdown_relaxation_factor
+        .max(Decimal::ONE)
+        .min(dec!(1.5));
+    let mut factor = Decimal::ONE;
+    if context.mode == TradingMode::Drawdown {
+        factor = configured;
+    }
+    if context.no_trade_relaxation_active {
+        factor = factor.max(configured);
+    }
+    factor
+}
+
+fn effective_min_visible_liquidity(settings: &Settings, context: AdaptiveRiskContext) -> Decimal {
+    let base = settings.min_visible_liquidity.max(Decimal::ZERO);
+    if base.is_zero() {
+        return Decimal::ZERO;
+    }
+
+    (base / adaptive_relaxation_factor(settings, context))
+        .max(base * dec!(0.5))
+        .round_dp(4)
+}
+
+fn effective_execution_min_liquidity(settings: &Settings, context: AdaptiveRiskContext) -> Decimal {
+    let base = settings.min_liquidity.max(Decimal::ZERO);
+    if base.is_zero() {
+        return Decimal::ZERO;
+    }
+
+    (base / adaptive_relaxation_factor(settings, context))
+        .max(base * dec!(0.5))
+        .round_dp(4)
+}
+
+fn effective_max_entry_slippage(settings: &Settings, context: AdaptiveRiskContext) -> Decimal {
+    let base = settings.max_entry_slippage.max(Decimal::ZERO);
+    if base.is_zero() {
+        return Decimal::ZERO;
+    }
+
+    (base * adaptive_relaxation_factor(settings, context)).round_dp(4)
+}
+
+fn effective_max_spread_bps(settings: &Settings, context: AdaptiveRiskContext) -> u32 {
+    relax_bps(settings.max_spread_bps, settings, context)
+}
+
+fn effective_wallet_trades_per_minute(settings: &Settings, context: AdaptiveRiskContext) -> u32 {
+    relax_bps(settings.max_wallet_trades_per_min, settings, context)
+}
+
+fn effective_min_wallet_avg_hold_ms(settings: &Settings, context: AdaptiveRiskContext) -> u64 {
+    let base = settings.min_wallet_avg_hold_ms;
+    if base == 0 {
+        return 0;
+    }
+
+    let relaxed = Decimal::from(base) / adaptive_relaxation_factor(settings, context);
+    relaxed.floor().to_u64().unwrap_or(u64::MAX).max(1)
+}
+
+fn effective_min_trade_quality_score(
+    settings: &Settings,
+    ultra_short: bool,
+    context: AdaptiveRiskContext,
+) -> Decimal {
+    let mut minimum = settings.min_trade_quality_score.max(Decimal::ZERO);
+    if context.mode == TradingMode::Drawdown {
+        minimum = (minimum + dec!(0.10)).min(dec!(0.95));
+    }
+    if context.no_trade_relaxation_active {
+        minimum = (minimum - dec!(0.05)).max(dec!(0.50));
+    }
+    if ultra_short {
+        minimum = minimum.max(dec!(0.85));
+    }
+    minimum.min(Decimal::ONE).round_dp(4)
+}
+
+fn relax_bps(base: u32, settings: &Settings, context: AdaptiveRiskContext) -> u32 {
+    if base == 0 {
+        return 0;
+    }
+
+    (Decimal::from(base) * adaptive_relaxation_factor(settings, context))
+        .ceil()
+        .to_u32()
+        .unwrap_or(u32::MAX)
+}
+
 fn average_hold_ms(stats: &WalletBehaviorStats) -> Option<u64> {
     if stats.hold_samples == 0 {
         return None;
@@ -1192,6 +1430,20 @@ mod tests {
         settings.max_drawdown_pct = dec!(1);
         settings.hard_stop_drawdown_pct = dec!(1);
         settings
+    }
+
+    fn normal_context() -> AdaptiveRiskContext {
+        AdaptiveRiskContext {
+            mode: TradingMode::Normal,
+            no_trade_relaxation_active: false,
+        }
+    }
+
+    fn drawdown_context() -> AdaptiveRiskContext {
+        AdaptiveRiskContext {
+            mode: TradingMode::Drawdown,
+            no_trade_relaxation_active: false,
+        }
     }
 
     fn sample_entry(
@@ -1529,7 +1781,7 @@ mod tests {
     }
 
     #[test]
-    fn ultra_short_market_is_rejected() {
+    fn ultra_short_market_requires_high_quality_when_disabled() {
         let engine = RiskEngine::new(sample_settings());
         let mut entry = sample_entry("BUY", "asset-2", 10.0, 5.0, "0xsource");
         entry.title = "BTC Up/Down 5m".to_owned();
@@ -1537,10 +1789,86 @@ mod tests {
 
         let observation = engine.observe_source_trade(&entry);
         let reason = engine
-            .enforce_entry_quality_pre_quote(&entry, &observation)
-            .expect_err("ultra-short markets should be filtered");
+            .enforce_entry_quality_post_quote(
+                &entry,
+                &sample_quote(dec!(0.49), dec!(60), dec!(0.51), dec!(60)),
+                &observation,
+                normal_context(),
+            )
+            .expect_err("ultra-short markets should require exceptional quality");
 
         assert_eq!(reason.code, "market_ultra_short_filtered");
+    }
+
+    #[test]
+    fn ultra_short_market_can_pass_with_exceptional_conditions() {
+        let mut settings = sample_settings();
+        settings.min_trade_quality_score = dec!(0.50);
+        let engine = RiskEngine::new(settings);
+        let mut entry = sample_entry("BUY", "asset-2", 10.0, 5.0, "0xsource");
+        entry.title = "BTC Up/Down 5m".to_owned();
+        entry.timestamp = recent_timestamp_ms();
+
+        let observation = engine.observe_source_trade(&entry);
+        let quality = engine
+            .enforce_entry_quality_post_quote(
+                &entry,
+                &sample_quote(dec!(0.499), dec!(500), dec!(0.501), dec!(500)),
+                &observation,
+                normal_context(),
+            )
+            .expect("exceptional ultra-short setup should pass");
+
+        assert!(quality.total_score >= dec!(0.85));
+    }
+
+    #[test]
+    fn drawdown_context_relaxes_market_thresholds_without_removing_quality_gate() {
+        let mut settings = sample_settings();
+        settings.enable_ultra_short_markets = true;
+        settings.min_trade_quality_score = dec!(0.40);
+        settings.min_visible_liquidity = dec!(50);
+        settings.max_spread_bps = 500;
+        settings.max_entry_slippage = dec!(0.03);
+        let engine = RiskEngine::new(settings);
+        let mut entry = sample_entry("BUY", "asset-2", 10.0, 5.0, "0xsource");
+        entry.timestamp = recent_timestamp_ms();
+        let observation = engine.observe_source_trade(&entry);
+        let quote = sample_quote(dec!(0.49), dec!(40), dec!(0.52), dec!(40));
+
+        assert_eq!(
+            engine
+                .enforce_entry_quality_post_quote(&entry, &quote, &observation, normal_context())
+                .expect_err("normal mode should keep strict thresholds")
+                .code,
+            "low_visible_liquidity"
+        );
+
+        let quality = engine
+            .enforce_entry_quality_post_quote(&entry, &quote, &observation, drawdown_context())
+            .expect("drawdown mode should relax liquidity/spread/slippage thresholds");
+        assert!(quality.total_score >= dec!(0.50));
+    }
+
+    #[test]
+    fn no_trade_relaxation_activates_after_signals_without_allowed_entries() {
+        let mut settings = sample_settings();
+        settings.no_trade_timeout = Duration::from_millis(1_000);
+        let engine = RiskEngine::new(settings);
+        let mut old_entry = sample_entry("BUY", "asset-old", 10.0, 5.0, "0xsource");
+        old_entry.timestamp = recent_timestamp_ms() - 2_000;
+        let _ = engine.observe_source_trade(&old_entry);
+
+        let mut fresh_entry = sample_entry("BUY", "asset-fresh", 10.0, 5.0, "0xsource");
+        fresh_entry.timestamp = recent_timestamp_ms();
+        let _ = engine.observe_source_trade(&fresh_entry);
+
+        let context = engine.entry_context(&flat_portfolio(dec!(100)));
+        assert!(context.no_trade_relaxation_active);
+
+        engine.record_entry_allowed();
+        let context = engine.entry_context(&flat_portfolio(dec!(100)));
+        assert!(!context.no_trade_relaxation_active);
     }
 
     #[test]
@@ -1553,13 +1881,14 @@ mod tests {
 
         let observation = engine.observe_source_trade(&entry);
         engine
-            .enforce_entry_quality_pre_quote(&entry, &observation)
+            .enforce_entry_quality_pre_quote(&entry, &observation, normal_context())
             .expect("pre-quote checks should pass");
         let reason = engine
             .enforce_entry_quality_post_quote(
                 &entry,
                 &sample_quote(dec!(0.49), dec!(10), dec!(0.51), dec!(12)),
                 &observation,
+                normal_context(),
             )
             .expect_err("low liquidity should be rejected");
 
@@ -1580,6 +1909,7 @@ mod tests {
                 &entry,
                 &sample_quote(dec!(0.58), dec!(80), dec!(0.60), dec!(80)),
                 &observation,
+                normal_context(),
             )
             .expect_err("slippage should be rejected");
 
@@ -1603,7 +1933,7 @@ mod tests {
         third.timestamp = recent_timestamp_ms();
         let observation = engine.observe_source_trade(&third);
         let reason = engine
-            .enforce_entry_quality_pre_quote(&third, &observation)
+            .enforce_entry_quality_pre_quote(&third, &observation, normal_context())
             .expect_err("fast wallets should be rejected");
 
         assert_eq!(reason.code, "wallet_too_fast");
@@ -1620,14 +1950,14 @@ mod tests {
         first.timestamp = recent_timestamp_ms();
         let first_observation = engine.observe_source_trade(&first);
         engine
-            .enforce_entry_quality_pre_quote(&first, &first_observation)
+            .enforce_entry_quality_pre_quote(&first, &first_observation, normal_context())
             .expect("first entry should pass");
 
         let mut second = sample_entry("BUY", "asset-2", 10.0, 5.0, "0xother");
         second.timestamp = recent_timestamp_ms() + 1;
         let second_observation = engine.observe_source_trade(&second);
         let reason = engine
-            .enforce_entry_quality_pre_quote(&second, &second_observation)
+            .enforce_entry_quality_pre_quote(&second, &second_observation, normal_context())
             .expect_err("cooldown should block immediate re-entry");
 
         assert_eq!(reason.code, "market_cooldown");
@@ -1659,13 +1989,14 @@ mod tests {
         entry.timestamp = recent_timestamp_ms();
         let observation = engine.observe_source_trade(&entry);
         engine
-            .enforce_entry_quality_pre_quote(&entry, &observation)
+            .enforce_entry_quality_pre_quote(&entry, &observation, normal_context())
             .expect("pre-quote filters should pass");
         let quality = engine
             .enforce_entry_quality_post_quote(
                 &entry,
                 &sample_quote(dec!(0.49), dec!(80), dec!(0.51), dec!(90)),
                 &observation,
+                normal_context(),
             )
             .expect("valid trade should pass");
 
@@ -1735,10 +2066,11 @@ mod tests {
     }
 
     #[test]
-    fn drawdown_guard_blocks_entries_but_not_sells() {
+    fn drawdown_mode_allows_reduced_entries_and_sells() {
         let mut settings = sample_settings();
         settings.max_drawdown_pct = dec!(0.10);
         settings.hard_stop_drawdown_pct = dec!(0.50);
+        settings.drawdown_size_multiplier = dec!(0.5);
         let engine = RiskEngine::new(settings);
         let mut portfolio = sample_portfolio();
         portfolio.current_equity = dec!(89);
@@ -1746,13 +2078,15 @@ mod tests {
         portfolio.current_drawdown_pct = dec!(0.11);
         portfolio.drawdown_guard_active = true;
 
-        let buy = sample_entry("BUY", "asset-new", 10.0, 5.0, "0xsource");
+        let mut buy = sample_entry("BUY", "asset-new", 10.0, 5.0, "0xsource");
+        buy.condition_id = "condition-new".to_owned();
         let sell = sample_entry("SELL", "asset-1", 8.0, 4.0, "0xsource");
 
-        assert_eq!(
-            engine.evaluate(&buy, &portfolio).expect_err("buy").code,
-            "drawdown_guard_triggered"
-        );
+        let decision = engine
+            .evaluate(&buy, &portfolio)
+            .expect("drawdown mode should reduce, not block");
+        assert_eq!(engine.trading_mode(&portfolio), TradingMode::Drawdown);
+        assert_eq!(decision.notional, dec!(2.5));
         let resolved_position = portfolio
             .resolve_position_to_sell(&sell)
             .expect("sell resolves against owned position");

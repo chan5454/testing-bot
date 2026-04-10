@@ -97,16 +97,27 @@ The rescanner remains enabled, but it is now firmly off the hot path. Active-wal
 - blocks very high-price entries above `0.92`
 - replaces the old hard entry ceiling with a remaining-edge check
 - rejects late copies via the strict `MAX_COPY_DELAY_MS` gate
-- rejects ultra-short markets unless `ENABLE_ULTRA_SHORT_MARKETS=true`
+- treats disabled ultra-short markets as exceptional-only instead of absolute-disabled: they must clear higher quality, liquidity, and slippage requirements
 - rejects thin books via visible-liquidity and spread checks
 - rejects price chasing, market cooldown churn, conflicting wallet signals, and hyperactive scalp wallets
 - downweights source wallets with negative recent realized or open PnL before sizing new entries
 - computes a weighted trade-quality score before submit
 - sizes entries as the minimum of risk-percent-of-equity, absolute size cap, remaining total exposure, remaining market exposure, and available cash
-- blocks entries during drawdown guard, hard-stop, loss-streak cooldown, total exposure limit, or per-market exposure limit
+- switches to adaptive drawdown mode instead of binary drawdown lockout; hard-stop, loss-streak cooldown, total exposure limit, and per-market exposure limit still block entries
 - rejects duplicate positions, stale positions, and opposite-side exposure unless `ALLOW_HEDGING=true`
 
 The design goal is "copy where edge still exists", not "copy everything late".
+
+Trading mode is adaptive:
+
+- `NORMAL`
+  Uses configured risk sizing and filters.
+- `DRAWDOWN`
+  Starts at `MAX_DRAWDOWN_PCT`; entries remain allowed but size is multiplied by `DRAWDOWN_SIZE_MULTIPLIER`, trade quality is stricter, and liquidity/spread/slippage thresholds relax by `DRAWDOWN_RELAXATION_FACTOR` within safety caps.
+- `HARD_STOP`
+  Starts at `HARD_STOP_DRAWDOWN_PCT`; new entries are blocked and exits remain actionable.
+
+If BUY signals are seen but no entry survives for `NO_TRADE_TIMEOUT_MS`, the risk engine temporarily applies the same bounded relaxation so the bot does not deadlock into a zero-trade state.
 
 Risk evaluation is now two-stage:
 
@@ -115,7 +126,7 @@ Risk evaluation is now two-stage:
 - cold-path audit trail
   richer explanations, analytics, and serialized skip detail
 
-The drawdown guard is intentionally asymmetric: new entries are blocked when equity/drawdown limits are breached, but source-follow and managed exits stay actionable. If `FORCE_CLOSE_ON_HARD_STOP=true`, the exit watcher submits emergency-exit closes for open positions after the hard-stop threshold is active.
+The hard-stop guard remains asymmetric: new entries are blocked only in `HARD_STOP`, but source-follow and managed exits stay actionable. If `FORCE_CLOSE_ON_HARD_STOP=true`, the exit watcher submits emergency-exit closes for open positions after the hard-stop threshold is active.
 
 ### 8. Unified execution contract
 
@@ -376,7 +387,7 @@ If you prefer the release binary directly:
 - EOA allowance flow: `POLYMARKET_USDC_ADDRESS`, `POLYMARKET_SPENDER_ADDRESS`, `AUTO_APPROVE_USDC_ALLOWANCE`, `USDC_APPROVAL_AMOUNT`
 - Wallet tracking: `TARGET_WALLETS`, optional authenticated activity credentials
 - Risk: `ENABLE_PRICE_BANDS`, `MIN_EDGE_THRESHOLD`, `MAX_COPY_DELAY_MS`, `ENABLE_ULTRA_SHORT_MARKETS`, `MIN_VISIBLE_LIQUIDITY`, `MAX_SPREAD_BPS`, `MAX_ENTRY_SLIPPAGE`, `MIN_WALLET_AVG_HOLD_MS`, `MAX_WALLET_TRADES_PER_MIN`, `MARKET_COOLDOWN_MS`, `MIN_TRADE_QUALITY_SCORE`, `MIN_LIQUIDITY`, `MIN_WALLET_SCORE`, `ALLOW_HEDGING`
-- Position risk: `MAX_RISK_PER_TRADE_PCT`, `MAX_POSITION_SIZE_ABS`, `MAX_TOTAL_EXPOSURE_PCT`, `MAX_EXPOSURE_PER_MARKET_PCT`, `MAX_DRAWDOWN_PCT`, `HARD_STOP_DRAWDOWN_PCT`, `FORCE_CLOSE_ON_HARD_STOP`, `MAX_CONSECUTIVE_LOSSES`, `LOSS_COOLDOWN_MS`
+- Position risk: `MAX_RISK_PER_TRADE_PCT`, `MAX_POSITION_SIZE_ABS`, `MAX_TOTAL_EXPOSURE_PCT`, `MAX_EXPOSURE_PER_MARKET_PCT`, `MAX_DRAWDOWN_PCT`, `DRAWDOWN_SIZE_MULTIPLIER`, `DRAWDOWN_RELAXATION_FACTOR`, `HARD_STOP_DRAWDOWN_PCT`, `NO_TRADE_TIMEOUT_MS`, `FORCE_CLOSE_ON_HARD_STOP`, `MAX_CONSECUTIVE_LOSSES`, `LOSS_COOLDOWN_MS`
 - Lifecycle and exits: `MAX_POSITION_AGE_HOURS`, `MAX_HOLD_TIME_SECONDS`, `ENABLE_EXIT_RETRY`, `EXIT_RETRY_WINDOW_MS`, `EXIT_RETRY_INTERVAL_MS`, `CLOSING_MAX_AGE_MS`, `FORCE_EXIT_ON_CLOSING_TIMEOUT`
 - Pending-open exit resolution: `UNRESOLVED_EXIT_INITIAL_RETRY_MS`, `UNRESOLVED_EXIT_MAX_RETRY_MS`, `UNRESOLVED_EXIT_TOTAL_WINDOW_MS`, `POSITION_PENDING_OPEN_TTL_MS`
 - Latency-first hot path: `HOT_PATH_MODE`, `HOT_PATH_QUEUE_CAPACITY`, `COLD_PATH_QUEUE_CAPACITY`, `ATTRIBUTION_FAST_CACHE_CAPACITY`, `PARSE_TASKS_MARKET`, `PARSE_TASKS_WALLET`, `EXIT_PRIORITY_STRICT`
