@@ -357,6 +357,10 @@ pub struct PortfolioPosition {
     #[serde(default)]
     pub average_entry_price: Decimal,
     #[serde(default)]
+    pub entry_conviction_score: Decimal,
+    #[serde(default)]
+    pub peak_price_since_open: Decimal,
+    #[serde(default)]
     pub current_price: Decimal,
     #[serde(default)]
     pub cost_basis: Decimal,
@@ -391,6 +395,7 @@ pub struct ResolvedPosition {
     pub size: Decimal,
     pub current_value: Decimal,
     pub average_entry_price: Decimal,
+    pub entry_conviction_score: Decimal,
     pub used_fallback: bool,
     pub fallback_reason: Option<String>,
 }
@@ -537,6 +542,49 @@ impl PortfolioSnapshot {
         }
 
         (self.market_exposure(condition_id) / equity)
+            .max(Decimal::ZERO)
+            .min(Decimal::ONE)
+    }
+
+    pub fn wallet_exposure(&self, wallet: &str) -> Decimal {
+        let wallet = normalize_portfolio_wallet(wallet);
+        if wallet.is_empty() {
+            return Decimal::ZERO;
+        }
+
+        self.active_positions()
+            .iter()
+            .filter(|position| normalize_portfolio_wallet(&position.source_wallet) == wallet)
+            .map(|position| position.current_value)
+            .sum()
+    }
+
+    pub fn wallet_exposure_pct(&self, wallet: &str) -> Decimal {
+        let equity = self.equity();
+        if equity <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+
+        (self.wallet_exposure(wallet) / equity)
+            .max(Decimal::ZERO)
+            .min(Decimal::ONE)
+    }
+
+    pub fn market_type_exposure(&self, market_type: MarketType) -> Decimal {
+        self.active_positions()
+            .iter()
+            .filter(|position| classify_market(&position.title) == market_type)
+            .map(|position| position.current_value)
+            .sum()
+    }
+
+    pub fn market_type_exposure_pct(&self, market_type: MarketType) -> Decimal {
+        let equity = self.equity();
+        if equity <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+
+        (self.market_type_exposure(market_type) / equity)
             .max(Decimal::ZERO)
             .min(Decimal::ONE)
     }
@@ -721,6 +769,7 @@ impl PortfolioSnapshot {
                 size: position.size,
                 current_value: position.current_value,
                 average_entry_price: position.average_entry_price,
+                entry_conviction_score: position.entry_conviction_score,
                 used_fallback: false,
                 fallback_reason: None,
             });
@@ -746,6 +795,7 @@ impl PortfolioSnapshot {
             size: position.size,
             current_value: position.current_value,
             average_entry_price: position.average_entry_price,
+            entry_conviction_score: position.entry_conviction_score,
             used_fallback: true,
             fallback_reason: Some(fallback_reason),
         })
@@ -985,6 +1035,14 @@ pub struct TradeCohort {
     pub filled_price: Decimal,
     #[serde(default)]
     pub entry_slippage_pct: Decimal,
+    #[serde(default)]
+    pub conviction_score: Decimal,
+    #[serde(default)]
+    pub wallet_alpha_score: Decimal,
+    #[serde(default)]
+    pub entry_notional: Decimal,
+    #[serde(default)]
+    pub sizing_bucket: String,
     pub filled_size: Decimal,
     pub execution_mode: String,
     pub open_time: DateTime<Utc>,
@@ -1035,9 +1093,27 @@ pub struct ExecutionAnalyticsState {
     #[serde(default)]
     pub wallet_alpha_scores: BTreeMap<String, Decimal>,
     #[serde(default)]
+    pub expectancy_by_wallet: BTreeMap<String, Decimal>,
+    #[serde(default)]
     pub pnl_by_trade_day: BTreeMap<String, Decimal>,
     #[serde(default)]
     pub win_rate_by_market_type: BTreeMap<String, Decimal>,
+    #[serde(default)]
+    pub expectancy_by_market_type: BTreeMap<String, Decimal>,
+    #[serde(default)]
+    pub expectancy_by_conviction_bucket: BTreeMap<String, Decimal>,
+    #[serde(default)]
+    pub pnl_by_sizing_bucket: BTreeMap<String, Decimal>,
+    #[serde(default)]
+    pub average_size_by_conviction_bucket: BTreeMap<String, Decimal>,
+    #[serde(default)]
+    pub average_winner: Decimal,
+    #[serde(default)]
+    pub average_loser: Decimal,
+    #[serde(default)]
+    pub payoff_ratio: Decimal,
+    #[serde(default)]
+    pub expectancy_per_trade: Decimal,
     pub current_window_positions: usize,
     pub legacy_positions: usize,
     pub current_window_unrealized_pnl: Decimal,
@@ -1127,6 +1203,15 @@ impl Default for ExecutionAnalyticsState {
             win_rate_by_wallet: BTreeMap::new(),
             pnl_by_trade_day: BTreeMap::new(),
             win_rate_by_market_type: BTreeMap::new(),
+            expectancy_by_wallet: BTreeMap::new(),
+            expectancy_by_market_type: BTreeMap::new(),
+            expectancy_by_conviction_bucket: BTreeMap::new(),
+            pnl_by_sizing_bucket: BTreeMap::new(),
+            average_size_by_conviction_bucket: BTreeMap::new(),
+            average_winner: Decimal::ZERO,
+            average_loser: Decimal::ZERO,
+            payoff_ratio: Decimal::ZERO,
+            expectancy_per_trade: Decimal::ZERO,
             current_window_positions: 0,
             legacy_positions: 0,
             current_window_unrealized_pnl: Decimal::ZERO,

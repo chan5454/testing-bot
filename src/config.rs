@@ -126,9 +126,12 @@ pub struct Settings {
     pub copy_scale_above_five_usd: Decimal,
     pub min_copy_notional_usd: Decimal,
     pub max_copy_notional_usd: Decimal,
+    pub base_risk_per_trade_pct: Decimal,
+    pub min_risk_per_trade_pct: Decimal,
     pub max_risk_per_trade_pct: Decimal,
     pub max_position_size_abs: Decimal,
     pub max_total_exposure_pct: Decimal,
+    pub max_exposure_per_wallet_pct: Decimal,
     pub max_exposure_per_market_pct: Decimal,
     pub max_total_exposure_usd: Decimal,
     pub max_market_exposure_usd: Decimal,
@@ -170,6 +173,12 @@ pub struct Settings {
     pub market_cooldown: Duration,
     pub min_trade_quality_score: Decimal,
     pub min_wallet_alpha_score: Decimal,
+    pub high_conviction_size_multiplier: Decimal,
+    pub low_conviction_size_multiplier: Decimal,
+    pub ultra_short_size_multiplier: Decimal,
+    pub short_size_multiplier: Decimal,
+    pub medium_size_multiplier: Decimal,
+    pub long_size_multiplier: Decimal,
     pub max_slippage_spread_share: Decimal,
     pub max_price_move_since_source_bps: u32,
     pub source_exit_partial_retain_pct: Decimal,
@@ -289,9 +298,12 @@ impl Settings {
             copy_scale_above_five_usd: Decimal::new(25, 2),
             min_copy_notional_usd: Decimal::ONE,
             max_copy_notional_usd: Decimal::new(25, 0),
+            base_risk_per_trade_pct: Decimal::new(12, 3),
+            min_risk_per_trade_pct: Decimal::new(5, 3),
             max_risk_per_trade_pct: Decimal::new(2, 2),
             max_position_size_abs: Decimal::new(100, 0),
             max_total_exposure_pct: Decimal::new(3, 1),
+            max_exposure_per_wallet_pct: Decimal::new(12, 2),
             max_exposure_per_market_pct: Decimal::new(1, 1),
             max_total_exposure_usd: Decimal::new(150, 0),
             max_market_exposure_usd: Decimal::new(40, 0),
@@ -333,6 +345,12 @@ impl Settings {
             market_cooldown: Duration::from_secs(15),
             min_trade_quality_score: Decimal::new(65, 2),
             min_wallet_alpha_score: Decimal::new(52, 2),
+            high_conviction_size_multiplier: Decimal::new(12, 1),
+            low_conviction_size_multiplier: Decimal::new(55, 2),
+            ultra_short_size_multiplier: Decimal::new(55, 2),
+            short_size_multiplier: Decimal::new(85, 2),
+            medium_size_multiplier: Decimal::new(105, 2),
+            long_size_multiplier: Decimal::new(11, 1),
             max_slippage_spread_share: Decimal::new(75, 2),
             max_price_move_since_source_bps: 300,
             source_exit_partial_retain_pct: Decimal::new(5, 1),
@@ -526,6 +544,14 @@ impl Settings {
             copy_scale_above_five_usd: parse_decimal("COPY_SCALE_ABOVE_FIVE_USD")?,
             min_copy_notional_usd: parse_decimal("MIN_COPY_NOTIONAL_USD")?,
             max_copy_notional_usd: parse_decimal("MAX_COPY_NOTIONAL_USD")?,
+            base_risk_per_trade_pct: parse_or_default_decimal(
+                "BASE_RISK_PER_TRADE_PCT",
+                Decimal::new(12, 3),
+            )?,
+            min_risk_per_trade_pct: parse_or_default_decimal(
+                "MIN_RISK_PER_TRADE_PCT",
+                Decimal::new(5, 3),
+            )?,
             max_risk_per_trade_pct: parse_or_default_decimal(
                 "MAX_RISK_PER_TRADE_PCT",
                 Decimal::new(2, 2),
@@ -537,6 +563,10 @@ impl Settings {
             max_total_exposure_pct: parse_or_default_decimal(
                 "MAX_TOTAL_EXPOSURE_PCT",
                 Decimal::new(3, 1),
+            )?,
+            max_exposure_per_wallet_pct: parse_or_default_decimal(
+                "MAX_EXPOSURE_PER_WALLET_PCT",
+                Decimal::new(12, 2),
             )?,
             max_exposure_per_market_pct: parse_or_default_decimal(
                 "MAX_EXPOSURE_PER_MARKET_PCT",
@@ -621,6 +651,30 @@ impl Settings {
             min_wallet_alpha_score: parse_or_default_decimal(
                 "MIN_WALLET_ALPHA_SCORE",
                 Decimal::new(52, 2),
+            )?,
+            high_conviction_size_multiplier: parse_or_default_decimal(
+                "HIGH_CONVICTION_SIZE_MULTIPLIER",
+                Decimal::new(12, 1),
+            )?,
+            low_conviction_size_multiplier: parse_or_default_decimal(
+                "LOW_CONVICTION_SIZE_MULTIPLIER",
+                Decimal::new(55, 2),
+            )?,
+            ultra_short_size_multiplier: parse_or_default_decimal(
+                "ULTRA_SHORT_SIZE_MULTIPLIER",
+                Decimal::new(55, 2),
+            )?,
+            short_size_multiplier: parse_or_default_decimal(
+                "SHORT_SIZE_MULTIPLIER",
+                Decimal::new(85, 2),
+            )?,
+            medium_size_multiplier: parse_or_default_decimal(
+                "MEDIUM_SIZE_MULTIPLIER",
+                Decimal::new(105, 2),
+            )?,
+            long_size_multiplier: parse_or_default_decimal(
+                "LONG_SIZE_MULTIPLIER",
+                Decimal::new(11, 1),
             )?,
             max_slippage_spread_share: parse_or_default_decimal(
                 "MAX_SLIPPAGE_SPREAD_SHARE",

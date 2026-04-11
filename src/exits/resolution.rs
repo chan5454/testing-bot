@@ -650,6 +650,7 @@ mod tests {
     use std::time::Duration;
 
     use chrono::Utc;
+    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
     use super::*;
@@ -727,6 +728,8 @@ mod tests {
                 current_value: dec!(5),
                 source_entry_price: dec!(0.5),
                 average_entry_price: dec!(0.5),
+                entry_conviction_score: Decimal::ZERO,
+                peak_price_since_open: dec!(0.5),
                 current_price: dec!(0.5),
                 cost_basis: dec!(5),
                 unrealized_pnl: dec!(0),

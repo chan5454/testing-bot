@@ -141,6 +141,13 @@ enum ManagedExitEvaluation {
     None,
 }
 
+#[derive(Clone, Debug, Default)]
+struct EntryExecutionMetadata {
+    conviction_score: Decimal,
+    wallet_alpha_score: Decimal,
+    sizing_bucket: String,
+}
+
 impl ExecutionAnalyticsTracker {
     async fn load_or_new(settings: &Settings) -> Result<Self> {
         let path = settings.data_dir.join("execution-analytics-summary.json");
@@ -229,6 +236,7 @@ impl ExecutionAnalyticsTracker {
         result: &ExecutionSuccess,
         portfolio: Option<&models::PortfolioSnapshot>,
         position_key: Option<&PositionKey>,
+        entry_metadata: Option<&EntryExecutionMetadata>,
     ) {
         let snapshot = {
             let mut state = self.state.lock().await;
@@ -253,6 +261,16 @@ impl ExecutionAnalyticsTracker {
                             decimal_from_f64(entry.price),
                             result.filled_price,
                         ),
+                        conviction_score: entry_metadata
+                            .map(|metadata| metadata.conviction_score)
+                            .unwrap_or(Decimal::ZERO),
+                        wallet_alpha_score: entry_metadata
+                            .map(|metadata| metadata.wallet_alpha_score)
+                            .unwrap_or(Decimal::ZERO),
+                        entry_notional: result.filled_notional,
+                        sizing_bucket: entry_metadata
+                            .map(|metadata| metadata.sizing_bucket.clone())
+                            .unwrap_or_else(|| "standard".to_owned()),
                         filled_size: result.filled_size,
                         execution_mode: result.mode.as_str().to_owned(),
                         open_time: source_trade_time(entry.timestamp),
@@ -530,8 +548,13 @@ fn refresh_analytics_from_portfolio(
     state.pnl_by_source_wallet = BTreeMap::new();
     state.win_rate_by_wallet = BTreeMap::new();
     state.wallet_alpha_scores = BTreeMap::new();
+    state.expectancy_by_wallet = BTreeMap::new();
     state.pnl_by_trade_day = BTreeMap::new();
     state.win_rate_by_market_type = BTreeMap::new();
+    state.expectancy_by_market_type = BTreeMap::new();
+    state.expectancy_by_conviction_bucket = BTreeMap::new();
+    state.pnl_by_sizing_bucket = BTreeMap::new();
+    state.average_size_by_conviction_bucket = BTreeMap::new();
     state.stale_position_counts = BTreeMap::new();
     state.current_window_trade_count = 0;
     state.winning_current_window_trades = 0;
@@ -545,6 +568,10 @@ fn refresh_analytics_from_portfolio(
     state.entry_slippage_p90_pct = Decimal::ZERO;
     state.win_rate_by_close_type = BTreeMap::new();
     state.median_hold_ms_by_close_type = BTreeMap::new();
+    state.average_winner = Decimal::ZERO;
+    state.average_loser = Decimal::ZERO;
+    state.payoff_ratio = Decimal::ZERO;
+    state.expectancy_per_trade = Decimal::ZERO;
 
     let mut current_window_open_trades = 0_u64;
     let mut current_window_open_winning = 0_u64;
@@ -559,6 +586,15 @@ fn refresh_analytics_from_portfolio(
     let mut slippage_values = Vec::<Decimal>::new();
     let mut wallet_alpha_inputs =
         HashMap::<String, (u64, u64, u64, u64, u64, Decimal, u128, Decimal)>::new();
+    let mut wallet_expectancy_inputs = BTreeMap::<String, (Decimal, u64)>::new();
+    let mut market_type_expectancy_inputs = BTreeMap::<String, (Decimal, u64)>::new();
+    let mut conviction_expectancy_inputs = BTreeMap::<String, (Decimal, u64)>::new();
+    let mut conviction_size_inputs = BTreeMap::<String, (Decimal, u64)>::new();
+    let mut closed_total_pnl = Decimal::ZERO;
+    let mut winner_total = Decimal::ZERO;
+    let mut winner_count = 0_u64;
+    let mut loser_total = Decimal::ZERO;
+    let mut loser_count = 0_u64;
 
     for cohort in &state.cohorts {
         let cohort_pnl = cohort.realized_pnl + cohort.unrealized_pnl;
@@ -603,24 +639,64 @@ fn refresh_analytics_from_portfolio(
             *wallet_counts
                 .entry(cohort.source_wallet.clone())
                 .or_insert(0) += 1;
+            let market_type_key = market_type_label(cohort.market_type).to_owned();
             *market_type_counts
-                .entry(market_type_label(cohort.market_type).to_owned())
+                .entry(market_type_key.clone())
                 .or_insert(0) += 1;
             let close_type = cohort
                 .close_reason
                 .clone()
                 .unwrap_or_else(|| "UNKNOWN".to_owned());
+            let conviction_bucket =
+                conviction_bucket_label(cohort.conviction_score.max(Decimal::ZERO)).to_owned();
+            let sizing_bucket = if cohort.sizing_bucket.trim().is_empty() {
+                "standard".to_owned()
+            } else {
+                cohort.sizing_bucket.clone()
+            };
             increment_string_counter(&mut state.close_type_counts, close_type.clone());
             *state
                 .pnl_by_close_type
                 .entry(close_type.clone())
                 .or_insert(Decimal::ZERO) += cohort.realized_pnl;
+            *state
+                .pnl_by_sizing_bucket
+                .entry(sizing_bucket)
+                .or_insert(Decimal::ZERO) += cohort.realized_pnl;
+            let wallet_expectancy = wallet_expectancy_inputs
+                .entry(cohort.source_wallet.clone())
+                .or_insert((Decimal::ZERO, 0));
+            wallet_expectancy.0 += cohort.realized_pnl;
+            wallet_expectancy.1 = wallet_expectancy.1.saturating_add(1);
+            let market_expectancy = market_type_expectancy_inputs
+                .entry(market_type_key.clone())
+                .or_insert((Decimal::ZERO, 0));
+            market_expectancy.0 += cohort.realized_pnl;
+            market_expectancy.1 = market_expectancy.1.saturating_add(1);
+            let conviction_expectancy = conviction_expectancy_inputs
+                .entry(conviction_bucket.clone())
+                .or_insert((Decimal::ZERO, 0));
+            conviction_expectancy.0 += cohort.realized_pnl;
+            conviction_expectancy.1 = conviction_expectancy.1.saturating_add(1);
+            let conviction_size = conviction_size_inputs
+                .entry(conviction_bucket)
+                .or_insert((Decimal::ZERO, 0));
+            conviction_size.0 += cohort
+                .entry_notional
+                .max(cohort.filled_price * cohort.filled_size);
+            conviction_size.1 = conviction_size.1.saturating_add(1);
+            closed_total_pnl += cohort.realized_pnl;
+            if cohort.realized_pnl > Decimal::ZERO {
+                winner_total += cohort.realized_pnl;
+                winner_count = winner_count.saturating_add(1);
+            } else if cohort.realized_pnl < Decimal::ZERO {
+                loser_total += cohort.realized_pnl.abs();
+                loser_count = loser_count.saturating_add(1);
+            }
             if cohort.realized_pnl > Decimal::ZERO {
                 *close_type_wins.entry(close_type.clone()).or_insert(0) += 1;
                 *wallet_wins.entry(cohort.source_wallet.clone()).or_insert(0) += 1;
-                *market_type_wins
-                    .entry(market_type_label(cohort.market_type).to_owned())
-                    .or_insert(0) += 1;
+                *market_type_wins.entry(market_type_key).or_insert(0) += 1;
             }
             if let Some(close_time) = cohort.close_time {
                 let hold_ms = close_time
@@ -737,6 +813,20 @@ fn refresh_analytics_from_portfolio(
         .get("PROFIT_PROTECTION")
         .copied()
         .unwrap_or(Decimal::ZERO);
+    state.average_winner = mean_decimal(winner_total, winner_count);
+    state.average_loser = if loser_count == 0 {
+        Decimal::ZERO
+    } else {
+        -(loser_total / Decimal::from(loser_count)).round_dp(4)
+    };
+    state.payoff_ratio = if loser_total > Decimal::ZERO && loser_count > 0 {
+        (state.average_winner / state.average_loser.abs())
+            .max(Decimal::ZERO)
+            .round_dp(4)
+    } else {
+        Decimal::ZERO
+    };
+    state.expectancy_per_trade = mean_decimal(closed_total_pnl, closed_cohort_count);
     for (
         wallet,
         (
@@ -782,6 +872,26 @@ fn refresh_analytics_from_portfolio(
             + (slippage_score * dec!(0.10)))
         .round_dp(4);
         state.wallet_alpha_scores.insert(wallet, score);
+    }
+    for (wallet, (pnl_sum, count)) in wallet_expectancy_inputs {
+        state
+            .expectancy_by_wallet
+            .insert(wallet, mean_decimal(pnl_sum, count));
+    }
+    for (market_type, (pnl_sum, count)) in market_type_expectancy_inputs {
+        state
+            .expectancy_by_market_type
+            .insert(market_type, mean_decimal(pnl_sum, count));
+    }
+    for (bucket, (pnl_sum, count)) in conviction_expectancy_inputs {
+        state
+            .expectancy_by_conviction_bucket
+            .insert(bucket, mean_decimal(pnl_sum, count));
+    }
+    for (bucket, (size_sum, count)) in conviction_size_inputs {
+        state
+            .average_size_by_conviction_bucket
+            .insert(bucket, mean_decimal(size_sum, count));
     }
 }
 
@@ -872,11 +982,23 @@ fn market_type_label(market_type: models::MarketType) -> &'static str {
     }
 }
 
+fn conviction_bucket_label(score: Decimal) -> &'static str {
+    risk::conviction_bucket_label(score)
+}
+
 fn ratio_decimal(numerator: u64, denominator: u64) -> Decimal {
     if denominator == 0 {
         Decimal::ZERO
     } else {
         Decimal::from(numerator) / Decimal::from(denominator)
+    }
+}
+
+fn mean_decimal(sum: Decimal, count: u64) -> Decimal {
+    if count == 0 {
+        Decimal::ZERO
+    } else {
+        (sum / Decimal::from(count)).round_dp(4)
     }
 }
 
@@ -2521,7 +2643,7 @@ async fn process_trade(
         },
         ExecutionSide::Buy => risk.evaluate_with_context(entry, &current_portfolio, risk_context),
     };
-    let decision = match evaluation {
+    let mut decision = match evaluation {
         Ok(decision) => decision,
         Err(reason) => {
             record_trade_skip(
@@ -2540,11 +2662,6 @@ async fn process_trade(
             return Ok(TradeProcessingOutcome::Skipped(reason));
         }
     };
-    if decision.size_was_scaled {
-        analytics
-            .record_risk_event("position_size_scaled", Some(&current_portfolio))
-            .await;
-    }
     if matches!(side, ExecutionSide::Buy)
         && let Err(reason) =
             risk.enforce_entry_quality_pre_quote(entry, &market_quality_observation, risk_context)
@@ -2568,6 +2685,7 @@ async fn process_trade(
     stage_timestamps.fast_risk_completed_at_utc = Some(Utc::now());
     let eligible_class = eligible_class_for_side(side);
     let mut pending_open_key = None;
+    let mut entry_metadata = None;
 
     if matches!(side, ExecutionSide::Buy)
         && let Some(position_key) = decision.position_key.as_ref()
@@ -2753,37 +2871,82 @@ async fn process_trade(
             "resolved execution quote through resilient fallback path"
         );
     }
-    if matches!(execution_mode, ExecutionMode::Normal)
-        && matches!(side, ExecutionSide::Buy)
-        && let Err(reason) = risk.enforce_entry_quality_post_quote(
+    if matches!(execution_mode, ExecutionMode::Normal) && matches!(side, ExecutionSide::Buy) {
+        let quality = match risk.enforce_entry_quality_post_quote(
             entry,
             &current_portfolio,
             &resolved_quote.quote,
             &market_quality_observation,
             risk_context,
-        )
-    {
-        finalize_failed_pending_open(
-            position_resolver,
-            pending_open_key.as_ref(),
-            &analytics,
-            "market_quality_rejected",
-        )
-        .await;
-        record_trade_skip(
+        ) {
+            Ok(quality) => quality,
+            Err(reason) => {
+                finalize_failed_pending_open(
+                    position_resolver,
+                    pending_open_key.as_ref(),
+                    &analytics,
+                    "market_quality_rejected",
+                )
+                .await;
+                record_trade_skip(
+                    entry,
+                    signal,
+                    risk,
+                    health,
+                    latency_logger,
+                    analytics,
+                    Some(&current_portfolio),
+                    None,
+                    classify_rejected_trade(side, has_copied_inventory),
+                    &reason,
+                )
+                .await;
+                return Ok(TradeProcessingOutcome::Skipped(reason));
+            }
+        };
+        let sizing = match risk.finalize_entry_sizing(
             entry,
-            signal,
-            risk,
-            health,
-            latency_logger,
-            analytics,
-            Some(&current_portfolio),
-            None,
-            classify_rejected_trade(side, has_copied_inventory),
-            &reason,
-        )
-        .await;
-        return Ok(TradeProcessingOutcome::Skipped(reason));
+            &current_portfolio,
+            &market_quality_observation,
+            &quality,
+            risk_context,
+            &mut decision,
+        ) {
+            Ok(sizing) => sizing,
+            Err(reason) => {
+                finalize_failed_pending_open(
+                    position_resolver,
+                    pending_open_key.as_ref(),
+                    &analytics,
+                    reason.code,
+                )
+                .await;
+                record_trade_skip(
+                    entry,
+                    signal,
+                    risk,
+                    health,
+                    latency_logger,
+                    analytics,
+                    Some(&current_portfolio),
+                    None,
+                    classify_rejected_trade(side, has_copied_inventory),
+                    &reason,
+                )
+                .await;
+                return Ok(TradeProcessingOutcome::Skipped(reason));
+            }
+        };
+        entry_metadata = Some(EntryExecutionMetadata {
+            conviction_score: sizing.conviction_score,
+            wallet_alpha_score: sizing.wallet_alpha_score,
+            sizing_bucket: sizing.sizing_bucket.to_owned(),
+        });
+    }
+    if matches!(side, ExecutionSide::Buy) && decision.size_was_scaled {
+        analytics
+            .record_risk_event("position_size_scaled", Some(&current_portfolio))
+            .await;
     }
     if matches!(execution_mode, ExecutionMode::Normal)
         && let Err(reason) = enforce_signal_price_deviation(entry, &decision, &resolved_quote.quote)
@@ -3168,6 +3331,7 @@ async fn process_trade(
             &result,
             Some(&current_portfolio),
             decision.position_key.as_ref(),
+            entry_metadata.as_ref(),
         )
         .await;
     health.increment_processed().await;
@@ -3181,6 +3345,7 @@ async fn process_trade(
         (*position_resolver).clone(),
         closing_positions,
         decision.position_key.clone(),
+        entry_metadata,
         released_hot_task_tx,
         notifier,
         health,
@@ -3397,13 +3562,14 @@ fn spawn_post_trade_side_effects(
     position_resolver: PositionResolver,
     closing_positions: ClosingPositions,
     closing_position_key: Option<PositionKey>,
+    entry_metadata: Option<EntryExecutionMetadata>,
     released_hot_task_tx: mpsc::UnboundedSender<HotPathTradeTask>,
     notifier: Arc<TelegramNotifier>,
     health: Arc<HealthState>,
     analytics: Arc<ExecutionAnalyticsTracker>,
 ) {
     tokio::spawn(async move {
-        let refreshed = if result.mode.is_paper() {
+        let mut refreshed = if result.mode.is_paper() {
             match portfolio
                 .apply_paper_fill(&entry, &result, decision.position_key.as_ref())
                 .await
@@ -3455,6 +3621,18 @@ fn spawn_post_trade_side_effects(
                 }
             }
         };
+        if matches!(decision.side, ExecutionSide::Buy)
+            && let (Some(position_key), Some(metadata)) =
+                (decision.position_key.as_ref(), entry_metadata.as_ref())
+            && let Some(position) = refreshed.position_mut_by_key(position_key)
+        {
+            position.entry_conviction_score = metadata.conviction_score;
+            position.peak_price_since_open =
+                position.peak_price_since_open.max(position.current_price);
+            if let Ok(stored_snapshot) = portfolio.store_snapshot(refreshed.clone()).await {
+                refreshed = stored_snapshot;
+            }
+        }
         match position_resolver.sync_from_portfolio(&refreshed) {
             Ok(released_exits) => {
                 for released_exit in released_exits {
@@ -3531,6 +3709,7 @@ async fn record_trade_skip(
         "drawdown_guard_triggered"
             | "hard_stop_triggered"
             | "exposure_limit_reached"
+            | "wallet_exposure_limit"
             | "market_exposure_limit"
             | "loss_streak_guard_triggered"
     ) {
@@ -4000,6 +4179,7 @@ async fn attempt_fail_safe_hedge(
                     portfolio.as_ref().clone(),
                     position_resolver,
                     closing_positions.clone(),
+                    None,
                     None,
                     released_hot_task_tx,
                     notifier,
@@ -4940,6 +5120,7 @@ async fn attempt_managed_exit_position(
             &result,
             Some(&closing_snapshot),
             Some(&position_key),
+            None,
         )
         .await;
     health.increment_processed().await;
@@ -4954,6 +5135,7 @@ async fn attempt_managed_exit_position(
         position_resolver,
         closing_positions,
         Some(position_key),
+        None,
         released_hot_task_tx,
         notifier,
         health,
@@ -5035,15 +5217,46 @@ fn profit_protection_triggered(
         return false;
     }
 
-    let profitable = best_bid
+    let conviction = position_conviction_score(position);
+    let min_profit_pct = settings.profit_protect_min_pnl_pct.max(Decimal::ZERO)
+        * if conviction >= dec!(0.85) {
+            dec!(1.10)
+        } else if conviction <= dec!(0.60) {
+            dec!(0.85)
+        } else {
+            Decimal::ONE
+        };
+    let reversal_bps = Decimal::from(settings.profit_protect_reversal_bps.max(1))
+        * if conviction >= dec!(0.85) {
+            dec!(1.15)
+        } else if conviction <= dec!(0.60) {
+            dec!(0.75)
+        } else {
+            Decimal::ONE
+        };
+    let peak_price = position
+        .peak_price_since_open
+        .max(position.current_price)
+        .max(best_bid);
+    let profitable_peak = peak_price
         >= position.average_entry_price
-            * (rust_decimal::Decimal::ONE + settings.profit_protect_min_pnl_pct.max(Decimal::ZERO));
-    let reversal = best_bid
-        <= position.current_price
-            * (rust_decimal::Decimal::ONE
-                - Decimal::from(settings.profit_protect_reversal_bps)
-                    / rust_decimal_macros::dec!(10000));
-    profitable && reversal
+            * (rust_decimal::Decimal::ONE + min_profit_pct.max(Decimal::ZERO));
+    if !profitable_peak {
+        return false;
+    }
+
+    let ratchet_floor = peak_price
+        * (rust_decimal::Decimal::ONE
+            - (reversal_bps.max(Decimal::ONE) / rust_decimal_macros::dec!(10000)));
+    let locked_profit_floor = position.average_entry_price
+        * (rust_decimal::Decimal::ONE
+            + (min_profit_pct
+                * if conviction >= dec!(0.70) {
+                    dec!(0.60)
+                } else {
+                    dec!(0.40)
+                }));
+    best_bid <= ratchet_floor.max(locked_profit_floor)
 }
 
 fn evaluate_time_exit(
@@ -5060,6 +5273,7 @@ fn evaluate_time_exit(
         return TimeExitEvaluation::Suppress("source_exit_pending");
     }
 
+    let conviction = position_conviction_score(position);
     let reference_price = position
         .current_price
         .max(position.average_entry_price)
@@ -5078,16 +5292,27 @@ fn evaluate_time_exit(
         && position.unrealized_pnl < rust_decimal::Decimal::ZERO;
     let strong_reversal = best_bid
         <= position.current_price * (rust_decimal::Decimal::ONE - TIME_EXIT_FAVORABLE_TREND_BPS);
+    let hold_extension_multiplier = if conviction >= dec!(0.85) {
+        3
+    } else if conviction >= dec!(0.70) {
+        2
+    } else {
+        1
+    };
     let extended_hold = position.age(now).is_some_and(|age| {
         age >= TimeDelta::seconds(
-            max_hold_time_seconds.saturating_mul(TIME_EXIT_EXTENSION_MULTIPLIER),
+            max_hold_time_seconds
+                .saturating_mul(TIME_EXIT_EXTENSION_MULTIPLIER.max(hold_extension_multiplier)),
         )
     });
 
-    if mild_loss && !strong_reversal && !extended_hold {
+    if conviction < dec!(0.60) && (position.unrealized_pnl < Decimal::ZERO || strong_reversal) {
+        return TimeExitEvaluation::Trigger;
+    }
+    if mild_loss && conviction >= dec!(0.60) && !strong_reversal && !extended_hold {
         return TimeExitEvaluation::Suppress("mild_loss_extension");
     }
-    if favorable_trend && !extended_hold {
+    if favorable_trend && conviction >= dec!(0.65) && !extended_hold {
         return TimeExitEvaluation::Suppress("favorable_trend");
     }
     if stagnant || position.unrealized_pnl <= TIME_EXIT_SMALL_PNL_ABS || extended_hold {
@@ -5106,17 +5331,30 @@ fn managed_exit_reason(
     source_exit_pending: bool,
 ) -> ManagedExitEvaluation {
     if position.average_entry_price > rust_decimal::Decimal::ZERO {
+        let conviction = position_conviction_score(position);
         if profit_protection_triggered(settings, position, best_bid) {
             return ManagedExitEvaluation::Trigger(ManagedExitReason::ProfitProtection);
         }
-        if !source_exit_pending
-            && best_bid >= position.average_entry_price * rust_decimal::Decimal::new(115, 2)
-        {
+        let take_profit_multiple = if conviction >= dec!(0.85) {
+            rust_decimal::Decimal::new(122, 2)
+        } else if conviction >= dec!(0.70) {
+            rust_decimal::Decimal::new(118, 2)
+        } else {
+            rust_decimal::Decimal::new(112, 2)
+        };
+        if !source_exit_pending && best_bid >= position.average_entry_price * take_profit_multiple {
             return ManagedExitEvaluation::Trigger(ManagedExitReason::TakeProfit);
         }
         let catastrophic_stop =
             best_bid <= position.average_entry_price * rust_decimal::Decimal::new(80, 2);
-        if best_bid <= position.average_entry_price * rust_decimal::Decimal::new(90, 2)
+        let stop_loss_multiple = if conviction >= dec!(0.85) {
+            rust_decimal::Decimal::new(88, 2)
+        } else if conviction >= dec!(0.70) {
+            rust_decimal::Decimal::new(90, 2)
+        } else {
+            rust_decimal::Decimal::new(94, 2)
+        };
+        if best_bid <= position.average_entry_price * stop_loss_multiple
             && (!source_exit_pending || catastrophic_stop)
         {
             return ManagedExitEvaluation::Trigger(ManagedExitReason::StopLoss);
@@ -5133,6 +5371,21 @@ fn managed_exit_reason(
         TimeExitEvaluation::Trigger => ManagedExitEvaluation::Trigger(ManagedExitReason::TimeExit),
         TimeExitEvaluation::Suppress(reason) => ManagedExitEvaluation::SuppressTimeExit(reason),
         TimeExitEvaluation::None => ManagedExitEvaluation::None,
+    }
+}
+
+fn position_conviction_score(position: &models::PortfolioPosition) -> Decimal {
+    if position.entry_conviction_score > Decimal::ZERO {
+        return position
+            .entry_conviction_score
+            .max(dec!(0.30))
+            .min(Decimal::ONE);
+    }
+
+    match models::classify_market(&position.title) {
+        models::MarketType::UltraShort => dec!(0.50),
+        models::MarketType::Short => dec!(0.65),
+        models::MarketType::Medium => dec!(0.75),
     }
 }
 
@@ -6004,6 +6257,8 @@ mod tests {
             current_value: dec!(5),
             source_entry_price: dec!(0.5),
             average_entry_price: dec!(0.5),
+            entry_conviction_score: Decimal::ZERO,
+            peak_price_since_open: dec!(0.5),
             current_price: dec!(0.5),
             cost_basis: dec!(5),
             unrealized_pnl: dec!(0),
@@ -6606,6 +6861,8 @@ mod tests {
             current_value: dec!(5),
             source_entry_price: dec!(0.5),
             average_entry_price: dec!(0.5),
+            entry_conviction_score: dec!(0.75),
+            peak_price_since_open: dec!(0.58),
             current_price: dec!(0.5),
             cost_basis: dec!(5),
             unrealized_pnl: dec!(0),
@@ -6625,7 +6882,7 @@ mod tests {
                 &settings,
                 &position,
                 Utc::now(),
-                dec!(0.58),
+                dec!(0.60),
                 TIME_EXIT_MAX_HOLD_SECONDS,
                 false,
             ),
@@ -6649,7 +6906,10 @@ mod tests {
         assert_eq!(
             managed_exit_reason(
                 &settings,
-                &position,
+                &models::PortfolioPosition {
+                    peak_price_since_open: dec!(0.50),
+                    ..position.clone()
+                },
                 Utc::now(),
                 dec!(0.44),
                 TIME_EXIT_MAX_HOLD_SECONDS,
@@ -6660,7 +6920,10 @@ mod tests {
         assert_eq!(
             managed_exit_reason(
                 &settings,
-                &position,
+                &models::PortfolioPosition {
+                    peak_price_since_open: dec!(0.50),
+                    ..position.clone()
+                },
                 Utc::now(),
                 dec!(0.50),
                 TIME_EXIT_MAX_HOLD_SECONDS,
@@ -6671,7 +6934,10 @@ mod tests {
         assert_eq!(
             managed_exit_reason(
                 &settings,
-                &position,
+                &models::PortfolioPosition {
+                    peak_price_since_open: dec!(0.50),
+                    ..position
+                },
                 Utc::now(),
                 dec!(0.50),
                 TIME_EXIT_MAX_HOLD_SECONDS,
@@ -6695,6 +6961,8 @@ mod tests {
             current_value: dec!(5.8),
             source_entry_price: dec!(0.5),
             average_entry_price: dec!(0.5),
+            entry_conviction_score: dec!(0.80),
+            peak_price_since_open: dec!(0.56),
             current_price: dec!(0.55),
             cost_basis: dec!(5),
             unrealized_pnl: dec!(0.8),
@@ -6727,6 +6995,7 @@ mod tests {
                     current_price: dec!(0.50),
                     current_value: dec!(5),
                     unrealized_pnl: dec!(0),
+                    peak_price_since_open: dec!(0.50),
                     ..position
                 },
                 Utc::now(),
@@ -6752,6 +7021,8 @@ mod tests {
             current_value: dec!(4.95),
             source_entry_price: dec!(0.5),
             average_entry_price: dec!(0.5),
+            entry_conviction_score: dec!(0.70),
+            peak_price_since_open: dec!(0.50),
             current_price: dec!(0.50),
             cost_basis: dec!(5),
             unrealized_pnl: dec!(-0.05),
@@ -6776,6 +7047,202 @@ mod tests {
                 false,
             ),
             ManagedExitEvaluation::SuppressTimeExit("mild_loss_extension")
+        );
+    }
+
+    #[test]
+    fn low_conviction_losers_compress_faster_than_high_conviction_trades() {
+        let settings = sample_settings(std::env::temp_dir().join("conviction-time-exit-test"));
+        let base_position = models::PortfolioPosition {
+            asset: "asset-1".to_owned(),
+            condition_id: "condition-1".to_owned(),
+            title: "Sample market".to_owned(),
+            outcome: "YES".to_owned(),
+            source_wallet: "0xsource".to_owned(),
+            state: models::PositionState::Open,
+            size: dec!(10),
+            current_value: dec!(4.95),
+            source_entry_price: dec!(0.5),
+            average_entry_price: dec!(0.5),
+            entry_conviction_score: dec!(0.85),
+            peak_price_since_open: dec!(0.50),
+            current_price: dec!(0.50),
+            cost_basis: dec!(5),
+            unrealized_pnl: dec!(-0.05),
+            opened_at: Some(Utc::now() - chrono::TimeDelta::minutes(20)),
+            source_trade_timestamp_unix: 0,
+            closing_started_at: None,
+            closing_reason: None,
+            last_close_attempt_at: None,
+            close_attempts: 0,
+            close_failure_reason: None,
+            closing_escalation_level: 0,
+            stale_reason: None,
+        };
+
+        assert_eq!(
+            managed_exit_reason(
+                &settings,
+                &base_position,
+                Utc::now(),
+                dec!(0.499),
+                TIME_EXIT_MAX_HOLD_SECONDS,
+                false,
+            ),
+            ManagedExitEvaluation::SuppressTimeExit("mild_loss_extension")
+        );
+        assert_eq!(
+            managed_exit_reason(
+                &settings,
+                &models::PortfolioPosition {
+                    entry_conviction_score: dec!(0.45),
+                    ..base_position
+                },
+                Utc::now(),
+                dec!(0.499),
+                TIME_EXIT_MAX_HOLD_SECONDS,
+                false,
+            ),
+            ManagedExitEvaluation::Trigger(ManagedExitReason::TimeExit)
+        );
+    }
+
+    #[test]
+    fn expectancy_analytics_update_correctly() {
+        let now = Utc::now();
+        let mut state = ExecutionAnalyticsState {
+            cohorts: vec![
+            TradeCohort {
+                source_wallet: "0xwallet-a".to_owned(),
+                asset: "asset-a".to_owned(),
+                condition_id: "condition-a".to_owned(),
+                outcome: "YES".to_owned(),
+                market_type: models::MarketType::Medium,
+                side: "BUY".to_owned(),
+                source_trade_timestamp_unix: now.timestamp_millis(),
+                source_price: dec!(0.5),
+                filled_price: dec!(0.5),
+                entry_slippage_pct: dec!(0.01),
+                conviction_score: dec!(0.90),
+                wallet_alpha_score: dec!(0.82),
+                entry_notional: dec!(8),
+                sizing_bucket: "high_conviction".to_owned(),
+                filled_size: dec!(16),
+                execution_mode: "paper".to_owned(),
+                open_time: now - chrono::TimeDelta::minutes(30),
+                close_time: Some(now),
+                close_reason: Some("PROFIT_PROTECTION".to_owned()),
+                realized_pnl: dec!(2),
+                unrealized_pnl: Decimal::ZERO,
+                status: TradeCohortStatus::Closed,
+                remaining_size: Decimal::ZERO,
+                cost_basis: Decimal::ZERO,
+            },
+            TradeCohort {
+                source_wallet: "0xwallet-b".to_owned(),
+                asset: "asset-b".to_owned(),
+                condition_id: "condition-b".to_owned(),
+                outcome: "NO".to_owned(),
+                market_type: models::MarketType::Short,
+                side: "BUY".to_owned(),
+                source_trade_timestamp_unix: now.timestamp_millis(),
+                source_price: dec!(0.5),
+                filled_price: dec!(0.5),
+                entry_slippage_pct: dec!(0.02),
+                conviction_score: dec!(0.55),
+                wallet_alpha_score: dec!(0.50),
+                entry_notional: dec!(5),
+                sizing_bucket: "reduced".to_owned(),
+                filled_size: dec!(10),
+                execution_mode: "paper".to_owned(),
+                open_time: now - chrono::TimeDelta::minutes(20),
+                close_time: Some(now),
+                close_reason: Some("TIME_EXIT".to_owned()),
+                realized_pnl: dec!(-1),
+                unrealized_pnl: Decimal::ZERO,
+                status: TradeCohortStatus::Closed,
+                remaining_size: Decimal::ZERO,
+                cost_basis: Decimal::ZERO,
+            },
+            TradeCohort {
+                source_wallet: "0xwallet-b".to_owned(),
+                asset: "asset-c".to_owned(),
+                condition_id: "condition-c".to_owned(),
+                outcome: "YES".to_owned(),
+                market_type: models::MarketType::UltraShort,
+                side: "BUY".to_owned(),
+                source_trade_timestamp_unix: now.timestamp_millis(),
+                source_price: dec!(0.5),
+                filled_price: dec!(0.5),
+                entry_slippage_pct: dec!(0.02),
+                conviction_score: dec!(0.58),
+                wallet_alpha_score: dec!(0.48),
+                entry_notional: dec!(4),
+                sizing_bucket: "micro".to_owned(),
+                filled_size: dec!(8),
+                execution_mode: "paper".to_owned(),
+                open_time: now - chrono::TimeDelta::minutes(10),
+                close_time: Some(now),
+                close_reason: Some("STOP_LOSS".to_owned()),
+                realized_pnl: dec!(-0.5),
+                unrealized_pnl: Decimal::ZERO,
+                status: TradeCohortStatus::Closed,
+                remaining_size: Decimal::ZERO,
+                cost_basis: Decimal::ZERO,
+            },
+            ],
+            ..ExecutionAnalyticsState::default()
+        };
+        let portfolio = models::PortfolioSnapshot {
+            fetched_at: now,
+            total_value: dec!(200.5),
+            current_equity: dec!(200.5),
+            starting_equity: dec!(200),
+            peak_equity: dec!(200.5),
+            ..models::PortfolioSnapshot::default()
+        };
+
+        refresh_analytics_from_portfolio(&mut state, &portfolio, dec!(200));
+
+        assert_eq!(state.average_winner.round_dp(4), dec!(2));
+        assert_eq!(state.average_loser.round_dp(4), dec!(-0.75));
+        assert_eq!(state.payoff_ratio.round_dp(4), dec!(2.6667));
+        assert_eq!(state.expectancy_per_trade.round_dp(4), dec!(0.1667));
+        assert_eq!(
+            state
+                .expectancy_by_conviction_bucket
+                .get("high")
+                .copied()
+                .unwrap_or(Decimal::ZERO)
+                .round_dp(4),
+            dec!(2)
+        );
+        assert_eq!(
+            state
+                .expectancy_by_conviction_bucket
+                .get("low")
+                .copied()
+                .unwrap_or(Decimal::ZERO)
+                .round_dp(4),
+            dec!(-0.75)
+        );
+        assert_eq!(
+            state
+                .pnl_by_sizing_bucket
+                .get("high_conviction")
+                .copied()
+                .unwrap_or(Decimal::ZERO)
+                .round_dp(4),
+            dec!(2)
+        );
+        assert_eq!(
+            state
+                .average_size_by_conviction_bucket
+                .get("low")
+                .copied()
+                .unwrap_or(Decimal::ZERO)
+                .round_dp(4),
+            dec!(4.5)
         );
     }
 

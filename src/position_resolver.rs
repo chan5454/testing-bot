@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeDelta, Utc};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use tokio::time::{MissedTickBehavior, interval};
@@ -399,6 +400,7 @@ impl PositionResolver {
             size: record.size,
             current_value: record.current_value,
             average_entry_price: record.average_entry_price,
+            entry_conviction_score: Decimal::ZERO,
             used_fallback: false,
             fallback_reason: None,
         })
@@ -638,6 +640,8 @@ mod tests {
             current_value: dec!(5),
             source_entry_price: dec!(0.5),
             average_entry_price: dec!(0.5),
+            entry_conviction_score: Decimal::ZERO,
+            peak_price_since_open: dec!(0.5),
             current_price: dec!(0.5),
             cost_basis: dec!(5),
             unrealized_pnl: dec!(0),

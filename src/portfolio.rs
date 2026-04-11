@@ -270,6 +270,8 @@ impl PortfolioService {
                 current_value,
                 source_entry_price: current_price,
                 average_entry_price: current_price,
+                entry_conviction_score: Decimal::ZERO,
+                peak_price_since_open: current_price,
                 current_price,
                 cost_basis: current_value,
                 unrealized_pnl: Decimal::ZERO,
@@ -503,6 +505,8 @@ fn apply_position_fill(
                     new_cost_basis / new_size
                 };
                 position.current_price = result.filled_price;
+                position.peak_price_since_open =
+                    position.peak_price_since_open.max(result.filled_price);
                 position.cost_basis = new_cost_basis;
                 position.current_value = position.size * position.current_price;
                 position.unrealized_pnl = position.current_value - position.cost_basis;
@@ -527,6 +531,8 @@ fn apply_position_fill(
                     size: result.filled_size,
                     source_entry_price: source.price_decimal().unwrap_or(result.filled_price),
                     average_entry_price: result.filled_price,
+                    entry_conviction_score: Decimal::ZERO,
+                    peak_price_since_open: result.filled_price,
                     current_price: result.filled_price,
                     cost_basis: result.filled_notional,
                     current_value: result.filled_size * result.filled_price,
@@ -633,6 +639,8 @@ impl PortfolioService {
                 ) {
                     position.current_price = mark_price;
                 }
+                position.peak_price_since_open =
+                    position.peak_price_since_open.max(position.current_price);
                 position.current_value = position.size * position.current_price;
                 position.cost_basis = position.size * position.average_entry_price;
                 position.unrealized_pnl = position.current_value - position.cost_basis;
@@ -793,6 +801,15 @@ fn normalize_snapshot(snapshot: &mut PortfolioSnapshot) {
         }
         if position.source_entry_price.is_zero() {
             position.source_entry_price = position.average_entry_price;
+        }
+        if position.peak_price_since_open.is_zero() {
+            position.peak_price_since_open =
+                position.current_price.max(position.average_entry_price);
+        } else {
+            position.peak_price_since_open = position
+                .peak_price_since_open
+                .max(position.current_price)
+                .max(position.average_entry_price);
         }
         if position.cost_basis.is_zero() {
             position.cost_basis = position.average_entry_price * position.size;
@@ -1266,6 +1283,8 @@ mod tests {
                 current_value: dec!(6.4),
                 source_entry_price: dec!(0.8),
                 average_entry_price: dec!(0.8),
+                entry_conviction_score: Decimal::ZERO,
+                peak_price_since_open: dec!(0.8),
                 current_price: dec!(0.8),
                 cost_basis: dec!(6.4),
                 unrealized_pnl: Decimal::ZERO,
@@ -1300,6 +1319,8 @@ mod tests {
                     current_value: dec!(2.4),
                     source_entry_price: dec!(0.4),
                     average_entry_price: dec!(0.4),
+                    entry_conviction_score: Decimal::ZERO,
+                    peak_price_since_open: dec!(0.4),
                     current_price: dec!(0.4),
                     cost_basis: dec!(2.4),
                     unrealized_pnl: Decimal::ZERO,
@@ -1324,6 +1345,8 @@ mod tests {
                     current_value: dec!(2),
                     source_entry_price: dec!(0.5),
                     average_entry_price: dec!(0.5),
+                    entry_conviction_score: Decimal::ZERO,
+                    peak_price_since_open: dec!(0.5),
                     current_price: dec!(0.5),
                     cost_basis: dec!(2),
                     unrealized_pnl: Decimal::ZERO,
@@ -1379,6 +1402,8 @@ mod tests {
                 current_value: dec!(4),
                 source_entry_price: dec!(0.8),
                 average_entry_price: dec!(0.8),
+                entry_conviction_score: Decimal::ZERO,
+                peak_price_since_open: dec!(0.8),
                 current_price: dec!(0.8),
                 cost_basis: dec!(4),
                 unrealized_pnl: Decimal::ZERO,
@@ -1412,6 +1437,8 @@ mod tests {
                 current_value: dec!(5),
                 source_entry_price: dec!(0.5),
                 average_entry_price: dec!(0.5),
+                entry_conviction_score: Decimal::ZERO,
+                peak_price_since_open: dec!(0.5),
                 current_price: dec!(0.5),
                 cost_basis: dec!(5),
                 unrealized_pnl: Decimal::ZERO,

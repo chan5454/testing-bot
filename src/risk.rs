@@ -119,6 +119,13 @@ pub struct WalletAlphaScore {
 }
 
 #[derive(Clone, Debug)]
+pub struct FinalizedEntrySizing {
+    pub conviction_score: Decimal,
+    pub wallet_alpha_score: Decimal,
+    pub sizing_bucket: &'static str,
+}
+
+#[derive(Clone, Debug)]
 pub struct MarketQualityObservation {
     pub market_type: MarketType,
     pub signal_age_ms: Option<u64>,
@@ -670,6 +677,141 @@ impl RiskEngine {
         Ok(quality)
     }
 
+    pub fn finalize_entry_sizing(
+        &self,
+        entry: &ActivityEntry,
+        portfolio: &PortfolioSnapshot,
+        observation: &MarketQualityObservation,
+        quality: &TradeQualityScore,
+        context: AdaptiveRiskContext,
+        decision: &mut CopyDecision,
+    ) -> Result<FinalizedEntrySizing, SkipReason> {
+        let wallet_alpha = wallet_alpha_score(&self.settings, portfolio, &entry.proxy_wallet);
+        let total_headroom = exposure_headroom_score(
+            portfolio.total_exposure_pct(),
+            self.settings.max_total_exposure_pct,
+        );
+        let market_headroom = exposure_headroom_score(
+            portfolio.market_exposure_pct(&entry.condition_id),
+            self.settings.max_exposure_per_market_pct,
+        );
+        let wallet_headroom = exposure_headroom_score(
+            portfolio.wallet_exposure_pct(&entry.proxy_wallet),
+            self.settings.max_exposure_per_wallet_pct,
+        );
+        let market_type_headroom =
+            soft_market_type_headroom(portfolio.market_type_exposure_pct(observation.market_type));
+        let liquidity_spread_score = ((quality.liquidity_score + quality.spread_score) / dec!(2))
+            .max(Decimal::ZERO)
+            .min(Decimal::ONE);
+        let wallet_penalty = wallet_performance_multiplier(portfolio, &entry.proxy_wallet)
+            .max(dec!(0.20))
+            .min(Decimal::ONE);
+        let conviction_score = ((quality.total_score * dec!(0.42))
+            + (wallet_alpha.total_score * dec!(0.18))
+            + (liquidity_spread_score * dec!(0.10))
+            + (quality.slippage_score * dec!(0.08))
+            + (quality.timing_score * dec!(0.08))
+            + (total_headroom * dec!(0.05))
+            + (wallet_headroom * dec!(0.04))
+            + (market_headroom * dec!(0.03))
+            + (market_type_headroom * dec!(0.02)))
+        .round_dp(4)
+        .max(Decimal::ZERO)
+        .min(Decimal::ONE);
+        let conviction_multiplier = conviction_size_multiplier(&self.settings, conviction_score);
+        let wallet_sizing_multiplier =
+            wallet_alpha_sizing_multiplier(&wallet_alpha, wallet_penalty);
+        let market_type_multiplier =
+            market_type_size_multiplier(&self.settings, observation.market_type);
+        let concentration_multiplier = concentration_sizing_multiplier(
+            total_headroom,
+            wallet_headroom,
+            market_headroom,
+            market_type_headroom,
+        );
+        let max_risk_pct = self
+            .settings
+            .max_risk_per_trade_pct
+            .max(Decimal::ZERO)
+            .min(Decimal::ONE);
+        let base_risk_pct = self
+            .settings
+            .base_risk_per_trade_pct
+            .max(Decimal::ZERO)
+            .min(max_risk_pct.max(Decimal::ZERO));
+        let minimum_risk_pct = self
+            .settings
+            .min_risk_per_trade_pct
+            .max(Decimal::ZERO)
+            .min(base_risk_pct.max(max_risk_pct));
+        let conviction_floor = if conviction_score >= dec!(0.70) {
+            minimum_risk_pct
+                * market_type_multiplier.min(Decimal::ONE)
+                * mode_size_multiplier(&self.settings, context.mode).max(dec!(0.35))
+        } else {
+            Decimal::ZERO
+        };
+        let raw_risk_pct = base_risk_pct
+            * conviction_multiplier
+            * wallet_sizing_multiplier
+            * market_type_multiplier
+            * concentration_multiplier
+            * mode_size_multiplier(&self.settings, context.mode);
+        let risk_per_trade_pct = raw_risk_pct
+            .max(conviction_floor)
+            .min(max_risk_pct)
+            .max(Decimal::ZERO)
+            .round_dp(4);
+        let risk_based_notional = (portfolio.equity() * risk_per_trade_pct).max(Decimal::ZERO);
+        let remaining_total = (self.total_exposure_cap(portfolio)
+            - portfolio.active_total_exposure())
+        .max(Decimal::ZERO);
+        let remaining_market = (self.market_exposure_cap(portfolio)
+            - portfolio.market_exposure(&entry.condition_id))
+        .max(Decimal::ZERO);
+        let remaining_wallet = if self.settings.max_exposure_per_wallet_pct > Decimal::ZERO {
+            (self.wallet_exposure_cap(portfolio) - portfolio.wallet_exposure(&entry.proxy_wallet))
+                .max(Decimal::ZERO)
+        } else {
+            decision.notional
+        };
+        let original_notional = decision.notional.max(Decimal::ZERO);
+        let final_notional = original_notional
+            .min(risk_based_notional)
+            .min(self.settings.max_position_size_abs.max(Decimal::ZERO))
+            .min(remaining_total)
+            .min(remaining_market)
+            .min(remaining_wallet)
+            .min(portfolio.cash_balance.max(Decimal::ZERO))
+            .round_dp(4);
+
+        if final_notional < self.settings.min_copy_notional_usd {
+            return Err(SkipReason::new(
+                "buy_notional_below_minimum",
+                format!(
+                    "conviction-sized notional {} is below minimum {} (conviction={} risk_pct={} wallet_headroom={} market_headroom={} total_headroom={})",
+                    final_notional.round_dp(4),
+                    self.settings.min_copy_notional_usd.round_dp(4),
+                    conviction_score.round_dp(4),
+                    risk_per_trade_pct.round_dp(4),
+                    wallet_headroom.round_dp(4),
+                    market_headroom.round_dp(4),
+                    total_headroom.round_dp(4)
+                ),
+            ));
+        }
+
+        decision.size_was_scaled = decision.size_was_scaled || final_notional < original_notional;
+        decision.notional = final_notional;
+
+        Ok(FinalizedEntrySizing {
+            conviction_score,
+            wallet_alpha_score: wallet_alpha.total_score,
+            sizing_bucket: sizing_bucket_label(conviction_score, risk_per_trade_pct, base_risk_pct),
+        })
+    }
+
     fn price_band_rules(
         &self,
         source_price: Decimal,
@@ -899,8 +1041,10 @@ impl RiskEngine {
         }
         let scaled_notional = (base_scaled_notional
             * price_band_rules.size_multiplier
-            * mode_size_multiplier(&self.settings, context.mode)
-            * wallet_performance_multiplier(portfolio, &entry.proxy_wallet))
+            * self
+                .settings
+                .high_conviction_size_multiplier
+                .max(Decimal::ONE))
         .min(self.settings.max_copy_notional_usd)
         .max(Decimal::ZERO);
         let allowed_notional = scaled_notional
@@ -1019,6 +1163,15 @@ impl RiskEngine {
         }
     }
 
+    fn wallet_exposure_cap(&self, portfolio: &PortfolioSnapshot) -> Decimal {
+        if self.settings.max_exposure_per_wallet_pct <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+
+        (portfolio.equity() * self.settings.max_exposure_per_wallet_pct.max(Decimal::ZERO))
+            .max(Decimal::ZERO)
+    }
+
     fn per_trade_notional_cap(&self, portfolio: &PortfolioSnapshot) -> Decimal {
         let pct_cap = if self.settings.max_risk_per_trade_pct > Decimal::ZERO {
             portfolio.equity() * self.settings.max_risk_per_trade_pct.max(Decimal::ZERO)
@@ -1094,6 +1247,23 @@ impl RiskEngine {
                         .round_dp(4),
                     entry.condition_id,
                     self.settings.max_exposure_per_market_pct.round_dp(4)
+                ),
+            ));
+        }
+
+        if self.settings.max_exposure_per_wallet_pct > Decimal::ZERO
+            && portfolio.wallet_exposure_pct(&entry.proxy_wallet)
+                >= self.settings.max_exposure_per_wallet_pct
+        {
+            return Err(SkipReason::new(
+                "wallet_exposure_limit",
+                format!(
+                    "wallet exposure {} for {} reached limit {}",
+                    portfolio
+                        .wallet_exposure_pct(&entry.proxy_wallet)
+                        .round_dp(4),
+                    entry.proxy_wallet,
+                    self.settings.max_exposure_per_wallet_pct.round_dp(4)
                 ),
             ));
         }
@@ -1286,6 +1456,130 @@ fn wallet_performance_multiplier(portfolio: &PortfolioSnapshot, wallet: &str) ->
         multiplier *= dec!(0.5);
     }
     multiplier
+}
+
+fn exposure_headroom_score(current_pct: Decimal, limit_pct: Decimal) -> Decimal {
+    if limit_pct <= Decimal::ZERO {
+        return Decimal::ONE;
+    }
+
+    ((limit_pct - current_pct.max(Decimal::ZERO)) / limit_pct)
+        .max(Decimal::ZERO)
+        .min(Decimal::ONE)
+}
+
+fn soft_market_type_headroom(current_pct: Decimal) -> Decimal {
+    let soft_limit = dec!(0.20);
+    if current_pct <= Decimal::ZERO {
+        return Decimal::ONE;
+    }
+    if current_pct <= soft_limit {
+        return Decimal::ONE;
+    }
+
+    (Decimal::ONE - ((current_pct - soft_limit) / dec!(0.40)))
+        .max(dec!(0.35))
+        .min(Decimal::ONE)
+}
+
+fn conviction_size_multiplier(settings: &Settings, conviction_score: Decimal) -> Decimal {
+    let low = settings
+        .low_conviction_size_multiplier
+        .max(dec!(0.10))
+        .min(dec!(1.25));
+    let high = settings
+        .high_conviction_size_multiplier
+        .max(low)
+        .min(dec!(2.0));
+    if conviction_score <= dec!(0.50) {
+        return low;
+    }
+    if conviction_score >= dec!(0.90) {
+        return high;
+    }
+
+    let progress = ((conviction_score - dec!(0.50)) / dec!(0.40))
+        .max(Decimal::ZERO)
+        .min(Decimal::ONE);
+    (low + ((high - low) * progress)).round_dp(4)
+}
+
+fn wallet_alpha_sizing_multiplier(
+    wallet_alpha: &WalletAlphaScore,
+    wallet_performance_penalty: Decimal,
+) -> Decimal {
+    let exit_efficiency = ((wallet_alpha.source_exit_share
+        + (Decimal::ONE - wallet_alpha.time_exit_share)
+        + (Decimal::ONE - wallet_alpha.stop_loss_share))
+        / dec!(3))
+    .max(Decimal::ZERO)
+    .min(Decimal::ONE);
+    ((wallet_alpha.total_score * dec!(0.60))
+        + (exit_efficiency * dec!(0.20))
+        + (wallet_performance_penalty * dec!(0.20)))
+    .max(dec!(0.30))
+    .min(dec!(1.20))
+    .round_dp(4)
+}
+
+fn market_type_size_multiplier(settings: &Settings, market_type: MarketType) -> Decimal {
+    let medium_or_long = settings
+        .medium_size_multiplier
+        .max(settings.long_size_multiplier)
+        .max(dec!(0.10))
+        .min(dec!(2.0));
+    match market_type {
+        MarketType::UltraShort => settings
+            .ultra_short_size_multiplier
+            .max(dec!(0.10))
+            .min(dec!(1.50)),
+        MarketType::Short => settings
+            .short_size_multiplier
+            .max(dec!(0.10))
+            .min(dec!(1.75)),
+        MarketType::Medium => medium_or_long,
+    }
+}
+
+fn concentration_sizing_multiplier(
+    total_headroom: Decimal,
+    wallet_headroom: Decimal,
+    market_headroom: Decimal,
+    market_type_headroom: Decimal,
+) -> Decimal {
+    ((total_headroom * dec!(0.35))
+        + (wallet_headroom * dec!(0.25))
+        + (market_headroom * dec!(0.25))
+        + (market_type_headroom * dec!(0.15)))
+    .max(dec!(0.25))
+    .min(Decimal::ONE)
+    .round_dp(4)
+}
+
+pub fn conviction_bucket_label(score: Decimal) -> &'static str {
+    if score >= dec!(0.85) {
+        "high"
+    } else if score >= dec!(0.70) {
+        "medium"
+    } else {
+        "low"
+    }
+}
+
+fn sizing_bucket_label(
+    conviction_score: Decimal,
+    risk_per_trade_pct: Decimal,
+    base_risk_pct: Decimal,
+) -> &'static str {
+    if conviction_score >= dec!(0.85) && risk_per_trade_pct >= base_risk_pct {
+        "high_conviction"
+    } else if risk_per_trade_pct <= (base_risk_pct * dec!(0.50)) {
+        "micro"
+    } else if risk_per_trade_pct <= (base_risk_pct * dec!(0.80)) {
+        "reduced"
+    } else {
+        "standard"
+    }
 }
 
 fn recent_win_rate(portfolio: &PortfolioSnapshot) -> Option<Decimal> {
@@ -1680,16 +1974,21 @@ fn source_exit_alpha_sell_multiplier(
     } else {
         Decimal::ZERO
     };
+    let conviction = resolved_position
+        .entry_conviction_score
+        .max(dec!(0.30))
+        .min(Decimal::ONE);
     let favorable_momentum_threshold =
         Decimal::from(settings.source_exit_favorable_momentum_bps.max(1)) / dec!(10000);
     if profitable && favorable_gap >= favorable_momentum_threshold {
-        return (Decimal::ONE
-            - settings
-                .source_exit_partial_retain_pct
-                .max(Decimal::ZERO)
-                .min(dec!(0.85)))
-        .max(dec!(0.25))
-        .round_dp(4);
+        let retain_pct = (settings
+            .source_exit_partial_retain_pct
+            .max(Decimal::ZERO)
+            .min(dec!(0.85))
+            * conviction.max(dec!(0.50)))
+        .max(dec!(0.15))
+        .min(dec!(0.85));
+        return (Decimal::ONE - retain_pct).max(dec!(0.25)).round_dp(4);
     }
 
     Decimal::ONE
@@ -1885,10 +2184,19 @@ mod tests {
     fn sample_settings() -> Settings {
         let mut settings = Settings::default_for_tests(PathBuf::from("./data"));
         settings.max_copy_delay_ms = u64::MAX;
+        settings.base_risk_per_trade_pct = dec!(1);
+        settings.min_risk_per_trade_pct = Decimal::ZERO;
         settings.max_risk_per_trade_pct = dec!(1);
         settings.max_position_size_abs = dec!(1000);
         settings.max_total_exposure_pct = dec!(10);
+        settings.max_exposure_per_wallet_pct = dec!(10);
         settings.max_exposure_per_market_pct = dec!(10);
+        settings.high_conviction_size_multiplier = Decimal::ONE;
+        settings.low_conviction_size_multiplier = Decimal::ONE;
+        settings.ultra_short_size_multiplier = Decimal::ONE;
+        settings.short_size_multiplier = Decimal::ONE;
+        settings.medium_size_multiplier = Decimal::ONE;
+        settings.long_size_multiplier = Decimal::ONE;
         settings.max_drawdown_pct = dec!(1);
         settings.hard_stop_drawdown_pct = dec!(1);
         settings
@@ -1979,6 +2287,8 @@ mod tests {
                 current_value: dec!(5),
                 source_entry_price: dec!(0.4),
                 average_entry_price: dec!(0.4),
+                entry_conviction_score: Decimal::ZERO,
+                peak_price_since_open: dec!(0.5),
                 current_price: dec!(0.5),
                 cost_basis: dec!(4),
                 unrealized_pnl: dec!(1),
@@ -2010,6 +2320,35 @@ mod tests {
             positions: Vec::new(),
             ..PortfolioSnapshot::default()
         }
+    }
+
+    fn finalize_buy_notional(
+        engine: &RiskEngine,
+        entry: &ActivityEntry,
+        portfolio: &PortfolioSnapshot,
+        context: AdaptiveRiskContext,
+    ) -> Decimal {
+        let mut entry = entry.clone();
+        entry.timestamp = recent_timestamp_ms();
+        let mut decision = engine
+            .evaluate_with_context(&entry, portfolio, context)
+            .expect("buy should be eligible before post-quote sizing");
+        let observation = engine.observe_source_trade(&entry);
+        let quote = sample_quote(dec!(0.499), dec!(500), dec!(0.501), dec!(500));
+        let quality = engine
+            .enforce_entry_quality_post_quote(&entry, portfolio, &quote, &observation, context)
+            .expect("quality should pass for sizing test");
+        engine
+            .finalize_entry_sizing(
+                &entry,
+                portfolio,
+                &observation,
+                &quality,
+                context,
+                &mut decision,
+            )
+            .expect("final sizing should succeed");
+        decision.notional
     }
 
     #[test]
@@ -2087,6 +2426,8 @@ mod tests {
             current_value: dec!(150),
             source_entry_price: dec!(1),
             average_entry_price: dec!(1),
+            entry_conviction_score: Decimal::ZERO,
+            peak_price_since_open: dec!(1),
             current_price: dec!(1),
             cost_basis: dec!(150),
             unrealized_pnl: Decimal::ZERO,
@@ -2131,6 +2472,8 @@ mod tests {
             current_value: dec!(140),
             source_entry_price: dec!(1),
             average_entry_price: dec!(1),
+            entry_conviction_score: Decimal::ZERO,
+            peak_price_since_open: dec!(1),
             current_price: dec!(1),
             cost_basis: dec!(140),
             unrealized_pnl: Decimal::ZERO,
@@ -2157,6 +2500,8 @@ mod tests {
     fn buy_notional_scales_down_in_high_price_band() {
         let mut settings = sample_settings();
         settings.copy_scale_above_five_usd = Decimal::ONE;
+        settings.base_risk_per_trade_pct = dec!(0.03);
+        settings.max_risk_per_trade_pct = dec!(0.10);
         let engine = RiskEngine::new(settings);
         let entry = sample_entry("BUY", "asset-2", 20.0, 18.0, "0xsource");
         let mut portfolio = sample_portfolio();
@@ -2174,6 +2519,8 @@ mod tests {
     fn rejects_high_price_buy_above_cutoff() {
         let mut settings = sample_settings();
         settings.copy_scale_above_five_usd = Decimal::ONE;
+        settings.base_risk_per_trade_pct = dec!(0.03);
+        settings.max_risk_per_trade_pct = dec!(0.10);
         let engine = RiskEngine::new(settings);
         let entry = sample_entry("BUY", "asset-2", 20.0, 19.6, "0xsource");
         let mut portfolio = sample_portfolio();
@@ -2190,10 +2537,14 @@ mod tests {
     fn buy_notional_is_reduced_when_wallet_open_pnl_is_negative() {
         let mut settings = sample_settings();
         settings.copy_scale_above_five_usd = Decimal::ONE;
+        settings.base_risk_per_trade_pct = dec!(0.03);
+        settings.max_risk_per_trade_pct = dec!(0.10);
         let engine = RiskEngine::new(settings);
-        let entry = sample_entry("BUY", "asset-2", 20.0, 10.0, "0xsource");
+        let mut entry = sample_entry("BUY", "asset-2", 20.0, 10.0, "0xsource");
+        entry.condition_id = "condition-new".to_owned();
         let mut portfolio = sample_portfolio();
-        portfolio.positions[0].unrealized_pnl = dec!(-2);
+        let mut baseline_portfolio = sample_portfolio();
+        baseline_portfolio.positions[0].unrealized_pnl = Decimal::ZERO;
         portfolio.positions.clear();
         portfolio.positions.push(PortfolioPosition {
             asset: "asset-held".to_owned(),
@@ -2206,6 +2557,8 @@ mod tests {
             current_value: dec!(4),
             source_entry_price: dec!(1),
             average_entry_price: dec!(1),
+            entry_conviction_score: Decimal::ZERO,
+            peak_price_since_open: dec!(1),
             current_price: dec!(0.8),
             cost_basis: dec!(5),
             unrealized_pnl: dec!(-1),
@@ -2220,21 +2573,25 @@ mod tests {
             stale_reason: None,
         });
 
-        let decision = engine
-            .evaluate(&entry, &portfolio)
-            .expect("buy should remain eligible");
+        let penalized_notional =
+            finalize_buy_notional(&engine, &entry, &portfolio, normal_context());
+        let baseline_notional =
+            finalize_buy_notional(&engine, &entry, &baseline_portfolio, normal_context());
 
-        assert_eq!(decision.notional, dec!(5));
+        assert!(penalized_notional < baseline_notional);
     }
 
     #[test]
     fn buy_notional_is_reduced_when_wallet_realized_pnl_is_negative() {
         let mut settings = sample_settings();
         settings.copy_scale_above_five_usd = Decimal::ONE;
+        settings.base_risk_per_trade_pct = dec!(0.03);
+        settings.max_risk_per_trade_pct = dec!(0.10);
         let engine = RiskEngine::new(settings);
         let entry = sample_entry("BUY", "asset-2", 20.0, 10.0, "0xsource");
         let mut portfolio = sample_portfolio();
         portfolio.positions.clear();
+        let baseline_portfolio = portfolio.clone();
         portfolio
             .recent_realized_trade_points
             .push(RealizedTradePoint {
@@ -2247,11 +2604,12 @@ mod tests {
                 market_type: MarketType::Short,
             });
 
-        let decision = engine
-            .evaluate(&entry, &portfolio)
-            .expect("buy should remain eligible");
+        let penalized_notional =
+            finalize_buy_notional(&engine, &entry, &portfolio, normal_context());
+        let baseline_notional =
+            finalize_buy_notional(&engine, &entry, &baseline_portfolio, normal_context());
 
-        assert_eq!(decision.notional, dec!(7.5));
+        assert!(penalized_notional < baseline_notional);
     }
 
     #[test]
@@ -2332,6 +2690,7 @@ mod tests {
             size: dec!(10),
             current_value: dec!(6),
             average_entry_price: dec!(0.5),
+            entry_conviction_score: dec!(0.80),
             used_fallback: false,
             fallback_reason: None,
         };
@@ -2611,6 +2970,78 @@ mod tests {
     }
 
     #[test]
+    fn higher_conviction_trades_receive_larger_size_than_lower_conviction_trades() {
+        let mut settings = sample_settings();
+        settings.market_cooldown = Duration::ZERO;
+        settings.enable_ultra_short_markets = true;
+        settings.base_risk_per_trade_pct = dec!(0.03);
+        settings.max_risk_per_trade_pct = dec!(0.10);
+        settings.min_trade_quality_score = dec!(0.40);
+        settings.high_conviction_size_multiplier = dec!(1.30);
+        settings.low_conviction_size_multiplier = dec!(0.50);
+        let engine = RiskEngine::new(settings);
+        let portfolio = flat_portfolio(dec!(100));
+
+        let mut high_entry = sample_entry("BUY", "asset-high", 20.0, 10.0, "0xsource");
+        high_entry.condition_id = "condition-high".to_owned();
+        high_entry.timestamp = recent_timestamp_ms();
+        let mut high_decision = engine
+            .evaluate(&high_entry, &portfolio)
+            .expect("high-conviction entry should be eligible");
+        let high_observation = engine.observe_source_trade(&high_entry);
+        let high_quote = sample_quote(dec!(0.499), dec!(500), dec!(0.501), dec!(500));
+        let high_quality = engine
+            .enforce_entry_quality_post_quote(
+                &high_entry,
+                &portfolio,
+                &high_quote,
+                &high_observation,
+                normal_context(),
+            )
+            .expect("high-conviction quality should pass");
+        engine
+            .finalize_entry_sizing(
+                &high_entry,
+                &portfolio,
+                &high_observation,
+                &high_quality,
+                normal_context(),
+                &mut high_decision,
+            )
+            .expect("high-conviction sizing should succeed");
+
+        let mut low_entry = sample_entry("BUY", "asset-low", 20.0, 10.0, "0xsource");
+        low_entry.condition_id = "condition-low".to_owned();
+        low_entry.timestamp = recent_timestamp_ms();
+        let mut low_decision = engine
+            .evaluate(&low_entry, &portfolio)
+            .expect("low-conviction entry should be eligible");
+        let low_observation = engine.observe_source_trade(&low_entry);
+        let low_quote = sample_quote(dec!(0.495), dec!(60), dec!(0.515), dec!(60));
+        let low_quality = engine
+            .enforce_entry_quality_post_quote(
+                &low_entry,
+                &portfolio,
+                &low_quote,
+                &low_observation,
+                normal_context(),
+            )
+            .expect("low-conviction quality should still pass");
+        engine
+            .finalize_entry_sizing(
+                &low_entry,
+                &portfolio,
+                &low_observation,
+                &low_quality,
+                normal_context(),
+                &mut low_decision,
+            )
+            .expect("low-conviction sizing should succeed");
+
+        assert!(high_decision.notional > low_decision.notional);
+    }
+
+    #[test]
     fn position_size_scales_down_with_equity_drop() {
         let mut settings = sample_settings();
         settings.copy_scale_above_five_usd = Decimal::ONE;
@@ -2651,6 +3082,8 @@ mod tests {
             current_value: dec!(31),
             source_entry_price: dec!(1),
             average_entry_price: dec!(1),
+            entry_conviction_score: Decimal::ZERO,
+            peak_price_since_open: dec!(1),
             current_price: dec!(1),
             cost_basis: dec!(31),
             unrealized_pnl: Decimal::ZERO,
@@ -2674,11 +3107,55 @@ mod tests {
     }
 
     #[test]
+    fn wallet_exposure_cap_blocks_new_entries() {
+        let mut settings = sample_settings();
+        settings.max_exposure_per_wallet_pct = dec!(0.10);
+        let engine = RiskEngine::new(settings);
+        let mut portfolio = flat_portfolio(dec!(100));
+        portfolio.positions.push(PortfolioPosition {
+            asset: "asset-held".to_owned(),
+            condition_id: "condition-held".to_owned(),
+            title: "Held".to_owned(),
+            outcome: "YES".to_owned(),
+            source_wallet: "0xsource".to_owned(),
+            state: crate::models::PositionState::Open,
+            size: dec!(10),
+            current_value: dec!(10),
+            source_entry_price: dec!(1),
+            average_entry_price: dec!(1),
+            entry_conviction_score: Decimal::ZERO,
+            peak_price_since_open: dec!(1),
+            current_price: dec!(1),
+            cost_basis: dec!(10),
+            unrealized_pnl: Decimal::ZERO,
+            opened_at: Some(Utc::now()),
+            source_trade_timestamp_unix: 1,
+            closing_started_at: None,
+            closing_reason: None,
+            last_close_attempt_at: None,
+            close_attempts: 0,
+            close_failure_reason: None,
+            closing_escalation_level: 0,
+            stale_reason: None,
+        });
+        let mut entry = sample_entry("BUY", "asset-new", 10.0, 5.0, "0xsource");
+        entry.condition_id = "condition-new".to_owned();
+
+        let reason = engine
+            .evaluate(&entry, &portfolio)
+            .expect_err("wallet exposure cap should block entries");
+
+        assert_eq!(reason.code, "wallet_exposure_limit");
+    }
+
+    #[test]
     fn drawdown_mode_allows_reduced_entries_and_sells() {
         let mut settings = sample_settings();
         settings.max_drawdown_pct = dec!(0.10);
         settings.hard_stop_drawdown_pct = dec!(0.50);
         settings.drawdown_size_multiplier = dec!(0.5);
+        settings.base_risk_per_trade_pct = dec!(0.03);
+        settings.max_risk_per_trade_pct = dec!(0.10);
         let engine = RiskEngine::new(settings);
         let mut portfolio = sample_portfolio();
         portfolio.current_equity = dec!(89);
@@ -2690,11 +3167,12 @@ mod tests {
         buy.condition_id = "condition-new".to_owned();
         let sell = sample_entry("SELL", "asset-1", 8.0, 4.0, "0xsource");
 
-        let decision = engine
-            .evaluate(&buy, &portfolio)
-            .expect("drawdown mode should reduce, not block");
+        let drawdown_notional =
+            finalize_buy_notional(&engine, &buy, &portfolio, drawdown_context());
+        let normal_notional =
+            finalize_buy_notional(&engine, &buy, &flat_portfolio(dec!(89)), normal_context());
         assert_eq!(engine.trading_mode(&portfolio), TradingMode::Drawdown);
-        assert_eq!(decision.notional, dec!(2.5));
+        assert!(drawdown_notional < normal_notional);
         let resolved_position = portfolio
             .resolve_position_to_sell(&sell)
             .expect("sell resolves against owned position");
@@ -2755,6 +3233,8 @@ mod tests {
             current_value: dec!(11),
             source_entry_price: dec!(1),
             average_entry_price: dec!(1),
+            entry_conviction_score: Decimal::ZERO,
+            peak_price_since_open: dec!(1),
             current_price: dec!(1),
             cost_basis: dec!(11),
             unrealized_pnl: Decimal::ZERO,

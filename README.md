@@ -106,6 +106,9 @@ The rescanner remains enabled, but it is now firmly off the hot path. Active-wal
 - rejects entries that have already moved too far away from the source with `MAX_PRICE_MOVE_SINCE_SOURCE_BPS`
 - downweights source wallets with negative recent realized or open PnL before sizing new entries
 - computes a weighted trade-quality score before submit across liquidity, spread, slippage, wallet behavior, wallet alpha, timing, market type, and remaining edge
+- computes final buy size from one conviction-weighted path that combines wallet alpha, trade quality, market type, slippage, drawdown mode, total exposure headroom, wallet concentration, and market concentration
+- caps exposure per source wallet with `MAX_EXPOSURE_PER_WALLET_PCT` and shrinks trades before the book becomes clustered in one wallet or one market family
+- supports config-driven sizing bands through `BASE_RISK_PER_TRADE_PCT`, `MIN_RISK_PER_TRADE_PCT`, `HIGH_CONVICTION_SIZE_MULTIPLIER`, `LOW_CONVICTION_SIZE_MULTIPLIER`, and market-type multipliers
 - sizes entries as the minimum of risk-percent-of-equity, absolute size cap, remaining total exposure, remaining market exposure, and available cash
 - switches to adaptive drawdown mode instead of binary drawdown lockout; hard-stop, loss-streak cooldown, total exposure limit, and per-market exposure limit still block entries
 - rejects duplicate positions, stale positions, and opposite-side exposure unless `ALLOW_HEDGING=true`
@@ -217,6 +220,8 @@ Important protections:
 - pending-open exits bind locally and are released on the position-open event instead of polling
 - managed exits consult pending unresolved source exits before firing time-based closes
 - stop-loss exits yield to pending source exits unless the move is catastrophic
+- positions retain entry conviction and peak favorable price so profitable winners ratchet through `PROFIT_PROTECTION` instead of round-tripping to flat
+- high-conviction winners get looser upside truncation than weak setups, while low-conviction losers compress earlier when they stagnate or drift
 - safe fallback resolution is limited to the same source wallet and same market/condition, and broad condition-only fallback is used only when there is exactly one active candidate
 - unresolved source exits are persisted to a short retry buffer in `data/unresolved-exits.json`, but only after local ownership candidates exist
 - UNKNOWN or unresolved outcomes are treated as attribution misses instead of actionable retry work unless a deterministic single-candidate fallback resolves them
@@ -258,6 +263,8 @@ The Telegram summary now reports:
 - unrealized PnL
 - total PnL
 - open positions
+- expectancy metrics including average winner, average loser, payoff ratio, expectancy per trade, expectancy by wallet, expectancy by market type, and expectancy by conviction bucket
+- sizing diagnostics including PnL by sizing bucket, average size by conviction bucket, wallet alpha scores, and entry-slippage percentiles
 - exposure
 
 and warns when exits have not executed yet.
