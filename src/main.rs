@@ -56,6 +56,7 @@ use prediction::{PredictionEngine, build_predicted_trade, signal_cache_key};
 use raw_activity_logger::RawActivityLogger;
 use risk::{CopyDecision, RiskEngine, SkipReason, TradingMode};
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex, Notify, mpsc};
@@ -93,8 +94,6 @@ const TIME_EXIT_FAVORABLE_TREND_BPS: Decimal = rust_decimal_macros::dec!(0.02);
 const TIME_EXIT_MILD_LOSS_BPS: Decimal = rust_decimal_macros::dec!(0.02);
 const TIME_EXIT_SMALL_PNL_ABS: Decimal = rust_decimal_macros::dec!(0.50);
 const TIME_EXIT_EXTENSION_MULTIPLIER: i64 = 2;
-const PROFIT_PROTECTION_MIN_GAIN_BPS: Decimal = rust_decimal_macros::dec!(0.03);
-const PROFIT_PROTECTION_REVERSAL_BPS: Decimal = rust_decimal_macros::dec!(0.02);
 const PREDICTION_HISTORY_SEED_LIMIT: usize = 512;
 const LOG_RETENTION_WINDOW: Duration = Duration::from_secs(6 * 60 * 60);
 const LOG_RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -245,14 +244,20 @@ impl ExecutionAnalyticsTracker {
                         asset: entry.asset.clone(),
                         condition_id: entry.condition_id.clone(),
                         outcome: entry.outcome.clone(),
+                        market_type: models::classify_market(&entry.title),
                         side: entry.side.clone(),
                         source_trade_timestamp_unix: entry.timestamp,
                         source_price: decimal_from_f64(entry.price),
                         filled_price: result.filled_price,
+                        entry_slippage_pct: entry_slippage_pct(
+                            decimal_from_f64(entry.price),
+                            result.filled_price,
+                        ),
                         filled_size: result.filled_size,
                         execution_mode: result.mode.as_str().to_owned(),
                         open_time: source_trade_time(entry.timestamp),
                         close_time: None,
+                        close_reason: None,
                         realized_pnl: Decimal::ZERO,
                         unrealized_pnl: Decimal::ZERO,
                         status: TradeCohortStatus::Open,
@@ -266,6 +271,7 @@ impl ExecutionAnalyticsTracker {
                     apply_exit_to_trade_cohorts(
                         &mut state.cohorts,
                         position_key.unwrap_or(&entry.position_key()),
+                        entry,
                         result,
                     );
                 }
@@ -522,15 +528,37 @@ fn refresh_analytics_from_portfolio(
     state.pnl_current_window = Decimal::ZERO;
     state.pnl_all_open_positions = Decimal::ZERO;
     state.pnl_by_source_wallet = BTreeMap::new();
+    state.win_rate_by_wallet = BTreeMap::new();
+    state.wallet_alpha_scores = BTreeMap::new();
     state.pnl_by_trade_day = BTreeMap::new();
+    state.win_rate_by_market_type = BTreeMap::new();
     state.stale_position_counts = BTreeMap::new();
     state.current_window_trade_count = 0;
     state.winning_current_window_trades = 0;
     state.losing_current_window_trades = 0;
+    state.close_type_counts = BTreeMap::new();
+    state.close_type_share = BTreeMap::new();
+    state.pnl_by_close_type = BTreeMap::new();
+    state.profit_protection_exit_pnl = Decimal::ZERO;
+    state.filtered_entry_pct = Decimal::ZERO;
+    state.entry_slippage_p50_pct = Decimal::ZERO;
+    state.entry_slippage_p90_pct = Decimal::ZERO;
+    state.win_rate_by_close_type = BTreeMap::new();
+    state.median_hold_ms_by_close_type = BTreeMap::new();
 
     let mut current_window_open_trades = 0_u64;
     let mut current_window_open_winning = 0_u64;
     let current_trade_day = today.to_string();
+    let mut close_type_wins = BTreeMap::<String, u64>::new();
+    let mut close_type_holds = BTreeMap::<String, Vec<u64>>::new();
+    let mut closed_cohort_count = 0_u64;
+    let mut wallet_counts = BTreeMap::<String, u64>::new();
+    let mut wallet_wins = BTreeMap::<String, u64>::new();
+    let mut market_type_counts = BTreeMap::<String, u64>::new();
+    let mut market_type_wins = BTreeMap::<String, u64>::new();
+    let mut slippage_values = Vec::<Decimal>::new();
+    let mut wallet_alpha_inputs =
+        HashMap::<String, (u64, u64, u64, u64, u64, Decimal, u128, Decimal)>::new();
 
     for cohort in &state.cohorts {
         let cohort_pnl = cohort.realized_pnl + cohort.unrealized_pnl;
@@ -542,6 +570,7 @@ fn refresh_analytics_from_portfolio(
             .pnl_by_source_wallet
             .entry(cohort.source_wallet.clone())
             .or_insert(Decimal::ZERO) += cohort_pnl;
+        slippage_values.push(cohort.entry_slippage_pct.max(Decimal::ZERO));
         *state
             .pnl_by_trade_day
             .entry(cohort.open_time.date_naive().to_string())
@@ -568,6 +597,67 @@ fn refresh_analytics_from_portfolio(
                 state.losing_current_window_trades += 1;
             }
         }
+
+        if cohort.status == TradeCohortStatus::Closed {
+            closed_cohort_count = closed_cohort_count.saturating_add(1);
+            *wallet_counts
+                .entry(cohort.source_wallet.clone())
+                .or_insert(0) += 1;
+            *market_type_counts
+                .entry(market_type_label(cohort.market_type).to_owned())
+                .or_insert(0) += 1;
+            let close_type = cohort
+                .close_reason
+                .clone()
+                .unwrap_or_else(|| "UNKNOWN".to_owned());
+            increment_string_counter(&mut state.close_type_counts, close_type.clone());
+            *state
+                .pnl_by_close_type
+                .entry(close_type.clone())
+                .or_insert(Decimal::ZERO) += cohort.realized_pnl;
+            if cohort.realized_pnl > Decimal::ZERO {
+                *close_type_wins.entry(close_type.clone()).or_insert(0) += 1;
+                *wallet_wins.entry(cohort.source_wallet.clone()).or_insert(0) += 1;
+                *market_type_wins
+                    .entry(market_type_label(cohort.market_type).to_owned())
+                    .or_insert(0) += 1;
+            }
+            if let Some(close_time) = cohort.close_time {
+                let hold_ms = close_time
+                    .signed_duration_since(cohort.open_time)
+                    .num_milliseconds()
+                    .max(0) as u64;
+                close_type_holds
+                    .entry(close_type.clone())
+                    .or_default()
+                    .push(hold_ms);
+                let alpha_input = wallet_alpha_inputs
+                    .entry(cohort.source_wallet.clone())
+                    .or_insert((0, 0, 0, 0, 0, Decimal::ZERO, 0, Decimal::ZERO));
+                alpha_input.6 = alpha_input.6.saturating_add(u128::from(hold_ms));
+            }
+            let alpha_input = wallet_alpha_inputs
+                .entry(cohort.source_wallet.clone())
+                .or_insert((0, 0, 0, 0, 0, Decimal::ZERO, 0, Decimal::ZERO));
+            alpha_input.0 = alpha_input.0.saturating_add(1);
+            if cohort.realized_pnl > Decimal::ZERO {
+                alpha_input.1 = alpha_input.1.saturating_add(1);
+            }
+            match close_type.as_str() {
+                "SOURCE_EXIT" | "TAKE_PROFIT" | "PROFIT_PROTECTION" => {
+                    alpha_input.2 = alpha_input.2.saturating_add(1);
+                }
+                "TIME_EXIT" => {
+                    alpha_input.3 = alpha_input.3.saturating_add(1);
+                }
+                "STOP_LOSS" | "HARD_STOP" => {
+                    alpha_input.4 = alpha_input.4.saturating_add(1);
+                }
+                _ => {}
+            }
+            alpha_input.5 += cohort.realized_pnl;
+            alpha_input.7 += cohort.entry_slippage_pct.max(Decimal::ZERO);
+        }
     }
 
     for position in portfolio
@@ -590,6 +680,109 @@ fn refresh_analytics_from_portfolio(
     );
     state.current_window_open_mtm_win_rate =
         ratio_decimal(current_window_open_winning, current_window_open_trades);
+    state.filtered_entry_pct = ratio_decimal(
+        state.skipped_entry_events,
+        state.skipped_entry_events + state.processed_entry_events,
+    );
+    for (close_type, count) in &state.close_type_counts {
+        state.close_type_share.insert(
+            close_type.clone(),
+            ratio_decimal(*count, closed_cohort_count),
+        );
+        state.win_rate_by_close_type.insert(
+            close_type.clone(),
+            ratio_decimal(
+                close_type_wins.get(close_type).copied().unwrap_or_default(),
+                *count,
+            ),
+        );
+        if let Some(holds) = close_type_holds.get_mut(close_type) {
+            holds.sort_unstable();
+            if let Some(median) = holds.get(holds.len() / 2).copied() {
+                state
+                    .median_hold_ms_by_close_type
+                    .insert(close_type.clone(), median);
+            }
+        }
+    }
+    for (wallet, count) in &wallet_counts {
+        state.win_rate_by_wallet.insert(
+            wallet.clone(),
+            ratio_decimal(wallet_wins.get(wallet).copied().unwrap_or_default(), *count),
+        );
+    }
+    for (market_type, count) in &market_type_counts {
+        state.win_rate_by_market_type.insert(
+            market_type.clone(),
+            ratio_decimal(
+                market_type_wins
+                    .get(market_type)
+                    .copied()
+                    .unwrap_or_default(),
+                *count,
+            ),
+        );
+    }
+    slippage_values.sort();
+    if let Some(p50) = slippage_values.get(slippage_values.len().saturating_sub(1) / 2) {
+        state.entry_slippage_p50_pct = *p50;
+    }
+    if let Some(p90) = slippage_values
+        .get(((slippage_values.len().saturating_sub(1) as f64) * 0.9).round() as usize)
+    {
+        state.entry_slippage_p90_pct = *p90;
+    }
+    state.profit_protection_exit_pnl = state
+        .pnl_by_close_type
+        .get("PROFIT_PROTECTION")
+        .copied()
+        .unwrap_or(Decimal::ZERO);
+    for (
+        wallet,
+        (
+            count,
+            wins,
+            good_exits,
+            time_exits,
+            stop_losses,
+            pnl_total,
+            hold_total_ms,
+            slippage_total,
+        ),
+    ) in wallet_alpha_inputs
+    {
+        let count_decimal = Decimal::from(count.max(1));
+        let win_rate = Decimal::from(wins) / count_decimal;
+        let good_exit_share = Decimal::from(good_exits) / count_decimal;
+        let time_exit_share = Decimal::from(time_exits) / count_decimal;
+        let pnl_score = if pnl_total >= Decimal::ZERO {
+            Decimal::ONE
+        } else {
+            (Decimal::ONE - (pnl_total.abs() / Decimal::from(10_u64)))
+                .max(Decimal::ZERO)
+                .min(Decimal::ONE)
+        };
+        let hold_score = if count == 0 {
+            Decimal::ONE
+        } else {
+            (Decimal::from(hold_total_ms as u64) / count_decimal / Decimal::from(15_000_u64))
+                .max(Decimal::ZERO)
+                .min(Decimal::ONE)
+        };
+        let stop_loss_share = Decimal::from(stop_losses) / count_decimal;
+        let slippage_score = (Decimal::ONE - ((slippage_total / count_decimal) / dec!(0.05)))
+            .max(Decimal::ZERO)
+            .min(Decimal::ONE);
+        let score = ((win_rate * dec!(0.30))
+            + (good_exit_share * dec!(0.20))
+            + ((Decimal::ONE - time_exit_share) * dec!(0.10))
+            + ((Decimal::ONE - stop_loss_share) * dec!(0.10))
+            + (pnl_score * dec!(0.10))
+            + (hold_score * dec!(0.10))
+            + (slippage_score * dec!(0.10)))
+        .round_dp(4);
+        state.wallet_alpha_scores.insert(wallet, score);
+    }
 }
 
 fn refresh_open_cohort_marks(cohorts: &mut [TradeCohort], portfolio: &models::PortfolioSnapshot) {
@@ -631,9 +824,11 @@ fn refresh_open_cohort_marks(cohorts: &mut [TradeCohort], portfolio: &models::Po
 fn apply_exit_to_trade_cohorts(
     cohorts: &mut [TradeCohort],
     position_key: &PositionKey,
+    entry: &ActivityEntry,
     result: &ExecutionSuccess,
 ) {
     let mut remaining_size = result.filled_size;
+    let close_reason = cohort_close_reason(entry);
     for cohort in cohorts.iter_mut().filter(|cohort| {
         cohort.status == TradeCohortStatus::Open && cohort_position_key(cohort) == *position_key
     }) {
@@ -648,11 +843,32 @@ fn apply_exit_to_trade_cohorts(
         cohort.remaining_size -= closed_size;
         cohort.cost_basis = cohort.filled_price * cohort.remaining_size;
         cohort.unrealized_pnl = Decimal::ZERO;
+        cohort.close_reason = Some(close_reason.clone());
         if cohort.remaining_size <= Decimal::ZERO {
             cohort.status = TradeCohortStatus::Closed;
             cohort.close_time = Some(Utc::now());
         }
         remaining_size -= closed_size;
+    }
+}
+
+fn cohort_close_reason(entry: &ActivityEntry) -> String {
+    match entry.type_name.as_str() {
+        "TIME_EXIT" => "TIME_EXIT".to_owned(),
+        "STOP_LOSS" => "STOP_LOSS".to_owned(),
+        "TAKE_PROFIT" => "TAKE_PROFIT".to_owned(),
+        "PROFIT_PROTECTION" => "PROFIT_PROTECTION".to_owned(),
+        "HARD_STOP" => "HARD_STOP".to_owned(),
+        _ if entry.side.eq_ignore_ascii_case("SELL") => "SOURCE_EXIT".to_owned(),
+        _ => "UNKNOWN".to_owned(),
+    }
+}
+
+fn market_type_label(market_type: models::MarketType) -> &'static str {
+    match market_type {
+        models::MarketType::UltraShort => "ultra_short",
+        models::MarketType::Short => "short",
+        models::MarketType::Medium => "medium",
     }
 }
 
@@ -666,6 +882,16 @@ fn ratio_decimal(numerator: u64, denominator: u64) -> Decimal {
 
 fn decimal_from_f64(value: f64) -> Decimal {
     Decimal::from_f64_retain(value).unwrap_or(Decimal::ZERO)
+}
+
+fn entry_slippage_pct(source_price: Decimal, filled_price: Decimal) -> Decimal {
+    if source_price <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+
+    ((filled_price - source_price) / source_price)
+        .abs()
+        .max(Decimal::ZERO)
 }
 
 fn source_trade_time(timestamp: i64) -> DateTime<Utc> {
@@ -2531,6 +2757,7 @@ async fn process_trade(
         && matches!(side, ExecutionSide::Buy)
         && let Err(reason) = risk.enforce_entry_quality_post_quote(
             entry,
+            &current_portfolio,
             &resolved_quote.quote,
             &market_quality_observation,
             risk_context,
@@ -4270,6 +4497,7 @@ async fn spawn_force_exit_watcher(
                 .has_pending_source_exit_for_position(&position.position_key())
                 .await;
             let exit_evaluation = managed_exit_reason(
+                &settings,
                 &position,
                 now,
                 best_bid,
@@ -4277,11 +4505,45 @@ async fn spawn_force_exit_watcher(
                 source_exit_pending,
             );
             let reason = match exit_evaluation {
-                ManagedExitEvaluation::Trigger(reason) => reason,
+                ManagedExitEvaluation::Trigger(reason) => {
+                    if reason == ManagedExitReason::ProfitProtection {
+                        analytics
+                            .record_exit_event(
+                                "time_exit_blocked_due_to_profit_protection",
+                                Some(&snapshot),
+                            )
+                            .await;
+                    }
+                    reason
+                }
                 ManagedExitEvaluation::SuppressTimeExit(suppressed_reason) => {
                     analytics
                         .record_exit_event("premature_time_exit", Some(&snapshot))
                         .await;
+                    match suppressed_reason {
+                        "source_exit_pending" => {
+                            analytics
+                                .record_exit_event(
+                                    "time_exit_blocked_due_to_pending_source_exit",
+                                    Some(&snapshot),
+                                )
+                                .await;
+                        }
+                        "mild_loss_extension" => {
+                            analytics
+                                .record_exit_event("adaptive_time_extension_used", Some(&snapshot))
+                                .await;
+                        }
+                        "profit_protection_active" => {
+                            analytics
+                                .record_exit_event(
+                                    "time_exit_blocked_due_to_profit_protection",
+                                    Some(&snapshot),
+                                )
+                                .await;
+                        }
+                        _ => {}
+                    }
                     info!(
                         event = "time_exit_suppressed",
                         reason = suppressed_reason,
@@ -4534,6 +4796,11 @@ async fn attempt_managed_exit_position(
                 .record_exit_event("managed_exit_time_limit", Some(&closing_snapshot))
                 .await;
         }
+        if reason == ManagedExitReason::ProfitProtection {
+            analytics
+                .record_exit_event("profit_protection_exit_triggered", Some(&closing_snapshot))
+                .await;
+        }
     }
 
     info!(
@@ -4755,9 +5022,13 @@ enum TimeExitEvaluation {
 }
 
 fn profit_protection_triggered(
+    settings: &Settings,
     position: &models::PortfolioPosition,
     best_bid: rust_decimal::Decimal,
 ) -> bool {
+    if !settings.enable_trailing_profit_exit {
+        return false;
+    }
     if position.average_entry_price <= rust_decimal::Decimal::ZERO
         || position.current_price <= rust_decimal::Decimal::ZERO
     {
@@ -4766,9 +5037,12 @@ fn profit_protection_triggered(
 
     let profitable = best_bid
         >= position.average_entry_price
-            * (rust_decimal::Decimal::ONE + PROFIT_PROTECTION_MIN_GAIN_BPS);
+            * (rust_decimal::Decimal::ONE + settings.profit_protect_min_pnl_pct.max(Decimal::ZERO));
     let reversal = best_bid
-        <= position.current_price * (rust_decimal::Decimal::ONE - PROFIT_PROTECTION_REVERSAL_BPS);
+        <= position.current_price
+            * (rust_decimal::Decimal::ONE
+                - Decimal::from(settings.profit_protect_reversal_bps)
+                    / rust_decimal_macros::dec!(10000));
     profitable && reversal
 }
 
@@ -4824,6 +5098,7 @@ fn evaluate_time_exit(
 }
 
 fn managed_exit_reason(
+    settings: &Settings,
     position: &models::PortfolioPosition,
     now: DateTime<Utc>,
     best_bid: rust_decimal::Decimal,
@@ -4831,7 +5106,7 @@ fn managed_exit_reason(
     source_exit_pending: bool,
 ) -> ManagedExitEvaluation {
     if position.average_entry_price > rust_decimal::Decimal::ZERO {
-        if profit_protection_triggered(position, best_bid) {
+        if profit_protection_triggered(settings, position, best_bid) {
             return ManagedExitEvaluation::Trigger(ManagedExitReason::ProfitProtection);
         }
         if !source_exit_pending
@@ -5727,6 +6002,7 @@ mod tests {
             state: models::PositionState::Closing,
             size: dec!(10),
             current_value: dec!(5),
+            source_entry_price: dec!(0.5),
             average_entry_price: dec!(0.5),
             current_price: dec!(0.5),
             cost_basis: dec!(5),
@@ -6318,6 +6594,7 @@ mod tests {
 
     #[test]
     fn managed_exit_reason_selects_profit_protection_loss_and_conditional_time_exit() {
+        let settings = sample_settings(std::env::temp_dir().join("managed-exit-reason-test"));
         let position = models::PortfolioPosition {
             asset: "asset-1".to_owned(),
             condition_id: "condition-1".to_owned(),
@@ -6327,6 +6604,7 @@ mod tests {
             state: models::PositionState::Open,
             size: dec!(10),
             current_value: dec!(5),
+            source_entry_price: dec!(0.5),
             average_entry_price: dec!(0.5),
             current_price: dec!(0.5),
             cost_basis: dec!(5),
@@ -6344,6 +6622,7 @@ mod tests {
 
         assert_eq!(
             managed_exit_reason(
+                &settings,
                 &position,
                 Utc::now(),
                 dec!(0.58),
@@ -6354,6 +6633,7 @@ mod tests {
         );
         assert_eq!(
             managed_exit_reason(
+                &settings,
                 &models::PortfolioPosition {
                     current_price: dec!(0.56),
                     unrealized_pnl: dec!(0.6),
@@ -6368,6 +6648,7 @@ mod tests {
         );
         assert_eq!(
             managed_exit_reason(
+                &settings,
                 &position,
                 Utc::now(),
                 dec!(0.44),
@@ -6378,6 +6659,7 @@ mod tests {
         );
         assert_eq!(
             managed_exit_reason(
+                &settings,
                 &position,
                 Utc::now(),
                 dec!(0.50),
@@ -6388,6 +6670,7 @@ mod tests {
         );
         assert_eq!(
             managed_exit_reason(
+                &settings,
                 &position,
                 Utc::now(),
                 dec!(0.50),
@@ -6400,6 +6683,7 @@ mod tests {
 
     #[test]
     fn time_exit_requires_stagnation_or_small_pnl() {
+        let settings = sample_settings(std::env::temp_dir().join("time-exit-stagnation-test"));
         let position = models::PortfolioPosition {
             asset: "asset-1".to_owned(),
             condition_id: "condition-1".to_owned(),
@@ -6409,6 +6693,7 @@ mod tests {
             state: models::PositionState::Open,
             size: dec!(10),
             current_value: dec!(5.8),
+            source_entry_price: dec!(0.5),
             average_entry_price: dec!(0.5),
             current_price: dec!(0.55),
             cost_basis: dec!(5),
@@ -6426,6 +6711,7 @@ mod tests {
 
         assert_eq!(
             managed_exit_reason(
+                &settings,
                 &position,
                 Utc::now(),
                 dec!(0.56),
@@ -6436,6 +6722,7 @@ mod tests {
         );
         assert_eq!(
             managed_exit_reason(
+                &settings,
                 &models::PortfolioPosition {
                     current_price: dec!(0.50),
                     current_value: dec!(5),
@@ -6453,6 +6740,7 @@ mod tests {
 
     #[test]
     fn time_exit_extends_mild_losers_without_reversal() {
+        let settings = sample_settings(std::env::temp_dir().join("time-exit-extension-test"));
         let position = models::PortfolioPosition {
             asset: "asset-1".to_owned(),
             condition_id: "condition-1".to_owned(),
@@ -6462,6 +6750,7 @@ mod tests {
             state: models::PositionState::Open,
             size: dec!(10),
             current_value: dec!(4.95),
+            source_entry_price: dec!(0.5),
             average_entry_price: dec!(0.5),
             current_price: dec!(0.50),
             cost_basis: dec!(5),
@@ -6479,6 +6768,7 @@ mod tests {
 
         assert_eq!(
             managed_exit_reason(
+                &settings,
                 &position,
                 Utc::now(),
                 dec!(0.499),

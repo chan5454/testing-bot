@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -10,6 +10,7 @@ use tracing::{info, warn};
 
 use crate::config::Settings;
 use crate::health::HealthState;
+use crate::models::ExecutionAnalyticsState;
 use crate::rolling_jsonl::RollingJsonlLogger;
 use crate::wallet::wallet_filter::normalize_wallet;
 use crate::wallet::wallet_matching::ActivityTradeEvent;
@@ -70,6 +71,11 @@ struct ScannedWallet {
     avg_trade_size: f64,
     trades_per_hour: f64,
     active: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct WalletCloseFeedback {
+    multiplier: f64,
 }
 
 impl WalletActivityLogger {
@@ -205,6 +211,7 @@ async fn scan_recent_wallet_activity(settings: &Settings) -> anyhow::Result<Vec<
     let now = Utc::now();
     let cutoff = now - TimeDelta::minutes(WALLET_SCANNER_LOOKBACK_MINUTES);
     let entries = read_wallet_activity_entries(&settings.data_dir, cutoff).await?;
+    let wallet_feedback = load_wallet_close_feedback(&settings.data_dir).await;
     let mut by_wallet = HashMap::<String, WalletScanStats>::new();
 
     for entry in entries {
@@ -241,10 +248,14 @@ async fn scan_recent_wallet_activity(settings: &Settings) -> anyhow::Result<Vec<
                     .clamp(0.0, 1.0)
             } else {
                 0.0
-            };
+            } * wallet_feedback
+                .get(&wallet)
+                .copied()
+                .unwrap_or(WalletCloseFeedback { multiplier: 1.0 })
+                .multiplier;
             ScannedWallet {
                 address: wallet,
-                score,
+                score: score.clamp(0.0, 1.0),
                 last_seen: stats.last_trade_time,
                 avg_trade_size,
                 trades_per_hour,
@@ -259,6 +270,86 @@ async fn scan_recent_wallet_activity(settings: &Settings) -> anyhow::Result<Vec<
             .then_with(|| right.last_seen.cmp(&left.last_seen))
     });
     Ok(wallets)
+}
+
+async fn load_wallet_close_feedback(data_dir: &Path) -> HashMap<String, WalletCloseFeedback> {
+    let path = data_dir.join("execution-analytics-summary.json");
+    let payload = match tokio::fs::read_to_string(&path).await {
+        Ok(payload) => payload,
+        Err(_) => return HashMap::new(),
+    };
+    let state = match serde_json::from_str::<ExecutionAnalyticsState>(&payload) {
+        Ok(state) => state,
+        Err(_) => return HashMap::new(),
+    };
+
+    let mut by_wallet = HashMap::<String, (u32, u32, u32, f64)>::new();
+    let mut from_summary_alpha = HashMap::<String, WalletCloseFeedback>::new();
+    for (wallet, alpha_score) in &state.wallet_alpha_scores {
+        let normalized = normalize_wallet(wallet);
+        if normalized.is_empty() {
+            continue;
+        }
+        let alpha = alpha_score
+            .to_string()
+            .parse::<f64>()
+            .unwrap_or(0.65)
+            .clamp(0.25, 1.20);
+        from_summary_alpha.insert(normalized, WalletCloseFeedback { multiplier: alpha });
+    }
+    for cohort in state
+        .cohorts
+        .iter()
+        .filter(|cohort| cohort.status == crate::models::TradeCohortStatus::Closed)
+    {
+        let wallet = normalize_wallet(&cohort.source_wallet);
+        if wallet.is_empty() {
+            continue;
+        }
+        let close_reason = cohort.close_reason.as_deref().unwrap_or("UNKNOWN");
+        let entry = by_wallet.entry(wallet).or_insert((0, 0, 0, 0.0));
+        entry.0 = entry.0.saturating_add(1);
+        if matches!(
+            close_reason,
+            "SOURCE_EXIT" | "TAKE_PROFIT" | "PROFIT_PROTECTION"
+        ) {
+            entry.1 = entry.1.saturating_add(1);
+        }
+        if matches!(close_reason, "TIME_EXIT" | "STOP_LOSS" | "HARD_STOP") {
+            entry.2 = entry.2.saturating_add(1);
+        }
+        entry.3 += cohort
+            .realized_pnl
+            .to_string()
+            .parse::<f64>()
+            .unwrap_or(0.0);
+    }
+
+    let mut feedback = by_wallet
+        .into_iter()
+        .map(|(wallet, (count, good, bad, pnl))| {
+            let multiplier = if count < 3 {
+                1.0
+            } else {
+                let count_f = count as f64;
+                let good_share = good as f64 / count_f;
+                let bad_share = bad as f64 / count_f;
+                let pnl_penalty = if pnl < 0.0 { 0.15 } else { 0.0 };
+                (1.0 + good_share * 0.15 - bad_share * 0.35 - pnl_penalty).clamp(0.25, 1.2)
+            };
+            (wallet, WalletCloseFeedback { multiplier })
+        })
+        .collect::<HashMap<_, _>>();
+    for (wallet, alpha_feedback) in from_summary_alpha {
+        feedback
+            .entry(wallet)
+            .and_modify(|feedback| {
+                feedback.multiplier =
+                    (feedback.multiplier * alpha_feedback.multiplier).clamp(0.25, 1.20);
+            })
+            .or_insert(alpha_feedback);
+    }
+    feedback
 }
 
 async fn read_wallet_activity_entries(
@@ -296,4 +387,68 @@ async fn read_wallet_activity_entries(
         }
     }
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use rust_decimal_macros::dec;
+
+    use super::*;
+    use crate::models::{ExecutionAnalyticsState, TradeCohort, TradeCohortStatus};
+
+    #[tokio::test]
+    async fn wallet_close_feedback_penalizes_time_exit_heavy_losers() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().join("execution-analytics-summary.json");
+        let state = ExecutionAnalyticsState {
+            cohorts: vec![
+                sample_closed_cohort("0xwallet-a", "TIME_EXIT", dec!(-3)),
+                sample_closed_cohort("0xwallet-a", "STOP_LOSS", dec!(-2)),
+                sample_closed_cohort("0xwallet-a", "TIME_EXIT", dec!(-1)),
+                sample_closed_cohort("0xwallet-b", "SOURCE_EXIT", dec!(2)),
+                sample_closed_cohort("0xwallet-b", "PROFIT_PROTECTION", dec!(1)),
+                sample_closed_cohort("0xwallet-b", "SOURCE_EXIT", dec!(1)),
+            ],
+            ..ExecutionAnalyticsState::default()
+        };
+        tokio::fs::write(&path, serde_json::to_vec_pretty(&state).expect("json"))
+            .await
+            .expect("write");
+
+        let feedback = load_wallet_close_feedback(&PathBuf::from(temp_dir.path())).await;
+
+        assert!(feedback.get("0xwallet-a").expect("wallet a").multiplier < 1.0);
+        assert!(feedback.get("0xwallet-b").expect("wallet b").multiplier >= 1.0);
+    }
+
+    fn sample_closed_cohort(
+        wallet: &str,
+        close_reason: &str,
+        pnl: rust_decimal::Decimal,
+    ) -> TradeCohort {
+        TradeCohort {
+            source_wallet: wallet.to_owned(),
+            asset: "asset-1".to_owned(),
+            condition_id: "condition-1".to_owned(),
+            outcome: "YES".to_owned(),
+            market_type: crate::models::MarketType::Short,
+            side: "BUY".to_owned(),
+            source_trade_timestamp_unix: Utc::now().timestamp_millis(),
+            source_price: dec!(0.5),
+            filled_price: dec!(0.5),
+            entry_slippage_pct: dec!(0.01),
+            filled_size: dec!(10),
+            execution_mode: "paper".to_owned(),
+            open_time: Utc::now() - TimeDelta::minutes(15),
+            close_time: Some(Utc::now()),
+            close_reason: Some(close_reason.to_owned()),
+            realized_pnl: pnl,
+            unrealized_pnl: rust_decimal::Decimal::ZERO,
+            status: TradeCohortStatus::Closed,
+            remaining_size: rust_decimal::Decimal::ZERO,
+            cost_basis: dec!(5),
+        }
+    }
 }

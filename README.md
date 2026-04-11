@@ -74,6 +74,7 @@ Tracked wallets are now registry-backed instead of being a static one-wallet ass
 - the registry persists to `data/wallets_active.json`
 - `src/wallet_scanner.rs` rescans recent activity every 3 minutes, scores wallets, updates the registry, and marks inactive wallets without deleting them
 - `src/wallet_score.rs` prefers early-entry wallets over late chasers
+- the execution analytics summary now exposes rolling `wallet_alpha_scores`, win rate by wallet, close-type mix, hold behavior, and entry slippage so weak wallets can be downweighted or skipped
 
 `TARGET_WALLETS` still seeds the registry, but runtime tracking can evolve as the scanner refreshes activity.
 
@@ -99,9 +100,12 @@ The rescanner remains enabled, but it is now firmly off the hot path. Active-wal
 - rejects late copies via the strict `MAX_COPY_DELAY_MS` gate
 - treats disabled ultra-short markets as exceptional-only instead of absolute-disabled: they must clear higher quality, liquidity, and slippage requirements
 - rejects thin books via visible-liquidity and spread checks
-- rejects price chasing, market cooldown churn, conflicting wallet signals, and hyperactive scalp wallets
+- rejects price chasing, market cooldown churn, conflicting wallet signals, hyperactive scalp wallets, and slippage that already consumes too much of the visible spread
+- computes a wallet-alpha score from recent copied outcomes: win rate, average PnL, close-type mix, hold behavior, and entry-slippage sensitivity
+- blocks low-alpha wallets with `MIN_WALLET_ALPHA_SCORE`
+- rejects entries that have already moved too far away from the source with `MAX_PRICE_MOVE_SINCE_SOURCE_BPS`
 - downweights source wallets with negative recent realized or open PnL before sizing new entries
-- computes a weighted trade-quality score before submit
+- computes a weighted trade-quality score before submit across liquidity, spread, slippage, wallet behavior, wallet alpha, timing, market type, and remaining edge
 - sizes entries as the minimum of risk-percent-of-equity, absolute size cap, remaining total exposure, remaining market exposure, and available cash
 - switches to adaptive drawdown mode instead of binary drawdown lockout; hard-stop, loss-streak cooldown, total exposure limit, and per-market exposure limit still block entries
 - rejects duplicate positions, stale positions, and opposite-side exposure unless `ALLOW_HEDGING=true`
@@ -193,6 +197,7 @@ The runtime in `src/main.rs` applies three exit layers:
 
 1. Source-follow exits
    Source SELL events attempt to close the matching copied position immediately.
+   When the copied trade is already strongly profitable and the live mark is materially above the observed source exit price, the bot can preserve part of the winner instead of dumping the full copied size at once.
 
 2. Price-based exits
    The exit watcher can trigger `TAKE_PROFIT`, `PROFIT_PROTECTION`, and `STOP_LOSS` exits from live quotes.
@@ -284,6 +289,20 @@ The analytics summary now separates:
 - `time_exit_triggered`
 - `premature_time_exit`
 - `managed_exit_profit_protection`
+
+and exposes close-quality diagnostics through summary fields such as:
+
+- `close_type_share`
+- `pnl_by_close_type`
+- `profit_protection_exit_pnl`
+- `win_rate_by_close_type`
+- `win_rate_by_wallet`
+- `win_rate_by_market_type`
+- `wallet_alpha_scores`
+- `filtered_entry_pct`
+- `entry_slippage_p50_pct`
+- `entry_slippage_p90_pct`
+- `median_hold_ms_by_close_type`
 
 ### 14. Persistence boundaries
 
@@ -394,9 +413,9 @@ If you prefer the release binary directly:
 - Live wallet identity: `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_PROFILE_ADDRESS`, optional `POLYMARKET_FUNDER_ADDRESS`
 - EOA allowance flow: `POLYMARKET_USDC_ADDRESS`, `POLYMARKET_SPENDER_ADDRESS`, `AUTO_APPROVE_USDC_ALLOWANCE`, `USDC_APPROVAL_AMOUNT`
 - Wallet tracking: `TARGET_WALLETS`, optional authenticated activity credentials
-- Risk: `ENABLE_PRICE_BANDS`, `MIN_EDGE_THRESHOLD`, `MAX_COPY_DELAY_MS`, `ENABLE_ULTRA_SHORT_MARKETS`, `MIN_VISIBLE_LIQUIDITY`, `MAX_SPREAD_BPS`, `MAX_ENTRY_SLIPPAGE`, `MIN_WALLET_AVG_HOLD_MS`, `MAX_WALLET_TRADES_PER_MIN`, `MARKET_COOLDOWN_MS`, `MIN_TRADE_QUALITY_SCORE`, `MIN_LIQUIDITY`, `MIN_WALLET_SCORE`, `ALLOW_HEDGING`
+- Risk: `ENABLE_PRICE_BANDS`, `MIN_EDGE_THRESHOLD`, `MAX_COPY_DELAY_MS`, `ENABLE_ULTRA_SHORT_MARKETS`, `MIN_VISIBLE_LIQUIDITY`, `MAX_SPREAD_BPS`, `MAX_ENTRY_SLIPPAGE`, `MIN_WALLET_AVG_HOLD_MS`, `MAX_WALLET_TRADES_PER_MIN`, `MARKET_COOLDOWN_MS`, `MIN_TRADE_QUALITY_SCORE`, `MIN_LIQUIDITY`, `MIN_WALLET_SCORE`, `MIN_WALLET_ALPHA_SCORE`, `MAX_SLIPPAGE_SPREAD_SHARE`, `MAX_PRICE_MOVE_SINCE_SOURCE_BPS`, `ALLOW_HEDGING`
 - Position risk: `MAX_RISK_PER_TRADE_PCT`, `MAX_POSITION_SIZE_ABS`, `MAX_TOTAL_EXPOSURE_PCT`, `MAX_EXPOSURE_PER_MARKET_PCT`, `MAX_DRAWDOWN_PCT`, `DRAWDOWN_SIZE_MULTIPLIER`, `DRAWDOWN_RELAXATION_FACTOR`, `HARD_STOP_DRAWDOWN_PCT`, `NO_TRADE_TIMEOUT_MS`, `FORCE_CLOSE_ON_HARD_STOP`, `MAX_CONSECUTIVE_LOSSES`, `LOSS_COOLDOWN_MS`
-- Lifecycle and exits: `MAX_POSITION_AGE_HOURS`, `MAX_HOLD_TIME_SECONDS`, `ENABLE_EXIT_RETRY`, `EXIT_RETRY_WINDOW_MS`, `EXIT_RETRY_INTERVAL_MS`, `CLOSING_MAX_AGE_MS`, `FORCE_EXIT_ON_CLOSING_TIMEOUT`
+- Lifecycle and exits: `MAX_POSITION_AGE_HOURS`, `MAX_HOLD_TIME_SECONDS`, `ENABLE_TRAILING_PROFIT_EXIT`, `PROFIT_PROTECT_MIN_PNL_PCT`, `PROFIT_PROTECT_REVERSAL_BPS`, `SOURCE_EXIT_PARTIAL_RETAIN_PCT`, `SOURCE_EXIT_FAVORABLE_MOMENTUM_BPS`, `ENABLE_EXIT_RETRY`, `EXIT_RETRY_WINDOW_MS`, `EXIT_RETRY_INTERVAL_MS`, `CLOSING_MAX_AGE_MS`, `FORCE_EXIT_ON_CLOSING_TIMEOUT`
 - Pending-open exit resolution: `UNRESOLVED_EXIT_INITIAL_RETRY_MS`, `UNRESOLVED_EXIT_MAX_RETRY_MS`, `UNRESOLVED_EXIT_TOTAL_WINDOW_MS`, `POSITION_PENDING_OPEN_TTL_MS`
 - Latency-first hot path: `HOT_PATH_MODE`, `HOT_PATH_QUEUE_CAPACITY`, `COLD_PATH_QUEUE_CAPACITY`, `ATTRIBUTION_FAST_CACHE_CAPACITY`, `PARSE_TASKS_MARKET`, `PARSE_TASKS_WALLET`, `EXIT_PRIORITY_STRICT`
 - Deferred cold-path work: `PERSISTENCE_FLUSH_INTERVAL_MS`, `ANALYTICS_FLUSH_INTERVAL_MS`, `TELEGRAM_ASYNC_ONLY`

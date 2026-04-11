@@ -17,7 +17,7 @@ use crate::config::{ExecutionMode, Settings};
 use crate::execution::{ExecutionSide, ExecutionStatus, ExecutionSuccess};
 use crate::models::{
     ActivityEntry, EquityPoint, PortfolioPosition, PortfolioSnapshot, PositionEntry, PositionKey,
-    PositionState, RealizedTradePoint,
+    PositionState, RealizedTradePoint, classify_market,
 };
 use crate::orderbook::orderbook_state::{MarketSnapshot, OrderBookState};
 
@@ -268,6 +268,7 @@ impl PortfolioService {
                 state: PositionState::Open,
                 size,
                 current_value,
+                source_entry_price: current_price,
                 average_entry_price: current_price,
                 current_price,
                 cost_basis: current_value,
@@ -524,6 +525,7 @@ fn apply_position_fill(
                     source_wallet: normalize_wallet(&source.proxy_wallet),
                     state: PositionState::Open,
                     size: result.filled_size,
+                    source_entry_price: source.price_decimal().unwrap_or(result.filled_price),
                     average_entry_price: result.filled_price,
                     current_price: result.filled_price,
                     cost_basis: result.filled_notional,
@@ -566,10 +568,21 @@ fn apply_position_fill(
             }
 
             let average_entry_price = snapshot.positions[index].average_entry_price;
+            let source_entry_price = snapshot.positions[index].source_entry_price;
             let source_wallet = snapshot.positions[index].source_wallet.clone();
+            let title = snapshot.positions[index].title.clone();
+            let opened_at = snapshot.positions[index].reference_time();
             let realized_pnl = (result.filled_price - average_entry_price) * result.filled_size;
             snapshot.realized_pnl += realized_pnl;
-            record_realized_trade(snapshot, &source_wallet, realized_pnl);
+            record_realized_trade(
+                snapshot,
+                &source_wallet,
+                realized_pnl,
+                realized_trade_close_reason(source),
+                realized_trade_hold_ms(opened_at, Utc::now()),
+                entry_slippage_pct(source_entry_price, average_entry_price),
+                classify_market(&title),
+            );
             let position = &mut snapshot.positions[index];
             position.state = PositionState::Closing;
             position.closing_started_at = Some(Utc::now());
@@ -778,6 +791,9 @@ fn normalize_snapshot(snapshot: &mut PortfolioSnapshot) {
                     position.current_price
                 };
         }
+        if position.source_entry_price.is_zero() {
+            position.source_entry_price = position.average_entry_price;
+        }
         if position.cost_basis.is_zero() {
             position.cost_basis = position.average_entry_price * position.size;
         }
@@ -813,6 +829,10 @@ fn record_realized_trade(
     snapshot: &mut PortfolioSnapshot,
     source_wallet: &str,
     realized_pnl: Decimal,
+    close_reason: impl Into<String>,
+    hold_ms: u64,
+    entry_slippage_pct: Decimal,
+    market_type: crate::models::MarketType,
 ) {
     let now = Utc::now();
     snapshot
@@ -821,6 +841,10 @@ fn record_realized_trade(
             observed_at: now,
             pnl: realized_pnl,
             source_wallet: normalize_wallet(source_wallet),
+            close_reason: close_reason.into(),
+            hold_ms,
+            entry_slippage_pct,
+            market_type,
         });
     if snapshot.recent_realized_trade_points.len() > RECENT_REALIZED_TRADE_LIMIT {
         let drop_count = snapshot.recent_realized_trade_points.len() - RECENT_REALIZED_TRADE_LIMIT;
@@ -837,6 +861,38 @@ fn record_realized_trade(
         snapshot.consecutive_losses = 0;
         snapshot.loss_cooldown_until = None;
     }
+}
+
+fn realized_trade_close_reason(source: &ActivityEntry) -> String {
+    match source.type_name.as_str() {
+        "TIME_EXIT" => "TIME_EXIT".to_owned(),
+        "STOP_LOSS" => "STOP_LOSS".to_owned(),
+        "TAKE_PROFIT" => "TAKE_PROFIT".to_owned(),
+        "PROFIT_PROTECTION" => "PROFIT_PROTECTION".to_owned(),
+        "HARD_STOP" => "HARD_STOP".to_owned(),
+        _ if source.side.eq_ignore_ascii_case("SELL") => "SOURCE_EXIT".to_owned(),
+        _ => "UNKNOWN".to_owned(),
+    }
+}
+
+fn realized_trade_hold_ms(opened_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> u64 {
+    opened_at
+        .map(|opened_at| {
+            now.signed_duration_since(opened_at)
+                .num_milliseconds()
+                .max(0) as u64
+        })
+        .unwrap_or_default()
+}
+
+fn entry_slippage_pct(source_entry_price: Decimal, average_entry_price: Decimal) -> Decimal {
+    if source_entry_price <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+
+    ((average_entry_price - source_entry_price) / source_entry_price)
+        .abs()
+        .max(Decimal::ZERO)
 }
 
 fn apply_risk_state(snapshot: &mut PortfolioSnapshot, config: &PortfolioRiskConfig) {
@@ -1208,6 +1264,7 @@ mod tests {
                 state: PositionState::Open,
                 size: dec!(8),
                 current_value: dec!(6.4),
+                source_entry_price: dec!(0.8),
                 average_entry_price: dec!(0.8),
                 current_price: dec!(0.8),
                 cost_basis: dec!(6.4),
@@ -1241,6 +1298,7 @@ mod tests {
                     state: PositionState::Open,
                     size: dec!(6),
                     current_value: dec!(2.4),
+                    source_entry_price: dec!(0.4),
                     average_entry_price: dec!(0.4),
                     current_price: dec!(0.4),
                     cost_basis: dec!(2.4),
@@ -1264,6 +1322,7 @@ mod tests {
                     state: PositionState::Open,
                     size: dec!(4),
                     current_value: dec!(2),
+                    source_entry_price: dec!(0.5),
                     average_entry_price: dec!(0.5),
                     current_price: dec!(0.5),
                     cost_basis: dec!(2),
@@ -1318,6 +1377,7 @@ mod tests {
                 state: PositionState::Open,
                 size: dec!(5),
                 current_value: dec!(4),
+                source_entry_price: dec!(0.8),
                 average_entry_price: dec!(0.8),
                 current_price: dec!(0.8),
                 cost_basis: dec!(4),
@@ -1350,6 +1410,7 @@ mod tests {
                 state: PositionState::Open,
                 size: dec!(10),
                 current_value: dec!(5),
+                source_entry_price: dec!(0.5),
                 average_entry_price: dec!(0.5),
                 current_price: dec!(0.5),
                 cost_basis: dec!(5),

@@ -55,6 +55,8 @@ impl TradingMode {
 pub struct AdaptiveRiskContext {
     pub mode: TradingMode,
     pub no_trade_relaxation_active: bool,
+    pub performance_degraded: bool,
+    pub performance_recovered: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,7 +97,24 @@ pub struct TradeQualityScore {
     pub spread_score: Decimal,
     pub slippage_score: Decimal,
     pub wallet_score: Decimal,
+    pub wallet_alpha_score: Decimal,
     pub latency_score: Decimal,
+    pub timing_score: Decimal,
+    pub market_type_score: Decimal,
+    pub edge_score: Decimal,
+    pub total_score: Decimal,
+}
+
+#[derive(Clone, Debug)]
+pub struct WalletAlphaScore {
+    pub trade_count: usize,
+    pub win_rate: Decimal,
+    pub avg_pnl_per_trade: Decimal,
+    pub source_exit_share: Decimal,
+    pub time_exit_share: Decimal,
+    pub stop_loss_share: Decimal,
+    pub avg_hold_ms: Decimal,
+    pub slippage_sensitivity_score: Decimal,
     pub total_score: Decimal,
 }
 
@@ -276,6 +295,8 @@ impl RiskEngine {
         AdaptiveRiskContext {
             mode: self.trading_mode(portfolio),
             no_trade_relaxation_active: self.no_trade_relaxation_active(),
+            performance_degraded: performance_degraded(&self.settings, portfolio),
+            performance_recovered: performance_recovered(&self.settings, portfolio),
         }
     }
 
@@ -418,6 +439,7 @@ impl RiskEngine {
     pub fn enforce_entry_quality_post_quote(
         &self,
         entry: &ActivityEntry,
+        portfolio: &PortfolioSnapshot,
         quote: &BestQuote,
         observation: &MarketQualityObservation,
         context: AdaptiveRiskContext,
@@ -479,6 +501,7 @@ impl RiskEngine {
             )
         })?;
         let slippage = (best_ask - source_price).abs();
+        let spread_width = (best_ask - best_bid).abs();
         let max_entry_slippage = effective_max_entry_slippage(&self.settings, context);
         if max_entry_slippage > Decimal::ZERO && slippage > max_entry_slippage {
             return Err(SkipReason::new(
@@ -491,6 +514,51 @@ impl RiskEngine {
                 ),
             ));
         }
+        let slippage_spread_cap =
+            max_slippage_from_spread(&self.settings, spread_width, observation.market_type);
+        let price_move_bps = if source_price > Decimal::ZERO {
+            ((slippage / source_price) * dec!(10000))
+                .max(Decimal::ZERO)
+                .round_dp(2)
+        } else {
+            Decimal::ZERO
+        };
+        if (slippage_spread_cap > Decimal::ZERO && slippage > slippage_spread_cap)
+            || price_move_bps
+                > effective_max_price_move_since_source_bps(
+                    &self.settings,
+                    observation.market_type,
+                    context,
+                )
+        {
+            return Err(SkipReason::new(
+                "slippage_kills_edge",
+                format!(
+                    "slippage {} with spread {} and price move {}bps exceeded edge-preserving thresholds (spread-share cap {}, max move {}bps)",
+                    slippage.round_dp(4),
+                    spread_width.round_dp(4),
+                    price_move_bps.round_dp(2),
+                    slippage_spread_cap.round_dp(4),
+                    effective_max_price_move_since_source_bps(
+                        &self.settings,
+                        observation.market_type,
+                        context,
+                    )
+                    .round_dp(2)
+                ),
+            ));
+        }
+        let wallet_alpha = wallet_alpha_score(&self.settings, portfolio, &entry.proxy_wallet);
+        let timing_score = timing_quality_score(
+            effective_max_price_move_since_source_bps(
+                &self.settings,
+                observation.market_type,
+                context,
+            ),
+            price_move_bps,
+            observation,
+        );
+        let market_type_score = market_type_quality_score(observation.market_type);
 
         let quality = TradeQualityScore {
             liquidity_score: positive_ratio_score(
@@ -500,16 +568,50 @@ impl RiskEngine {
             spread_score: inverse_ratio_score(spread_bps, Decimal::from(max_spread_bps.max(1))),
             slippage_score: inverse_ratio_score(slippage, max_entry_slippage.max(dec!(0.0001))),
             wallet_score: wallet_quality_score(&self.settings, observation),
+            wallet_alpha_score: wallet_alpha.total_score,
             latency_score: latency_quality_score(self.settings.max_copy_delay_ms, observation),
+            timing_score,
+            market_type_score,
+            edge_score: Decimal::ZERO,
             total_score: Decimal::ZERO,
         };
-        let total_score = ((quality.liquidity_score * dec!(0.25))
-            + (quality.spread_score * dec!(0.20))
-            + (quality.slippage_score * dec!(0.20))
-            + (quality.wallet_score * dec!(0.20))
-            + (quality.latency_score * dec!(0.15)))
+        let remaining_edge = (Decimal::ONE - best_ask).max(Decimal::ZERO);
+        let effective_min_edge =
+            effective_min_remaining_edge(&self.settings, observation.market_type, context);
+        let slippage_consumption_ratio = if remaining_edge > Decimal::ZERO {
+            slippage / remaining_edge
+        } else {
+            Decimal::ONE
+        };
+        if remaining_edge <= effective_min_edge
+            || slippage_consumption_ratio
+                >= max_slippage_edge_consumption_ratio(observation.market_type, context)
+        {
+            return Err(SkipReason::new(
+                "edge_rejected",
+                format!(
+                    "remaining edge {} with slippage {} is insufficient for {:?} market (min edge {}, slippage share {})",
+                    remaining_edge.round_dp(4),
+                    slippage.round_dp(4),
+                    observation.market_type,
+                    effective_min_edge.round_dp(4),
+                    slippage_consumption_ratio.round_dp(4)
+                ),
+            ));
+        }
+        let edge_score = positive_ratio_score(remaining_edge, effective_min_edge.max(dec!(0.0001)));
+        let total_score = ((quality.liquidity_score * dec!(0.16))
+            + (quality.spread_score * dec!(0.13))
+            + (quality.slippage_score * dec!(0.18))
+            + (quality.wallet_score * dec!(0.08))
+            + (quality.wallet_alpha_score * dec!(0.18))
+            + (quality.latency_score * dec!(0.10))
+            + (quality.timing_score * dec!(0.09))
+            + (quality.market_type_score * dec!(0.04))
+            + (edge_score * dec!(0.04)))
         .round_dp(4);
         let quality = TradeQualityScore {
+            edge_score,
             total_score,
             ..quality
         };
@@ -549,14 +651,18 @@ impl RiskEngine {
             return Err(SkipReason::new(
                 "trade_quality_rejected",
                 format!(
-                    "trade quality {} is below minimum {} (liq={} spread={} slip={} wallet={} latency={})",
+                    "trade quality {} is below minimum {} (liq={} spread={} slip={} wallet={} wallet_alpha={} latency={} timing={} market={} edge={})",
                     quality.total_score.round_dp(4),
                     min_quality.round_dp(4),
                     quality.liquidity_score.round_dp(4),
                     quality.spread_score.round_dp(4),
                     quality.slippage_score.round_dp(4),
                     quality.wallet_score.round_dp(4),
-                    quality.latency_score.round_dp(4)
+                    quality.wallet_alpha_score.round_dp(4),
+                    quality.latency_score.round_dp(4),
+                    quality.timing_score.round_dp(4),
+                    quality.market_type_score.round_dp(4),
+                    quality.edge_score.round_dp(4)
                 ),
             ));
         }
@@ -768,6 +874,26 @@ impl RiskEngine {
                 format!(
                     "opposite_side_blocked: existing outcome {} for condition {} prevents {}",
                     existing.outcome, entry.condition_id, entry.outcome
+                ),
+            ));
+        }
+        let wallet_alpha = wallet_alpha_score(&self.settings, portfolio, &entry.proxy_wallet);
+        if wallet_alpha.total_score < self.settings.min_wallet_alpha_score.max(Decimal::ZERO) {
+            return Err(SkipReason::new(
+                "wallet_alpha_too_low",
+                format!(
+                    "wallet {} alpha score {} is below minimum {} (win_rate={} source_exit_share={} time_exit_share={} stop_loss_share={} avg_pnl={} trades={} avg_hold_ms={} slippage_score={})",
+                    entry.proxy_wallet,
+                    wallet_alpha.total_score.round_dp(4),
+                    self.settings.min_wallet_alpha_score.round_dp(4),
+                    wallet_alpha.win_rate.round_dp(4),
+                    wallet_alpha.source_exit_share.round_dp(4),
+                    wallet_alpha.time_exit_share.round_dp(4),
+                    wallet_alpha.stop_loss_share.round_dp(4),
+                    wallet_alpha.avg_pnl_per_trade.round_dp(4),
+                    wallet_alpha.trade_count,
+                    wallet_alpha.avg_hold_ms.round_dp(2),
+                    wallet_alpha.slippage_sensitivity_score.round_dp(4)
                 ),
             ));
         }
@@ -986,6 +1112,12 @@ impl RiskEngine {
         price_band: PriceBand,
     ) -> Result<CopyDecision, SkipReason> {
         let _ = price_band;
+        let source_price = entry.price_decimal().map_err(|error| {
+            SkipReason::new(
+                "invalid_source_price",
+                format!("failed to parse source price: {error}"),
+            )
+        })?;
         if resolved_position.used_fallback {
             tracing::info!(
                 event = "fallback_exit_resolution",
@@ -1011,7 +1143,16 @@ impl RiskEngine {
         )
         .min(resolved_position.size)
         .round_dp_with_strategy(6, RoundingStrategy::ToZero);
-        if scaled_size <= dec!(0) {
+        let alpha_adjusted_size = (scaled_size
+            * source_exit_alpha_sell_multiplier(&self.settings, source_price, &resolved_position))
+        .round_dp_with_strategy(6, RoundingStrategy::ToZero)
+        .max(dec!(0));
+        let final_size = if alpha_adjusted_size > Decimal::ZERO {
+            alpha_adjusted_size
+        } else {
+            scaled_size
+        };
+        if final_size <= dec!(0) {
             return Err(SkipReason::new(
                 "sell_size_rounded_to_zero",
                 format!(
@@ -1024,8 +1165,15 @@ impl RiskEngine {
         Ok(CopyDecision {
             token_id: resolved_position.asset.clone(),
             side: ExecutionSide::Sell,
-            notional: source_notional.min(resolved_position.current_value),
-            size: scaled_size,
+            notional: if resolved_position.size > Decimal::ZERO {
+                ((final_size / resolved_position.size)
+                    .min(Decimal::ONE)
+                    .max(Decimal::ZERO))
+                    * resolved_position.current_value
+            } else {
+                Decimal::ZERO
+            },
+            size: final_size,
             size_was_scaled: false,
             position_key: Some(resolved_position.key),
             price_band,
@@ -1140,6 +1288,37 @@ fn wallet_performance_multiplier(portfolio: &PortfolioSnapshot, wallet: &str) ->
     multiplier
 }
 
+fn recent_win_rate(portfolio: &PortfolioSnapshot) -> Option<Decimal> {
+    let count = portfolio.recent_realized_trade_points.len() as u64;
+    if count == 0 {
+        return None;
+    }
+
+    let wins = portfolio
+        .recent_realized_trade_points
+        .iter()
+        .filter(|point| point.pnl > Decimal::ZERO)
+        .count() as u64;
+    Some(Decimal::from(wins) / Decimal::from(count))
+}
+
+fn performance_degraded(settings: &Settings, portfolio: &PortfolioSnapshot) -> bool {
+    let degraded_drawdown = settings.max_drawdown_pct > Decimal::ZERO
+        && portfolio.current_drawdown_pct
+            >= (settings.max_drawdown_pct.max(dec!(0.04)) / dec!(2)).round_dp(4);
+    let degraded_win_rate = portfolio.recent_realized_trade_points.len() >= 5
+        && recent_win_rate(portfolio).is_some_and(|win_rate| win_rate < dec!(0.45));
+    degraded_drawdown || degraded_win_rate || portfolio.rolling_loss_count >= 3
+}
+
+fn performance_recovered(settings: &Settings, portfolio: &PortfolioSnapshot) -> bool {
+    portfolio.recent_realized_trade_points.len() >= 5
+        && recent_win_rate(portfolio).is_some_and(|win_rate| win_rate >= dec!(0.60))
+        && portfolio.current_drawdown_pct
+            < (settings.max_drawdown_pct.max(dec!(0.04)) / dec!(2)).round_dp(4)
+        && portfolio.rolling_loss_count <= 1
+}
+
 fn mode_size_multiplier(settings: &Settings, mode: TradingMode) -> Decimal {
     match mode {
         TradingMode::Normal => Decimal::ONE,
@@ -1172,9 +1351,12 @@ fn effective_min_visible_liquidity(settings: &Settings, context: AdaptiveRiskCon
         return Decimal::ZERO;
     }
 
-    (base / adaptive_relaxation_factor(settings, context))
-        .max(base * dec!(0.5))
-        .round_dp(4)
+    let mut effective =
+        (base / adaptive_relaxation_factor(settings, context)).max(base * dec!(0.5));
+    if context.performance_recovered {
+        effective *= dec!(0.95);
+    }
+    effective.round_dp(4)
 }
 
 fn effective_execution_min_liquidity(settings: &Settings, context: AdaptiveRiskContext) -> Decimal {
@@ -1183,9 +1365,12 @@ fn effective_execution_min_liquidity(settings: &Settings, context: AdaptiveRiskC
         return Decimal::ZERO;
     }
 
-    (base / adaptive_relaxation_factor(settings, context))
-        .max(base * dec!(0.5))
-        .round_dp(4)
+    let mut effective =
+        (base / adaptive_relaxation_factor(settings, context)).max(base * dec!(0.5));
+    if context.performance_recovered {
+        effective *= dec!(0.95);
+    }
+    effective.round_dp(4)
 }
 
 fn effective_max_entry_slippage(settings: &Settings, context: AdaptiveRiskContext) -> Decimal {
@@ -1194,11 +1379,25 @@ fn effective_max_entry_slippage(settings: &Settings, context: AdaptiveRiskContex
         return Decimal::ZERO;
     }
 
-    (base * adaptive_relaxation_factor(settings, context)).round_dp(4)
+    let mut effective = base * adaptive_relaxation_factor(settings, context);
+    if context.performance_degraded {
+        effective *= dec!(0.85);
+    } else if context.performance_recovered && context.mode == TradingMode::Normal {
+        effective *= dec!(1.05);
+    }
+    effective.max(dec!(0.0001)).round_dp(4)
 }
 
 fn effective_max_spread_bps(settings: &Settings, context: AdaptiveRiskContext) -> u32 {
-    relax_bps(settings.max_spread_bps, settings, context)
+    let mut effective = Decimal::from(relax_bps(settings.max_spread_bps, settings, context));
+    if context.performance_recovered && context.mode == TradingMode::Normal {
+        effective *= dec!(1.05);
+    }
+    effective
+        .max(Decimal::ONE)
+        .ceil()
+        .to_u32()
+        .unwrap_or(u32::MAX)
 }
 
 fn effective_wallet_trades_per_minute(settings: &Settings, context: AdaptiveRiskContext) -> u32 {
@@ -1224,6 +1423,11 @@ fn effective_min_trade_quality_score(
     if context.mode == TradingMode::Drawdown {
         minimum = (minimum + dec!(0.10)).min(dec!(0.95));
     }
+    if context.performance_degraded {
+        minimum = (minimum + dec!(0.05)).min(dec!(0.98));
+    } else if context.performance_recovered && context.mode == TradingMode::Normal {
+        minimum = (minimum - dec!(0.03)).max(dec!(0.45));
+    }
     if context.no_trade_relaxation_active {
         minimum = (minimum - dec!(0.05)).max(dec!(0.50));
     }
@@ -1231,6 +1435,264 @@ fn effective_min_trade_quality_score(
         minimum = minimum.max(dec!(0.85));
     }
     minimum.min(Decimal::ONE).round_dp(4)
+}
+
+fn effective_min_remaining_edge(
+    settings: &Settings,
+    market_type: MarketType,
+    context: AdaptiveRiskContext,
+) -> Decimal {
+    let multiplier = match market_type {
+        MarketType::UltraShort => dec!(2.0),
+        MarketType::Short => dec!(1.5),
+        MarketType::Medium => Decimal::ONE,
+    };
+    let mut edge = settings.min_edge_threshold.max(Decimal::ZERO) * multiplier;
+    if context.mode == TradingMode::Drawdown {
+        edge = (edge + dec!(0.01)).min(dec!(0.25));
+    }
+    if context.performance_degraded {
+        edge = (edge + dec!(0.01)).min(dec!(0.30));
+    }
+    edge.round_dp(4)
+}
+
+fn max_slippage_from_spread(
+    settings: &Settings,
+    spread_width: Decimal,
+    market_type: MarketType,
+) -> Decimal {
+    if spread_width <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+
+    let market_multiplier = match market_type {
+        MarketType::UltraShort => dec!(0.70),
+        MarketType::Short => dec!(0.85),
+        MarketType::Medium => Decimal::ONE,
+    };
+    (spread_width
+        * settings
+            .max_slippage_spread_share
+            .max(Decimal::ZERO)
+            .min(dec!(2.0))
+        * market_multiplier)
+        .round_dp(4)
+}
+
+fn effective_max_price_move_since_source_bps(
+    settings: &Settings,
+    market_type: MarketType,
+    context: AdaptiveRiskContext,
+) -> Decimal {
+    let mut max_bps = Decimal::from(settings.max_price_move_since_source_bps.max(1));
+    max_bps *= match market_type {
+        MarketType::UltraShort => dec!(0.75),
+        MarketType::Short => dec!(0.90),
+        MarketType::Medium => Decimal::ONE,
+    };
+    if context.mode == TradingMode::Drawdown || context.no_trade_relaxation_active {
+        max_bps *= adaptive_relaxation_factor(settings, context) * dec!(1.05);
+    } else if context.performance_degraded {
+        max_bps *= dec!(0.90);
+    } else if context.performance_recovered && context.mode == TradingMode::Normal {
+        max_bps *= dec!(1.05);
+    }
+    max_bps.round_dp(2)
+}
+
+fn max_slippage_edge_consumption_ratio(
+    market_type: MarketType,
+    context: AdaptiveRiskContext,
+) -> Decimal {
+    let mut ratio = match market_type {
+        MarketType::UltraShort => dec!(0.25),
+        MarketType::Short => dec!(0.35),
+        MarketType::Medium => dec!(0.50),
+    };
+    if context.performance_degraded {
+        ratio *= dec!(0.90);
+    }
+    ratio.round_dp(4)
+}
+
+fn market_type_quality_score(market_type: MarketType) -> Decimal {
+    match market_type {
+        MarketType::UltraShort => dec!(0.55),
+        MarketType::Short => dec!(0.75),
+        MarketType::Medium => Decimal::ONE,
+    }
+}
+
+fn timing_quality_score(
+    max_price_move_bps: Decimal,
+    price_move_bps: Decimal,
+    observation: &MarketQualityObservation,
+) -> Decimal {
+    let price_score = inverse_ratio_score(price_move_bps, max_price_move_bps.max(Decimal::ONE));
+    let latency_score = latency_quality_score(u64::MAX, observation);
+    ((price_score + latency_score) / dec!(2))
+        .min(Decimal::ONE)
+        .max(Decimal::ZERO)
+}
+
+fn wallet_alpha_score(
+    settings: &Settings,
+    portfolio: &PortfolioSnapshot,
+    wallet: &str,
+) -> WalletAlphaScore {
+    let wallet = normalize_wallet(wallet);
+    let wallet_points = portfolio
+        .recent_realized_trade_points
+        .iter()
+        .filter(|point| normalize_wallet(&point.source_wallet) == wallet)
+        .collect::<Vec<_>>();
+    if wallet_points.is_empty() {
+        return WalletAlphaScore {
+            trade_count: 0,
+            win_rate: dec!(0.50),
+            avg_pnl_per_trade: Decimal::ZERO,
+            source_exit_share: dec!(0.50),
+            time_exit_share: Decimal::ZERO,
+            stop_loss_share: Decimal::ZERO,
+            avg_hold_ms: Decimal::from(settings.min_wallet_avg_hold_ms),
+            slippage_sensitivity_score: dec!(0.65),
+            total_score: dec!(0.65),
+        };
+    }
+
+    let trade_count = wallet_points.len();
+    let trade_count_decimal = Decimal::from(trade_count as u64);
+    let wins = wallet_points
+        .iter()
+        .filter(|point| point.pnl > Decimal::ZERO)
+        .count() as u64;
+    let total_pnl = wallet_points
+        .iter()
+        .map(|point| point.pnl)
+        .fold(Decimal::ZERO, |sum, pnl| sum + pnl);
+    let avg_pnl_per_trade = total_pnl / trade_count_decimal;
+    let source_exit_share = ratio_from_points(&wallet_points, |point| {
+        matches!(
+            point.close_reason.as_str(),
+            "SOURCE_EXIT" | "TAKE_PROFIT" | "PROFIT_PROTECTION"
+        )
+    });
+    let time_exit_share =
+        ratio_from_points(&wallet_points, |point| point.close_reason == "TIME_EXIT");
+    let stop_loss_share = ratio_from_points(&wallet_points, |point| {
+        matches!(point.close_reason.as_str(), "STOP_LOSS" | "HARD_STOP")
+    });
+    let avg_hold_ms = wallet_points
+        .iter()
+        .map(|point| Decimal::from(point.hold_ms))
+        .fold(Decimal::ZERO, |sum, hold_ms| sum + hold_ms)
+        / trade_count_decimal;
+    let avg_entry_slippage_pct = wallet_points
+        .iter()
+        .map(|point| point.entry_slippage_pct.max(Decimal::ZERO))
+        .fold(Decimal::ZERO, |sum, slippage| sum + slippage)
+        / trade_count_decimal;
+    let pnl_score = if avg_pnl_per_trade >= Decimal::ZERO {
+        Decimal::ONE
+    } else {
+        inverse_ratio_score(
+            avg_pnl_per_trade.abs(),
+            settings.max_position_size_abs.max(Decimal::ONE),
+        )
+    };
+    let hold_score = if settings.min_wallet_avg_hold_ms == 0 {
+        Decimal::ONE
+    } else {
+        positive_ratio_score(
+            avg_hold_ms,
+            Decimal::from(settings.min_wallet_avg_hold_ms.max(1)),
+        )
+    };
+    let exit_quality_score =
+        ((source_exit_share + (Decimal::ONE - time_exit_share) + (Decimal::ONE - stop_loss_share))
+            / dec!(3))
+        .max(Decimal::ZERO)
+        .min(Decimal::ONE);
+    let slippage_sensitivity_score = inverse_ratio_score(
+        avg_entry_slippage_pct,
+        settings.max_entry_slippage.max(dec!(0.0001)) * dec!(1.25),
+    );
+    let computed_score = ((Decimal::from(wins) / trade_count_decimal) * dec!(0.35)
+        + exit_quality_score * dec!(0.20)
+        + pnl_score * dec!(0.15)
+        + hold_score * dec!(0.10)
+        + slippage_sensitivity_score * dec!(0.10)
+        + (Decimal::ONE - time_exit_share) * dec!(0.05)
+        + (Decimal::ONE - stop_loss_share) * dec!(0.05))
+    .round_dp(4)
+    .min(Decimal::ONE)
+    .max(Decimal::ZERO);
+    let confidence = (trade_count_decimal / dec!(5)).min(Decimal::ONE);
+    let total_score = ((dec!(0.65) * (Decimal::ONE - confidence)) + computed_score * confidence)
+        .round_dp(4)
+        .min(Decimal::ONE)
+        .max(Decimal::ZERO);
+
+    WalletAlphaScore {
+        trade_count,
+        win_rate: (Decimal::from(wins) / trade_count_decimal).round_dp(4),
+        avg_pnl_per_trade: avg_pnl_per_trade.round_dp(4),
+        source_exit_share: source_exit_share.round_dp(4),
+        time_exit_share: time_exit_share.round_dp(4),
+        stop_loss_share: stop_loss_share.round_dp(4),
+        avg_hold_ms: avg_hold_ms.round_dp(2),
+        slippage_sensitivity_score: slippage_sensitivity_score.round_dp(4),
+        total_score,
+    }
+}
+
+fn ratio_from_points<F>(points: &[&crate::models::RealizedTradePoint], predicate: F) -> Decimal
+where
+    F: Fn(&crate::models::RealizedTradePoint) -> bool,
+{
+    if points.is_empty() {
+        return Decimal::ZERO;
+    }
+
+    Decimal::from(points.iter().filter(|point| predicate(point)).count() as u64)
+        / Decimal::from(points.len() as u64)
+}
+
+fn source_exit_alpha_sell_multiplier(
+    settings: &Settings,
+    source_exit_price: Decimal,
+    resolved_position: &ResolvedPosition,
+) -> Decimal {
+    if source_exit_price <= Decimal::ZERO
+        || resolved_position.average_entry_price <= Decimal::ZERO
+        || resolved_position.size <= Decimal::ZERO
+    {
+        return Decimal::ONE;
+    }
+
+    let mark_price = (resolved_position.current_value / resolved_position.size).max(Decimal::ZERO);
+    let profitable = mark_price
+        >= resolved_position.average_entry_price
+            * (Decimal::ONE + settings.profit_protect_min_pnl_pct.max(Decimal::ZERO));
+    let favorable_gap = if source_exit_price > Decimal::ZERO {
+        (mark_price - source_exit_price) / source_exit_price
+    } else {
+        Decimal::ZERO
+    };
+    let favorable_momentum_threshold =
+        Decimal::from(settings.source_exit_favorable_momentum_bps.max(1)) / dec!(10000);
+    if profitable && favorable_gap >= favorable_momentum_threshold {
+        return (Decimal::ONE
+            - settings
+                .source_exit_partial_retain_pct
+                .max(Decimal::ZERO)
+                .min(dec!(0.85)))
+        .max(dec!(0.25))
+        .round_dp(4);
+    }
+
+    Decimal::ONE
 }
 
 fn relax_bps(base: u32, settings: &Settings, context: AdaptiveRiskContext) -> u32 {
@@ -1436,6 +1898,8 @@ mod tests {
         AdaptiveRiskContext {
             mode: TradingMode::Normal,
             no_trade_relaxation_active: false,
+            performance_degraded: false,
+            performance_recovered: false,
         }
     }
 
@@ -1443,6 +1907,8 @@ mod tests {
         AdaptiveRiskContext {
             mode: TradingMode::Drawdown,
             no_trade_relaxation_active: false,
+            performance_degraded: true,
+            performance_recovered: false,
         }
     }
 
@@ -1511,6 +1977,7 @@ mod tests {
                 state: crate::models::PositionState::Open,
                 size: dec!(10),
                 current_value: dec!(5),
+                source_entry_price: dec!(0.4),
                 average_entry_price: dec!(0.4),
                 current_price: dec!(0.5),
                 cost_basis: dec!(4),
@@ -1618,6 +2085,7 @@ mod tests {
             state: crate::models::PositionState::Open,
             size: dec!(150),
             current_value: dec!(150),
+            source_entry_price: dec!(1),
             average_entry_price: dec!(1),
             current_price: dec!(1),
             cost_basis: dec!(150),
@@ -1661,6 +2129,7 @@ mod tests {
             state: crate::models::PositionState::Open,
             size: dec!(140),
             current_value: dec!(140),
+            source_entry_price: dec!(1),
             average_entry_price: dec!(1),
             current_price: dec!(1),
             cost_basis: dec!(140),
@@ -1735,6 +2204,7 @@ mod tests {
             state: crate::models::PositionState::Open,
             size: dec!(5),
             current_value: dec!(4),
+            source_entry_price: dec!(1),
             average_entry_price: dec!(1),
             current_price: dec!(0.8),
             cost_basis: dec!(5),
@@ -1771,6 +2241,10 @@ mod tests {
                 observed_at: Utc::now(),
                 pnl: dec!(-3),
                 source_wallet: "0xsource".to_owned(),
+                close_reason: "TIME_EXIT".to_owned(),
+                hold_ms: 30_000,
+                entry_slippage_pct: dec!(0.01),
+                market_type: MarketType::Short,
             });
 
         let decision = engine
@@ -1778,6 +2252,97 @@ mod tests {
             .expect("buy should remain eligible");
 
         assert_eq!(decision.notional, dec!(7.5));
+    }
+
+    #[test]
+    fn wallet_alpha_low_quality_wallet_is_filtered() {
+        let mut settings = sample_settings();
+        settings.min_wallet_alpha_score = dec!(0.60);
+        let engine = RiskEngine::new(settings);
+        let entry = sample_entry("BUY", "asset-2", 20.0, 10.0, "0xsource");
+        let mut portfolio = flat_portfolio(dec!(100));
+        portfolio.recent_realized_trade_points = vec![
+            RealizedTradePoint {
+                observed_at: Utc::now(),
+                pnl: dec!(-2),
+                source_wallet: "0xsource".to_owned(),
+                close_reason: "TIME_EXIT".to_owned(),
+                hold_ms: 5_000,
+                entry_slippage_pct: dec!(0.03),
+                market_type: MarketType::UltraShort,
+            },
+            RealizedTradePoint {
+                observed_at: Utc::now(),
+                pnl: dec!(-2),
+                source_wallet: "0xsource".to_owned(),
+                close_reason: "STOP_LOSS".to_owned(),
+                hold_ms: 4_000,
+                entry_slippage_pct: dec!(0.04),
+                market_type: MarketType::UltraShort,
+            },
+            RealizedTradePoint {
+                observed_at: Utc::now(),
+                pnl: dec!(-1),
+                source_wallet: "0xsource".to_owned(),
+                close_reason: "TIME_EXIT".to_owned(),
+                hold_ms: 6_000,
+                entry_slippage_pct: dec!(0.03),
+                market_type: MarketType::Short,
+            },
+            RealizedTradePoint {
+                observed_at: Utc::now(),
+                pnl: dec!(-1),
+                source_wallet: "0xsource".to_owned(),
+                close_reason: "TIME_EXIT".to_owned(),
+                hold_ms: 7_000,
+                entry_slippage_pct: dec!(0.02),
+                market_type: MarketType::Short,
+            },
+            RealizedTradePoint {
+                observed_at: Utc::now(),
+                pnl: dec!(-3),
+                source_wallet: "0xsource".to_owned(),
+                close_reason: "HARD_STOP".to_owned(),
+                hold_ms: 3_000,
+                entry_slippage_pct: dec!(0.05),
+                market_type: MarketType::UltraShort,
+            },
+        ];
+
+        let reason = engine
+            .evaluate(&entry, &portfolio)
+            .expect_err("wallet alpha should reject repeated time-exit / stop-loss losers");
+
+        assert_eq!(reason.code, "wallet_alpha_too_low");
+    }
+
+    #[test]
+    fn profitable_source_exit_is_partially_held_when_exit_price_lags_market() {
+        let mut settings = sample_settings();
+        settings.copy_scale_above_five_usd = Decimal::ONE;
+        settings.source_exit_partial_retain_pct = dec!(0.5);
+        settings.source_exit_favorable_momentum_bps = 100;
+        let engine = RiskEngine::new(settings);
+        let entry = sample_entry("SELL", "asset-1", 10.0, 5.4, "0xsource");
+        let resolved = ResolvedPosition {
+            key: PositionKey::new("condition-1", "YES", "0xsource"),
+            asset: "asset-1".to_owned(),
+            outcome: "YES".to_owned(),
+            source_wallet: "0xsource".to_owned(),
+            size: dec!(10),
+            current_value: dec!(6),
+            average_entry_price: dec!(0.5),
+            used_fallback: false,
+            fallback_reason: None,
+        };
+
+        let decision = engine
+            .evaluate_sell_from_resolved_position(&entry, resolved)
+            .expect("profitable source exit should still resolve");
+
+        assert_eq!(decision.side, ExecutionSide::Sell);
+        assert!(decision.size < dec!(10));
+        assert!(decision.size >= dec!(5));
     }
 
     #[test]
@@ -1791,6 +2356,7 @@ mod tests {
         let reason = engine
             .enforce_entry_quality_post_quote(
                 &entry,
+                &flat_portfolio(dec!(100)),
                 &sample_quote(dec!(0.49), dec!(60), dec!(0.51), dec!(60)),
                 &observation,
                 normal_context(),
@@ -1813,6 +2379,7 @@ mod tests {
         let quality = engine
             .enforce_entry_quality_post_quote(
                 &entry,
+                &flat_portfolio(dec!(100)),
                 &sample_quote(dec!(0.499), dec!(500), dec!(0.501), dec!(500)),
                 &observation,
                 normal_context(),
@@ -1838,14 +2405,26 @@ mod tests {
 
         assert_eq!(
             engine
-                .enforce_entry_quality_post_quote(&entry, &quote, &observation, normal_context())
+                .enforce_entry_quality_post_quote(
+                    &entry,
+                    &flat_portfolio(dec!(100)),
+                    &quote,
+                    &observation,
+                    normal_context(),
+                )
                 .expect_err("normal mode should keep strict thresholds")
                 .code,
             "low_visible_liquidity"
         );
 
         let quality = engine
-            .enforce_entry_quality_post_quote(&entry, &quote, &observation, drawdown_context())
+            .enforce_entry_quality_post_quote(
+                &entry,
+                &flat_portfolio(dec!(100)),
+                &quote,
+                &observation,
+                drawdown_context(),
+            )
             .expect("drawdown mode should relax liquidity/spread/slippage thresholds");
         assert!(quality.total_score >= dec!(0.50));
     }
@@ -1886,6 +2465,7 @@ mod tests {
         let reason = engine
             .enforce_entry_quality_post_quote(
                 &entry,
+                &flat_portfolio(dec!(100)),
                 &sample_quote(dec!(0.49), dec!(10), dec!(0.51), dec!(12)),
                 &observation,
                 normal_context(),
@@ -1907,6 +2487,7 @@ mod tests {
         let reason = engine
             .enforce_entry_quality_post_quote(
                 &entry,
+                &flat_portfolio(dec!(100)),
                 &sample_quote(dec!(0.58), dec!(80), dec!(0.60), dec!(80)),
                 &observation,
                 normal_context(),
@@ -1914,6 +2495,31 @@ mod tests {
             .expect_err("slippage should be rejected");
 
         assert_eq!(reason.code, "price_chased_strict");
+    }
+
+    #[test]
+    fn low_edge_slippage_heavy_trade_is_rejected() {
+        let mut settings = sample_settings();
+        settings.enable_ultra_short_markets = true;
+        settings.max_entry_slippage = dec!(0.20);
+        settings.min_edge_threshold = dec!(0.05);
+        let engine = RiskEngine::new(settings);
+        let mut entry = sample_entry("BUY", "asset-2", 10.0, 8.0, "0xsource");
+        entry.title = "BTC 1h".to_owned();
+        entry.timestamp = recent_timestamp_ms();
+
+        let observation = engine.observe_source_trade(&entry);
+        let reason = engine
+            .enforce_entry_quality_post_quote(
+                &entry,
+                &flat_portfolio(dec!(100)),
+                &sample_quote(dec!(0.93), dec!(80), dec!(0.96), dec!(80)),
+                &observation,
+                normal_context(),
+            )
+            .expect_err("slippage-heavy low-edge trade should be rejected");
+
+        assert_eq!(reason.code, "slippage_kills_edge");
     }
 
     #[test]
@@ -1994,6 +2600,7 @@ mod tests {
         let quality = engine
             .enforce_entry_quality_post_quote(
                 &entry,
+                &flat_portfolio(dec!(100)),
                 &sample_quote(dec!(0.49), dec!(80), dec!(0.51), dec!(90)),
                 &observation,
                 normal_context(),
@@ -2042,6 +2649,7 @@ mod tests {
             state: crate::models::PositionState::Open,
             size: dec!(31),
             current_value: dec!(31),
+            source_entry_price: dec!(1),
             average_entry_price: dec!(1),
             current_price: dec!(1),
             cost_basis: dec!(31),
@@ -2145,6 +2753,7 @@ mod tests {
             state: crate::models::PositionState::Open,
             size: dec!(11),
             current_value: dec!(11),
+            source_entry_price: dec!(1),
             average_entry_price: dec!(1),
             current_price: dec!(1),
             cost_basis: dec!(11),

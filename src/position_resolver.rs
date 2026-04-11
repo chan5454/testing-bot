@@ -398,6 +398,7 @@ impl PositionResolver {
             source_wallet: record.key.source_wallet.clone(),
             size: record.size,
             current_value: record.current_value,
+            average_entry_price: record.average_entry_price,
             used_fallback: false,
             fallback_reason: None,
         })
@@ -635,6 +636,7 @@ mod tests {
             state: PositionState::Open,
             size: dec!(10),
             current_value: dec!(5),
+            source_entry_price: dec!(0.5),
             average_entry_price: dec!(0.5),
             current_price: dec!(0.5),
             cost_basis: dec!(5),

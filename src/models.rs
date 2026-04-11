@@ -56,10 +56,11 @@ impl ActivityEntry {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum MarketType {
     UltraShort,
     Short,
+    #[default]
     Medium,
 }
 
@@ -257,6 +258,14 @@ pub struct RealizedTradePoint {
     pub pnl: Decimal,
     #[serde(default)]
     pub source_wallet: String,
+    #[serde(default)]
+    pub close_reason: String,
+    #[serde(default)]
+    pub hold_ms: u64,
+    #[serde(default)]
+    pub entry_slippage_pct: Decimal,
+    #[serde(default)]
+    pub market_type: MarketType,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -344,6 +353,8 @@ pub struct PortfolioPosition {
     pub size: Decimal,
     pub current_value: Decimal,
     #[serde(default)]
+    pub source_entry_price: Decimal,
+    #[serde(default)]
     pub average_entry_price: Decimal,
     #[serde(default)]
     pub current_price: Decimal,
@@ -379,6 +390,7 @@ pub struct ResolvedPosition {
     pub source_wallet: String,
     pub size: Decimal,
     pub current_value: Decimal,
+    pub average_entry_price: Decimal,
     pub used_fallback: bool,
     pub fallback_reason: Option<String>,
 }
@@ -708,6 +720,7 @@ impl PortfolioSnapshot {
                 source_wallet: position.source_wallet.clone(),
                 size: position.size,
                 current_value: position.current_value,
+                average_entry_price: position.average_entry_price,
                 used_fallback: false,
                 fallback_reason: None,
             });
@@ -732,6 +745,7 @@ impl PortfolioSnapshot {
             source_wallet: position.source_wallet.clone(),
             size: position.size,
             current_value: position.current_value,
+            average_entry_price: position.average_entry_price,
             used_fallback: true,
             fallback_reason: Some(fallback_reason),
         })
@@ -963,14 +977,20 @@ pub struct TradeCohort {
     pub condition_id: String,
     #[serde(default)]
     pub outcome: String,
+    #[serde(default)]
+    pub market_type: MarketType,
     pub side: String,
     pub source_trade_timestamp_unix: i64,
     pub source_price: Decimal,
     pub filled_price: Decimal,
+    #[serde(default)]
+    pub entry_slippage_pct: Decimal,
     pub filled_size: Decimal,
     pub execution_mode: String,
     pub open_time: DateTime<Utc>,
     pub close_time: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub close_reason: Option<String>,
     pub realized_pnl: Decimal,
     pub unrealized_pnl: Decimal,
     pub status: TradeCohortStatus,
@@ -1011,7 +1031,13 @@ pub struct ExecutionAnalyticsState {
     #[serde(default)]
     pub pnl_by_source_wallet: BTreeMap<String, Decimal>,
     #[serde(default)]
+    pub win_rate_by_wallet: BTreeMap<String, Decimal>,
+    #[serde(default)]
+    pub wallet_alpha_scores: BTreeMap<String, Decimal>,
+    #[serde(default)]
     pub pnl_by_trade_day: BTreeMap<String, Decimal>,
+    #[serde(default)]
+    pub win_rate_by_market_type: BTreeMap<String, Decimal>,
     pub current_window_positions: usize,
     pub legacy_positions: usize,
     pub current_window_unrealized_pnl: Decimal,
@@ -1051,6 +1077,24 @@ pub struct ExecutionAnalyticsState {
     #[serde(default)]
     pub risk_event_counts: BTreeMap<String, u64>,
     #[serde(default)]
+    pub close_type_counts: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub close_type_share: BTreeMap<String, Decimal>,
+    #[serde(default)]
+    pub pnl_by_close_type: BTreeMap<String, Decimal>,
+    #[serde(default)]
+    pub profit_protection_exit_pnl: Decimal,
+    #[serde(default)]
+    pub filtered_entry_pct: Decimal,
+    #[serde(default)]
+    pub entry_slippage_p50_pct: Decimal,
+    #[serde(default)]
+    pub entry_slippage_p90_pct: Decimal,
+    #[serde(default)]
+    pub win_rate_by_close_type: BTreeMap<String, Decimal>,
+    #[serde(default)]
+    pub median_hold_ms_by_close_type: BTreeMap<String, u64>,
+    #[serde(default)]
     pub cohorts: Vec<TradeCohort>,
 }
 
@@ -1080,7 +1124,9 @@ impl Default for ExecutionAnalyticsState {
             pnl_current_window: Decimal::ZERO,
             pnl_all_open_positions: Decimal::ZERO,
             pnl_by_source_wallet: BTreeMap::new(),
+            win_rate_by_wallet: BTreeMap::new(),
             pnl_by_trade_day: BTreeMap::new(),
+            win_rate_by_market_type: BTreeMap::new(),
             current_window_positions: 0,
             legacy_positions: 0,
             current_window_unrealized_pnl: Decimal::ZERO,
@@ -1105,6 +1151,16 @@ impl Default for ExecutionAnalyticsState {
             drawdown_guard_active: false,
             hard_stop_active: false,
             risk_event_counts: BTreeMap::new(),
+            close_type_counts: BTreeMap::new(),
+            close_type_share: BTreeMap::new(),
+            pnl_by_close_type: BTreeMap::new(),
+            profit_protection_exit_pnl: Decimal::ZERO,
+            filtered_entry_pct: Decimal::ZERO,
+            entry_slippage_p50_pct: Decimal::ZERO,
+            entry_slippage_p90_pct: Decimal::ZERO,
+            win_rate_by_close_type: BTreeMap::new(),
+            median_hold_ms_by_close_type: BTreeMap::new(),
+            wallet_alpha_scores: BTreeMap::new(),
             cohorts: Vec::new(),
         }
     }

@@ -51,10 +51,27 @@ impl FastAttributionIndex {
         wallet_registry: &WalletRegistry,
         position_registry: &PositionRegistry,
     ) -> Option<MatchedTrackedTrade> {
-        let tracked_wallet = event.wallet_candidates.iter().find(|wallet| {
-            wallet_registry.is_tracked(wallet)
-                || position_registry.has_open_position_for_wallet_market(wallet, &event.market_id)
-        })?;
+        let tracked_wallet = event
+            .wallet_candidates
+            .iter()
+            .filter_map(|wallet| {
+                let owns_market =
+                    position_registry.has_open_position_for_wallet_market(wallet, &event.market_id);
+                let meta = wallet_registry.get_wallet_meta(wallet);
+                (owns_market || meta.as_ref().is_some_and(|meta| meta.active)).then(|| {
+                    (
+                        wallet,
+                        owns_market,
+                        meta.map(|meta| meta.score).unwrap_or_default(),
+                    )
+                })
+            })
+            .max_by(|left, right| {
+                left.1
+                    .cmp(&right.1)
+                    .then_with(|| left.2.total_cmp(&right.2))
+            })?
+            .0;
 
         let mut event = event.clone();
         event.wallet = tracked_wallet.clone();
