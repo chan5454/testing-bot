@@ -82,12 +82,13 @@ pub async fn enforce_jsonl_retention(path: &Path, retention: Duration) -> Result
         .with_context(|| format!("flushing {}", temp_path.display()))?;
     drop(destination);
 
-    match tokio::fs::remove_file(path).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).with_context(|| format!("removing {}", path.display())),
+    if outcome.kept_lines == 0 {
+        remove_if_exists_async(path).await?;
+        remove_if_exists_async(&temp_path).await?;
+        return Ok(outcome);
     }
 
+    remove_if_exists_async(path).await?;
     tokio::fs::rename(&temp_path, path)
         .await
         .with_context(|| format!("replacing {}", path.display()))?;
@@ -146,12 +147,13 @@ pub fn enforce_jsonl_retention_blocking(
         .with_context(|| format!("flushing {}", temp_path.display()))?;
     drop(destination);
 
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).with_context(|| format!("removing {}", path.display())),
+    if outcome.kept_lines == 0 {
+        remove_if_exists_blocking(path)?;
+        remove_if_exists_blocking(&temp_path)?;
+        return Ok(outcome);
     }
 
+    remove_if_exists_blocking(path)?;
     std::fs::rename(&temp_path, path).with_context(|| format!("replacing {}", path.display()))?;
 
     Ok(outcome)
@@ -185,9 +187,26 @@ fn temp_path_for(path: &Path) -> Result<PathBuf> {
     Ok(path.with_file_name(temp_name))
 }
 
+async fn remove_if_exists_async(path: &Path) -> Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+fn remove_if_exists_blocking(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn keeps_recent_timestamped_lines() {
@@ -221,5 +240,44 @@ mod tests {
             r#"{"event_type":"unknown"}"#,
             Utc::now() - chrono::Duration::hours(6)
         ));
+    }
+
+    #[tokio::test]
+    async fn deletes_file_when_all_entries_are_expired() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("retention.jsonl");
+        let stale = format!(
+            r#"{{"logged_at":"{}","event_type":"stale"}}"#,
+            (Utc::now() - chrono::Duration::hours(8)).to_rfc3339()
+        );
+        tokio::fs::write(&path, format!("{stale}\n"))
+            .await
+            .expect("write stale line");
+
+        let outcome = enforce_jsonl_retention(&path, Duration::from_secs(60 * 60))
+            .await
+            .expect("enforce retention");
+
+        assert_eq!(outcome.kept_lines, 0);
+        assert_eq!(outcome.removed_lines, 1);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn deletes_file_when_all_entries_are_expired_blocking() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("retention-blocking.jsonl");
+        let stale = format!(
+            r#"{{"logged_at":"{}","event_type":"stale"}}"#,
+            (Utc::now() - chrono::Duration::hours(8)).to_rfc3339()
+        );
+        std::fs::write(&path, format!("{stale}\n")).expect("write stale line");
+
+        let outcome = enforce_jsonl_retention_blocking(&path, Duration::from_secs(60 * 60))
+            .expect("enforce blocking retention");
+
+        assert_eq!(outcome.kept_lines, 0);
+        assert_eq!(outcome.removed_lines, 1);
+        assert!(!path.exists());
     }
 }

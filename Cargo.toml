@@ -8,7 +8,6 @@ license = "MIT"
 [dependencies]
 alloy = { version = "1.7.3", default-features = false, features = ["std", "essentials", "reqwest-rustls-tls", "signer-local"] }
 anyhow = "1.0.100"
-arc-swap = "1.7.1"
 async-trait = "0.1.89"
 axum = { version = "0.8.6", features = ["json"] }
 chrono = { version = "0.4.42", features = ["serde"] }
@@ -29,3 +28,11 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "jso
 
 [dev-dependencies]
 tempfile = "3.23.0"
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false

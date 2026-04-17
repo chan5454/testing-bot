@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -9,6 +10,7 @@ use tracing::warn;
 
 use crate::config::Settings;
 use crate::execution::{ExecutionResult, ExecutionSide, ExecutionStatus};
+use crate::log_retention::RetentionOutcome;
 use crate::models::{ActivityEntry, PortfolioSnapshot, PositionKey};
 use crate::rolling_jsonl::RollingJsonlLogger;
 use crate::wallet::wallet_filter::normalize_wallet;
@@ -75,6 +77,10 @@ impl PositionRegistry {
 
     pub fn has_matching_open_position(&self, entry: &ActivityEntry) -> bool {
         self.resolve_open_position(&entry.position_key()).is_some()
+    }
+
+    pub async fn cull_old_entries(&self, retention: Duration) -> Result<RetentionOutcome> {
+        self.lifecycle_logger.cull_old_entries(retention).await
     }
 
     pub fn has_open_position_key(&self, key: &PositionKey) -> bool {

@@ -1,11 +1,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+
+use crate::log_retention::{RetentionOutcome, enforce_jsonl_retention};
 
 #[derive(Clone)]
 pub struct RollingJsonlLogger {
@@ -85,6 +88,67 @@ impl RollingJsonlLogger {
             })?;
         Ok(())
     }
+
+    pub async fn cull_old_entries(&self, retention: Duration) -> Result<RetentionOutcome> {
+        let mut state = self.state.lock().await;
+        self.initialize_if_needed(&mut state).await?;
+
+        let mut outcome = RetentionOutcome::default();
+        for path in self.managed_paths().await? {
+            let file_outcome = enforce_jsonl_retention(&path, retention).await?;
+            outcome.kept_lines += file_outcome.kept_lines;
+            outcome.removed_lines += file_outcome.removed_lines;
+        }
+
+        state.line_count = count_lines(&self.path).await?;
+        Ok(outcome)
+    }
+
+    async fn managed_paths(&self) -> Result<Vec<PathBuf>> {
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let mut directory = tokio::fs::read_dir(parent)
+            .await
+            .with_context(|| format!("reading {}", parent.display()))?;
+        let mut paths = Vec::new();
+
+        while let Some(entry) = directory.next_entry().await? {
+            let path = entry.path();
+            if self.manages_path(&path) {
+                paths.push(path);
+            }
+        }
+
+        if !paths.iter().any(|candidate| candidate == &self.path) && path_exists(&self.path).await? {
+            paths.push(self.path.clone());
+        }
+
+        Ok(paths)
+    }
+
+    fn manages_path(&self, candidate: &Path) -> bool {
+        if candidate == self.path {
+            return true;
+        }
+
+        let Some(file_name) = candidate.file_name().and_then(|value| value.to_str()) else {
+            return false;
+        };
+        let stem = self
+            .path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("log");
+        let rotated_prefix = format!("{stem}-");
+        let extension = self.path.extension().and_then(|value| value.to_str());
+
+        match extension {
+            Some(extension) if !extension.is_empty() => {
+                file_name.starts_with(&rotated_prefix)
+                    && file_name.ends_with(&format!(".{extension}"))
+            }
+            _ => file_name.starts_with(&rotated_prefix),
+        }
+    }
 }
 
 async fn count_lines(path: &Path) -> Result<usize> {
@@ -115,5 +179,66 @@ fn rotated_path(path: &Path, suffix: i64) -> PathBuf {
             parent.join(format!("{stem}-{suffix}.{extension}"))
         }
         _ => parent.join(format!("{stem}-{suffix}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Duration as ChronoDuration, Utc};
+    use serde::Serialize;
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[derive(Serialize)]
+    struct TestEntry {
+        logged_at: chrono::DateTime<Utc>,
+        value: &'static str,
+    }
+
+    #[tokio::test]
+    async fn culls_rotated_files_and_deletes_empty_shells() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("wallet-activity.jsonl");
+        let logger = RollingJsonlLogger::new(path.clone(), 2);
+        let stale_time = Utc::now() - ChronoDuration::hours(3);
+
+        logger
+            .append(&TestEntry {
+                logged_at: stale_time,
+                value: "first",
+            })
+            .await
+            .expect("append first");
+        logger
+            .append(&TestEntry {
+                logged_at: stale_time,
+                value: "second",
+            })
+            .await
+            .expect("append second");
+        logger
+            .append(&TestEntry {
+                logged_at: stale_time,
+                value: "third",
+            })
+            .await
+            .expect("append third");
+
+        let outcome = logger
+            .cull_old_entries(Duration::from_secs(60 * 60))
+            .await
+            .expect("cull stale entries");
+
+        assert_eq!(outcome.kept_lines, 0);
+        assert_eq!(outcome.removed_lines, 3);
+
+        let names = std::fs::read_dir(temp_dir.path())
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(names.is_empty(), "expected no managed files, found {names:?}");
+        assert!(!path.exists());
     }
 }

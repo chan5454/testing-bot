@@ -10,6 +10,7 @@ use tracing::{info, warn};
 
 use crate::config::Settings;
 use crate::health::HealthState;
+use crate::log_retention::RetentionOutcome;
 use crate::models::ExecutionAnalyticsState;
 use crate::rolling_jsonl::RollingJsonlLogger;
 use crate::wallet::wallet_filter::normalize_wallet;
@@ -113,6 +114,10 @@ impl WalletActivityLogger {
             warn!(?error, "failed to persist wallet activity event");
         }
     }
+
+    pub async fn cull_old_entries(&self, retention: Duration) -> anyhow::Result<RetentionOutcome> {
+        self.logger.cull_old_entries(retention).await
+    }
 }
 
 impl WalletScoreLogger {
@@ -147,6 +152,10 @@ impl WalletScoreLogger {
         {
             warn!(?error, wallet, "failed to persist wallet score");
         }
+    }
+
+    pub async fn cull_old_entries(&self, retention: Duration) -> anyhow::Result<RetentionOutcome> {
+        self.logger.cull_old_entries(retention).await
     }
 }
 
@@ -230,6 +239,11 @@ async fn scan_recent_wallet_activity(settings: &Settings) -> anyhow::Result<Vec<
         .to_string()
         .parse::<f64>()
         .unwrap_or(1.0);
+    let max_trades_per_hour = if settings.max_wallet_trades_per_min == 0 {
+        f64::INFINITY
+    } else {
+        settings.max_wallet_trades_per_min as f64 * 60.0
+    };
 
     let mut wallets = by_wallet
         .into_iter()
@@ -242,7 +256,8 @@ async fn scan_recent_wallet_activity(settings: &Settings) -> anyhow::Result<Vec<
             };
             let active = stats.trades >= MIN_TRADES_PER_HOUR
                 && stats.last_trade_time >= cutoff.timestamp_millis()
-                && avg_trade_size >= min_avg_trade_size;
+                && avg_trade_size >= min_avg_trade_size
+                && trades_per_hour <= max_trades_per_hour;
             let score = if active {
                 ((trades_per_hour / 10.0).min(1.0) * 0.6 + (avg_trade_size / 10.0).min(1.0) * 0.4)
                     .clamp(0.0, 1.0)
@@ -396,6 +411,7 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use super::*;
+    use crate::config::Settings;
     use crate::models::{ExecutionAnalyticsState, TradeCohort, TradeCohortStatus};
 
     #[tokio::test]
@@ -421,6 +437,71 @@ mod tests {
 
         assert!(feedback.get("0xwallet-a").expect("wallet a").multiplier < 1.0);
         assert!(feedback.get("0xwallet-b").expect("wallet b").multiplier >= 1.0);
+    }
+
+    #[tokio::test]
+    async fn scan_recent_wallet_activity_rejects_hyperactive_wallets() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut settings = Settings::default_for_tests(PathBuf::from(temp_dir.path()));
+        settings.min_source_trade_usdc = dec!(1);
+        settings.max_wallet_trades_per_min = 1;
+
+        let now = Utc::now();
+        let path = temp_dir.path().join("wallet-activity.jsonl");
+        let mut lines = Vec::new();
+        for index in 0..65 {
+            lines.push(
+                serde_json::to_string(&WalletActivityLogEntry {
+                    logged_at: now,
+                    wallet: "0xhyper".to_owned(),
+                    market_id: format!("market-{index}"),
+                    transaction_hash: format!("0xhyper-{index}"),
+                    price: 0.4,
+                    size: 10.0,
+                    timestamp_ms: now.timestamp_millis() - index as i64,
+                    source: "activity_ws".to_owned(),
+                    tracked: false,
+                    exit_eligible: false,
+                })
+                .expect("hyper json"),
+            );
+        }
+        for index in 0..5 {
+            lines.push(
+                serde_json::to_string(&WalletActivityLogEntry {
+                    logged_at: now,
+                    wallet: "0xsteady".to_owned(),
+                    market_id: format!("steady-market-{index}"),
+                    transaction_hash: format!("0xsteady-{index}"),
+                    price: 0.4,
+                    size: 10.0,
+                    timestamp_ms: now.timestamp_millis() - 100 - index as i64,
+                    source: "activity_ws".to_owned(),
+                    tracked: false,
+                    exit_eligible: false,
+                })
+                .expect("steady json"),
+            );
+        }
+        tokio::fs::write(&path, lines.join("\n"))
+            .await
+            .expect("write wallet activity");
+
+        let scan_result = scan_recent_wallet_activity(&settings)
+            .await
+            .expect("scan succeeds");
+
+        let hyper = scan_result
+            .iter()
+            .find(|wallet| wallet.address == "0xhyper")
+            .expect("hyper wallet present");
+        let steady = scan_result
+            .iter()
+            .find(|wallet| wallet.address == "0xsteady")
+            .expect("steady wallet present");
+
+        assert!(!hyper.active);
+        assert!(steady.active);
     }
 
     fn sample_closed_cohort(

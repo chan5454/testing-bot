@@ -9,8 +9,6 @@ pub struct WalletScore {
     pub early_entry_ratio: Decimal,
 }
 
-pub type WalletStats = WalletScore;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrackedWallet {
     pub address: String,
@@ -24,7 +22,7 @@ impl TrackedWallet {
     }
 }
 
-pub fn compute_wallet_score(wallet: &WalletStats) -> Decimal {
+pub fn compute_wallet_score(wallet: &WalletScore) -> Decimal {
     let early_entry_bonus = if wallet.avg_entry_price < dec!(0.7) {
         dec!(1.2)
     } else {

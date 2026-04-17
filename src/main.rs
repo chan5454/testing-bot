@@ -28,6 +28,7 @@ mod wallet_score;
 mod websocket;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,11 +58,11 @@ use raw_activity_logger::RawActivityLogger;
 use risk::{CopyDecision, RiskEngine, SkipReason, TradingMode};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use wallet::activity_stream::{ActivityCommand, WalletActivityStream};
 use wallet::wallet_filter::normalize_wallet;
 use wallet::wallet_matching::MatchedTrackedTrade;
@@ -95,7 +96,6 @@ const TIME_EXIT_MILD_LOSS_BPS: Decimal = rust_decimal_macros::dec!(0.02);
 const TIME_EXIT_SMALL_PNL_ABS: Decimal = rust_decimal_macros::dec!(0.50);
 const TIME_EXIT_EXTENSION_MULTIPLIER: i64 = 2;
 const PREDICTION_HISTORY_SEED_LIMIT: usize = 512;
-const LOG_RETENTION_WINDOW: Duration = Duration::from_secs(6 * 60 * 60);
 const LOG_RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const PERIODIC_SUMMARY_RETRY_DELAY: Duration = Duration::from_secs(60);
 const LATE_PREDICTION_CONFIRMATION_RETENTION: Duration = Duration::from_secs(5);
@@ -146,6 +146,37 @@ struct EntryExecutionMetadata {
     conviction_score: Decimal,
     wallet_alpha_score: Decimal,
     sizing_bucket: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct WalletRealizedWinRateReport {
+    generated_at: DateTime<Utc>,
+    trade_day: String,
+    total_closed_trades: u64,
+    wallet_count: usize,
+    entries: Vec<WalletRealizedWinRateEntry>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct WalletRealizedWinRateEntry {
+    wallet: String,
+    closed_trades: u64,
+    wins: u64,
+    losses: u64,
+    breakeven: u64,
+    realized_win_rate: Decimal,
+    total_realized_pnl: Decimal,
+    expectancy_per_trade: Decimal,
+    average_winner: Decimal,
+    average_loser: Decimal,
+    payoff_ratio: Decimal,
+    alpha_score: Decimal,
+    favorable_exit_share: Decimal,
+    time_exit_share: Decimal,
+    stop_exit_share: Decimal,
+    average_hold_ms: u64,
+    average_entry_slippage_pct: Decimal,
+    last_close_time: Option<DateTime<Utc>>,
 }
 
 impl ExecutionAnalyticsTracker {
@@ -403,6 +434,8 @@ impl ExecutionAnalyticsTracker {
                     Ok(body) => {
                         if let Err(error) = tokio::fs::write(&path, body).await {
                             warn!(?error, path = %path.display(), "failed to persist execution analytics summary");
+                        } else {
+                            persist_wallet_realized_win_rate_report(&path, &snapshot).await;
                         }
                     }
                     Err(error) => warn!(?error, "failed to encode execution analytics summary"),
@@ -1002,6 +1035,265 @@ fn mean_decimal(sum: Decimal, count: u64) -> Decimal {
     }
 }
 
+fn build_wallet_realized_win_rate_report(
+    state: &ExecutionAnalyticsState,
+) -> WalletRealizedWinRateReport {
+    #[derive(Default)]
+    struct WalletAccumulator {
+        closed_trades: u64,
+        wins: u64,
+        losses: u64,
+        breakeven: u64,
+        total_realized_pnl: Decimal,
+        winner_total: Decimal,
+        loser_total_abs: Decimal,
+        favorable_exits: u64,
+        time_exits: u64,
+        stop_exits: u64,
+        hold_total_ms: u128,
+        hold_count: u64,
+        slippage_total: Decimal,
+        slippage_count: u64,
+        last_close_time: Option<DateTime<Utc>>,
+    }
+
+    let mut by_wallet = BTreeMap::<String, WalletAccumulator>::new();
+    let mut total_closed_trades = 0_u64;
+
+    for cohort in state
+        .cohorts
+        .iter()
+        .filter(|cohort| cohort.status == TradeCohortStatus::Closed)
+    {
+        let wallet = normalize_wallet(&cohort.source_wallet);
+        if wallet.is_empty() {
+            continue;
+        }
+        total_closed_trades = total_closed_trades.saturating_add(1);
+        let entry = by_wallet.entry(wallet).or_default();
+        entry.closed_trades = entry.closed_trades.saturating_add(1);
+        entry.total_realized_pnl += cohort.realized_pnl;
+        entry.slippage_total += cohort.entry_slippage_pct.max(Decimal::ZERO);
+        entry.slippage_count = entry.slippage_count.saturating_add(1);
+
+        if cohort.realized_pnl > Decimal::ZERO {
+            entry.wins = entry.wins.saturating_add(1);
+            entry.winner_total += cohort.realized_pnl;
+        } else if cohort.realized_pnl < Decimal::ZERO {
+            entry.losses = entry.losses.saturating_add(1);
+            entry.loser_total_abs += cohort.realized_pnl.abs();
+        } else {
+            entry.breakeven = entry.breakeven.saturating_add(1);
+        }
+
+        match cohort.close_reason.as_deref().unwrap_or("UNKNOWN") {
+            "SOURCE_EXIT" | "TAKE_PROFIT" | "PROFIT_PROTECTION" => {
+                entry.favorable_exits = entry.favorable_exits.saturating_add(1);
+            }
+            "TIME_EXIT" => {
+                entry.time_exits = entry.time_exits.saturating_add(1);
+            }
+            "STOP_LOSS" | "HARD_STOP" => {
+                entry.stop_exits = entry.stop_exits.saturating_add(1);
+            }
+            _ => {}
+        }
+
+        if let Some(close_time) = cohort.close_time {
+            let hold_ms = close_time
+                .signed_duration_since(cohort.open_time)
+                .num_milliseconds()
+                .max(0) as u64;
+            entry.hold_total_ms = entry.hold_total_ms.saturating_add(u128::from(hold_ms));
+            entry.hold_count = entry.hold_count.saturating_add(1);
+            entry.last_close_time = Some(
+                entry
+                    .last_close_time
+                    .map(|previous| previous.max(close_time))
+                    .unwrap_or(close_time),
+            );
+        }
+    }
+
+    let mut entries = by_wallet
+        .into_iter()
+        .map(|(wallet, entry)| {
+            let average_loser = if entry.losses == 0 {
+                Decimal::ZERO
+            } else {
+                -(entry.loser_total_abs / Decimal::from(entry.losses)).round_dp(4)
+            };
+            let average_winner = mean_decimal(entry.winner_total, entry.wins);
+            let payoff_ratio = if average_loser < Decimal::ZERO {
+                (average_winner / average_loser.abs()).round_dp(4)
+            } else {
+                Decimal::ZERO
+            };
+            let average_hold_ms = if entry.hold_count == 0 {
+                0
+            } else {
+                (entry.hold_total_ms / u128::from(entry.hold_count)) as u64
+            };
+
+            WalletRealizedWinRateEntry {
+                alpha_score: state
+                    .wallet_alpha_scores
+                    .get(&wallet)
+                    .copied()
+                    .unwrap_or(Decimal::ZERO)
+                    .round_dp(4),
+                wallet: wallet.clone(),
+                closed_trades: entry.closed_trades,
+                wins: entry.wins,
+                losses: entry.losses,
+                breakeven: entry.breakeven,
+                realized_win_rate: ratio_decimal(entry.wins, entry.closed_trades).round_dp(4),
+                total_realized_pnl: entry.total_realized_pnl.round_dp(4),
+                expectancy_per_trade: mean_decimal(entry.total_realized_pnl, entry.closed_trades),
+                average_winner,
+                average_loser,
+                payoff_ratio,
+                favorable_exit_share: ratio_decimal(entry.favorable_exits, entry.closed_trades)
+                    .round_dp(4),
+                time_exit_share: ratio_decimal(entry.time_exits, entry.closed_trades).round_dp(4),
+                stop_exit_share: ratio_decimal(entry.stop_exits, entry.closed_trades).round_dp(4),
+                average_hold_ms,
+                average_entry_slippage_pct: mean_decimal(
+                    entry.slippage_total,
+                    entry.slippage_count,
+                ),
+                last_close_time: entry.last_close_time,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    entries.sort_by(|left, right| {
+        right
+            .closed_trades
+            .cmp(&left.closed_trades)
+            .then_with(|| right.realized_win_rate.cmp(&left.realized_win_rate))
+            .then_with(|| right.total_realized_pnl.cmp(&left.total_realized_pnl))
+            .then_with(|| left.wallet.cmp(&right.wallet))
+    });
+
+    WalletRealizedWinRateReport {
+        generated_at: state.summary_generated_at,
+        trade_day: state.trade_day.clone(),
+        total_closed_trades,
+        wallet_count: entries.len(),
+        entries,
+    }
+}
+
+fn render_wallet_realized_win_rate_report_markdown(report: &WalletRealizedWinRateReport) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "# Wallet Realized Win Rate Report");
+    let _ = writeln!(output);
+    let _ = writeln!(
+        output,
+        "- Generated At: {}",
+        report.generated_at.to_rfc3339()
+    );
+    let _ = writeln!(output, "- Trade Day: {}", report.trade_day);
+    let _ = writeln!(output, "- Wallets: {}", report.wallet_count);
+    let _ = writeln!(output, "- Closed Trades: {}", report.total_closed_trades);
+    let _ = writeln!(output);
+
+    if report.entries.is_empty() {
+        let _ = writeln!(
+            output,
+            "No closed cohorts were available, so there is no realized wallet report yet."
+        );
+        return output;
+    }
+
+    let _ = writeln!(
+        output,
+        "| Wallet | Closed | Wins | Losses | Win Rate | Realized PnL | Expectancy | Avg Winner | Avg Loser | Payoff | Alpha | Favorable Exit % | Time Exit % | Stop Exit % | Avg Hold (min) | Avg Slippage % | Last Close |"
+    );
+    let _ = writeln!(
+        output,
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+    );
+
+    for entry in &report.entries {
+        let avg_hold_minutes =
+            (Decimal::from(entry.average_hold_ms) / Decimal::from(60_000_u64)).round_dp(2);
+        let _ = writeln!(
+            output,
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            entry.wallet,
+            entry.closed_trades,
+            entry.wins,
+            entry.losses,
+            percent_display(entry.realized_win_rate),
+            entry.total_realized_pnl.round_dp(4),
+            entry.expectancy_per_trade.round_dp(4),
+            entry.average_winner.round_dp(4),
+            entry.average_loser.round_dp(4),
+            entry.payoff_ratio.round_dp(4),
+            entry.alpha_score.round_dp(4),
+            percent_display(entry.favorable_exit_share),
+            percent_display(entry.time_exit_share),
+            percent_display(entry.stop_exit_share),
+            avg_hold_minutes,
+            percent_display(entry.average_entry_slippage_pct),
+            entry
+                .last_close_time
+                .map(|value| value.to_rfc3339())
+                .unwrap_or_else(|| "-".to_owned()),
+        );
+    }
+
+    output
+}
+
+fn percent_display(value: Decimal) -> String {
+    format!("{}%", (value * dec!(100)).round_dp(2))
+}
+
+fn wallet_realized_report_json_path(summary_path: &PathBuf) -> PathBuf {
+    summary_path.with_file_name("wallet-realized-win-rate-report.json")
+}
+
+fn wallet_realized_report_markdown_path(summary_path: &PathBuf) -> PathBuf {
+    summary_path.with_file_name("wallet-realized-win-rate-report.md")
+}
+
+async fn persist_wallet_realized_win_rate_report(
+    summary_path: &PathBuf,
+    snapshot: &ExecutionAnalyticsState,
+) {
+    let report = build_wallet_realized_win_rate_report(snapshot);
+    let report_json_path = wallet_realized_report_json_path(summary_path);
+    match serde_json::to_string_pretty(&report) {
+        Ok(body) => {
+            if let Err(error) = tokio::fs::write(&report_json_path, body).await {
+                warn!(
+                    ?error,
+                    path = %report_json_path.display(),
+                    "failed to persist wallet realized win-rate report"
+                );
+            }
+        }
+        Err(error) => warn!(?error, "failed to encode wallet realized win-rate report"),
+    }
+
+    let report_markdown_path = wallet_realized_report_markdown_path(summary_path);
+    if let Err(error) = tokio::fs::write(
+        &report_markdown_path,
+        render_wallet_realized_win_rate_report_markdown(&report),
+    )
+    .await
+    {
+        warn!(
+            ?error,
+            path = %report_markdown_path.display(),
+            "failed to persist wallet realized win-rate markdown report"
+        );
+    }
+}
+
 fn decimal_from_f64(value: f64) -> Decimal {
     Decimal::from_f64_retain(value).unwrap_or(Decimal::ZERO)
 }
@@ -1026,6 +1318,10 @@ fn source_trade_time(timestamp: i64) -> DateTime<Utc> {
             .single()
             .unwrap_or_else(Utc::now)
     }
+}
+
+fn configured_log_retention_window(settings: &Settings) -> Duration {
+    Duration::from_secs(settings.log_rotate_hours.max(1).saturating_mul(60 * 60))
 }
 
 fn cohort_position_key(cohort: &TradeCohort) -> PositionKey {
@@ -1195,7 +1491,7 @@ async fn main() -> Result<()> {
     spawn_wallet_scanner(
         settings.clone(),
         wallet_registry.clone(),
-        wallet_score_logger,
+        wallet_score_logger.clone(),
         health.clone(),
     );
 
@@ -1256,9 +1552,13 @@ async fn main() -> Result<()> {
         released_hot_task_tx.clone(),
     ));
     tokio::spawn(spawn_log_retention_maintainer(
+        configured_log_retention_window(&settings),
         attribution_logger.clone(),
         latency_logger.clone(),
         raw_activity_logger.clone(),
+        wallet_activity_logger.clone(),
+        wallet_score_logger.clone(),
+        position_registry.clone(),
     ));
     tokio::spawn(spawn_backpressure_sampler(
         backpressure.clone(),
@@ -1620,6 +1920,27 @@ async fn main() -> Result<()> {
                                 0,
                                 Some(format!(
                                     "{} action=deferred_until_prediction_result",
+                                    confirmation_detail
+                                )),
+                            )
+                            .await;
+                        persist_confirmed_trade_seen(&state_store, &matched_trade.entry, &health)
+                            .await;
+                    } else if matched_trade.entry.side.eq_ignore_ascii_case("BUY")
+                        && matched_trade.validation_signal.is_none()
+                        && !can_execute_unvalidated_direct_buy(
+                            &settings,
+                            &matched_trade.entry.proxy_wallet,
+                        )
+                    {
+                        attribution_logger
+                            .record_signal_event(
+                                "wallet_confirmation_rejected",
+                                validation_signal,
+                                pending_validations.len(),
+                                0,
+                                Some(format!(
+                                    "{} action=skipped_unvalidated_non_target_buy",
                                     confirmation_detail
                                 )),
                             )
@@ -2407,7 +2728,7 @@ async fn process_trade(
             analytics
                 .record_exit_event("exit_noise_filtered", Some(&current_portfolio))
                 .await;
-            info!(
+            debug!(
                 event = "source_exit_duplicate_suppressed",
                 condition_id = %entry.condition_id,
                 outcome = %entry.outcome,
@@ -2437,7 +2758,7 @@ async fn process_trade(
             analytics
                 .record_exit_event("exit_noise_filtered", Some(&current_portfolio))
                 .await;
-            info!(
+            debug!(
                 event = non_actionable.reason,
                 detail = %non_actionable.detail,
                 condition_id = %entry.condition_id,
@@ -2481,7 +2802,7 @@ async fn process_trade(
                 analytics
                     .record_exit_event("exit_resolved_success", Some(&current_portfolio))
                     .await;
-                info!(
+                debug!(
                     event = "source_exit_matched",
                     condition_id = %position_key.condition_id,
                     outcome = %position_key.outcome,
@@ -2515,7 +2836,7 @@ async fn process_trade(
                 analytics
                     .record_exit_event("exit_resolved_success", Some(&current_portfolio))
                     .await;
-                info!(
+                debug!(
                     event = "source_exit_matched_fallback",
                     condition_id = %position_key.condition_id,
                     outcome = %position_key.outcome,
@@ -2543,7 +2864,7 @@ async fn process_trade(
                 analytics
                     .record_exit_event("exit_resolved_success", Some(&current_portfolio))
                     .await;
-                info!(
+                debug!(
                     event = "exit_bound_to_pending",
                     condition_id = %bound.position_key.condition_id,
                     outcome = %bound.position_key.outcome,
@@ -2573,7 +2894,7 @@ async fn process_trade(
                         .record_exit_event("source_exit_retry_queued", Some(&current_portfolio))
                         .await;
                 }
-                info!(
+                debug!(
                     event = "source_exit_retry_queued",
                     retry_key = %retry.retry_key,
                     reason = %retry.reason,
@@ -3692,7 +4013,7 @@ async fn record_trade_skip(
         .elapsed()
         .as_millis() as u64;
     let skipped_at = Utc::now();
-    if entry.side.eq_ignore_ascii_case("BUY") {
+    if entry.side.eq_ignore_ascii_case("BUY") && risk.should_log_skips() {
         log_entry_rejection_diagnostics(entry, quote, class, reason);
     }
     log_skipped_trade(
@@ -3799,7 +4120,7 @@ fn log_entry_rejection_diagnostics(
     });
     let remaining_edge = best_ask.map(|price| (Decimal::ONE - price).max(Decimal::ZERO));
 
-    info!(
+    debug!(
         event = "buy_rejection_diagnostic",
         trade_class = class.as_str(),
         source_wallet = %entry.proxy_wallet,
@@ -4508,7 +4829,7 @@ async fn spawn_unresolved_exit_retry_worker(
                     analytics
                         .record_exit_event("exit_resolved_success", Some(&snapshot))
                         .await;
-                    info!(
+                    debug!(
                         event = "source_exit_retry_resolved",
                         retry_key = %retry_key,
                         condition_id = %position_key.condition_id,
@@ -4530,7 +4851,7 @@ async fn spawn_unresolved_exit_retry_worker(
                     analytics
                         .record_exit_event("exit_resolved_success", Some(&snapshot))
                         .await;
-                    info!(
+                    debug!(
                         event = "source_exit_retry_resolved",
                         retry_key = %retry_key,
                         condition_id = %position_key.condition_id,
@@ -4558,7 +4879,7 @@ async fn spawn_unresolved_exit_retry_worker(
                     analytics
                         .record_exit_event("exit_noise_filtered", Some(&snapshot))
                         .await;
-                    info!(
+                    debug!(
                         retry_key = %retry_key,
                         reason = non_actionable.reason,
                         detail = %non_actionable.detail,
@@ -4897,9 +5218,13 @@ async fn spawn_periodic_portfolio_summary(
 }
 
 async fn spawn_log_retention_maintainer(
+    retention_window: Duration,
     attribution_logger: Arc<AttributionLogger>,
     latency_logger: Arc<LatencyLogger>,
     raw_activity_logger: Arc<RawActivityLogger>,
+    wallet_activity_logger: WalletActivityLogger,
+    wallet_score_logger: WalletScoreLogger,
+    position_registry: PositionRegistry,
 ) {
     let mut ticker = interval(LOG_RETENTION_SWEEP_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -4908,19 +5233,28 @@ async fn spawn_log_retention_maintainer(
         ticker.tick().await;
 
         if let Err(error) = attribution_logger
-            .cull_old_entries(LOG_RETENTION_WINDOW)
+            .cull_old_entries(retention_window)
             .await
         {
             warn!(?error, "failed to cull attribution log retention window");
         }
-        if let Err(error) = latency_logger.cull_old_entries(LOG_RETENTION_WINDOW).await {
+        if let Err(error) = latency_logger.cull_old_entries(retention_window).await {
             warn!(?error, "failed to cull latency log retention window");
         }
         if let Err(error) = raw_activity_logger
-            .cull_old_entries(LOG_RETENTION_WINDOW)
+            .cull_old_entries(retention_window)
             .await
         {
             warn!(?error, "failed to cull raw activity log retention window");
+        }
+        if let Err(error) = wallet_activity_logger.cull_old_entries(retention_window).await {
+            warn!(?error, "failed to cull wallet activity log retention window");
+        }
+        if let Err(error) = wallet_score_logger.cull_old_entries(retention_window).await {
+            warn!(?error, "failed to cull wallet score log retention window");
+        }
+        if let Err(error) = position_registry.cull_old_entries(retention_window).await {
+            warn!(?error, "failed to cull position lifecycle log retention window");
         }
     }
 }
@@ -6126,7 +6460,7 @@ fn log_skipped_trade(
         return;
     }
 
-    info!(
+    debug!(
         trade_class = class.as_str(),
         reason_code = reason.code,
         reason = %reason.detail,
@@ -6151,6 +6485,16 @@ fn signal_side_label(side: ExecutionSide) -> &'static str {
         ExecutionSide::Buy => "BUY",
         ExecutionSide::Sell => "SELL",
     }
+}
+
+fn can_execute_unvalidated_direct_buy(settings: &Settings, wallet: &str) -> bool {
+    let wallet = normalize_wallet(wallet);
+    !wallet.is_empty()
+        && settings
+            .target_profile_addresses
+            .iter()
+            .map(|target| normalize_wallet(target))
+            .any(|target| !target.is_empty() && target == wallet)
 }
 
 #[derive(Default)]
@@ -6395,6 +6739,16 @@ mod tests {
             submitted_at_utc: Utc::now(),
             validation_deadline: Instant::now() + Duration::from_secs(1),
         }
+    }
+
+    #[test]
+    fn unvalidated_direct_buy_bypass_is_limited_to_configured_target_wallets() {
+        let settings = sample_settings(std::env::temp_dir().join("direct-buy-wallet-gate-test"));
+
+        assert!(can_execute_unvalidated_direct_buy(&settings, "0xsource"));
+        assert!(can_execute_unvalidated_direct_buy(&settings, "0xSOURCE"));
+        assert!(!can_execute_unvalidated_direct_buy(&settings, "0xother"));
+        assert!(!can_execute_unvalidated_direct_buy(&settings, ""));
     }
 
     #[test]
@@ -7112,84 +7466,84 @@ mod tests {
         let now = Utc::now();
         let mut state = ExecutionAnalyticsState {
             cohorts: vec![
-            TradeCohort {
-                source_wallet: "0xwallet-a".to_owned(),
-                asset: "asset-a".to_owned(),
-                condition_id: "condition-a".to_owned(),
-                outcome: "YES".to_owned(),
-                market_type: models::MarketType::Medium,
-                side: "BUY".to_owned(),
-                source_trade_timestamp_unix: now.timestamp_millis(),
-                source_price: dec!(0.5),
-                filled_price: dec!(0.5),
-                entry_slippage_pct: dec!(0.01),
-                conviction_score: dec!(0.90),
-                wallet_alpha_score: dec!(0.82),
-                entry_notional: dec!(8),
-                sizing_bucket: "high_conviction".to_owned(),
-                filled_size: dec!(16),
-                execution_mode: "paper".to_owned(),
-                open_time: now - chrono::TimeDelta::minutes(30),
-                close_time: Some(now),
-                close_reason: Some("PROFIT_PROTECTION".to_owned()),
-                realized_pnl: dec!(2),
-                unrealized_pnl: Decimal::ZERO,
-                status: TradeCohortStatus::Closed,
-                remaining_size: Decimal::ZERO,
-                cost_basis: Decimal::ZERO,
-            },
-            TradeCohort {
-                source_wallet: "0xwallet-b".to_owned(),
-                asset: "asset-b".to_owned(),
-                condition_id: "condition-b".to_owned(),
-                outcome: "NO".to_owned(),
-                market_type: models::MarketType::Short,
-                side: "BUY".to_owned(),
-                source_trade_timestamp_unix: now.timestamp_millis(),
-                source_price: dec!(0.5),
-                filled_price: dec!(0.5),
-                entry_slippage_pct: dec!(0.02),
-                conviction_score: dec!(0.55),
-                wallet_alpha_score: dec!(0.50),
-                entry_notional: dec!(5),
-                sizing_bucket: "reduced".to_owned(),
-                filled_size: dec!(10),
-                execution_mode: "paper".to_owned(),
-                open_time: now - chrono::TimeDelta::minutes(20),
-                close_time: Some(now),
-                close_reason: Some("TIME_EXIT".to_owned()),
-                realized_pnl: dec!(-1),
-                unrealized_pnl: Decimal::ZERO,
-                status: TradeCohortStatus::Closed,
-                remaining_size: Decimal::ZERO,
-                cost_basis: Decimal::ZERO,
-            },
-            TradeCohort {
-                source_wallet: "0xwallet-b".to_owned(),
-                asset: "asset-c".to_owned(),
-                condition_id: "condition-c".to_owned(),
-                outcome: "YES".to_owned(),
-                market_type: models::MarketType::UltraShort,
-                side: "BUY".to_owned(),
-                source_trade_timestamp_unix: now.timestamp_millis(),
-                source_price: dec!(0.5),
-                filled_price: dec!(0.5),
-                entry_slippage_pct: dec!(0.02),
-                conviction_score: dec!(0.58),
-                wallet_alpha_score: dec!(0.48),
-                entry_notional: dec!(4),
-                sizing_bucket: "micro".to_owned(),
-                filled_size: dec!(8),
-                execution_mode: "paper".to_owned(),
-                open_time: now - chrono::TimeDelta::minutes(10),
-                close_time: Some(now),
-                close_reason: Some("STOP_LOSS".to_owned()),
-                realized_pnl: dec!(-0.5),
-                unrealized_pnl: Decimal::ZERO,
-                status: TradeCohortStatus::Closed,
-                remaining_size: Decimal::ZERO,
-                cost_basis: Decimal::ZERO,
-            },
+                TradeCohort {
+                    source_wallet: "0xwallet-a".to_owned(),
+                    asset: "asset-a".to_owned(),
+                    condition_id: "condition-a".to_owned(),
+                    outcome: "YES".to_owned(),
+                    market_type: models::MarketType::Medium,
+                    side: "BUY".to_owned(),
+                    source_trade_timestamp_unix: now.timestamp_millis(),
+                    source_price: dec!(0.5),
+                    filled_price: dec!(0.5),
+                    entry_slippage_pct: dec!(0.01),
+                    conviction_score: dec!(0.90),
+                    wallet_alpha_score: dec!(0.82),
+                    entry_notional: dec!(8),
+                    sizing_bucket: "high_conviction".to_owned(),
+                    filled_size: dec!(16),
+                    execution_mode: "paper".to_owned(),
+                    open_time: now - chrono::TimeDelta::minutes(30),
+                    close_time: Some(now),
+                    close_reason: Some("PROFIT_PROTECTION".to_owned()),
+                    realized_pnl: dec!(2),
+                    unrealized_pnl: Decimal::ZERO,
+                    status: TradeCohortStatus::Closed,
+                    remaining_size: Decimal::ZERO,
+                    cost_basis: Decimal::ZERO,
+                },
+                TradeCohort {
+                    source_wallet: "0xwallet-b".to_owned(),
+                    asset: "asset-b".to_owned(),
+                    condition_id: "condition-b".to_owned(),
+                    outcome: "NO".to_owned(),
+                    market_type: models::MarketType::Short,
+                    side: "BUY".to_owned(),
+                    source_trade_timestamp_unix: now.timestamp_millis(),
+                    source_price: dec!(0.5),
+                    filled_price: dec!(0.5),
+                    entry_slippage_pct: dec!(0.02),
+                    conviction_score: dec!(0.55),
+                    wallet_alpha_score: dec!(0.50),
+                    entry_notional: dec!(5),
+                    sizing_bucket: "reduced".to_owned(),
+                    filled_size: dec!(10),
+                    execution_mode: "paper".to_owned(),
+                    open_time: now - chrono::TimeDelta::minutes(20),
+                    close_time: Some(now),
+                    close_reason: Some("TIME_EXIT".to_owned()),
+                    realized_pnl: dec!(-1),
+                    unrealized_pnl: Decimal::ZERO,
+                    status: TradeCohortStatus::Closed,
+                    remaining_size: Decimal::ZERO,
+                    cost_basis: Decimal::ZERO,
+                },
+                TradeCohort {
+                    source_wallet: "0xwallet-b".to_owned(),
+                    asset: "asset-c".to_owned(),
+                    condition_id: "condition-c".to_owned(),
+                    outcome: "YES".to_owned(),
+                    market_type: models::MarketType::UltraShort,
+                    side: "BUY".to_owned(),
+                    source_trade_timestamp_unix: now.timestamp_millis(),
+                    source_price: dec!(0.5),
+                    filled_price: dec!(0.5),
+                    entry_slippage_pct: dec!(0.02),
+                    conviction_score: dec!(0.58),
+                    wallet_alpha_score: dec!(0.48),
+                    entry_notional: dec!(4),
+                    sizing_bucket: "micro".to_owned(),
+                    filled_size: dec!(8),
+                    execution_mode: "paper".to_owned(),
+                    open_time: now - chrono::TimeDelta::minutes(10),
+                    close_time: Some(now),
+                    close_reason: Some("STOP_LOSS".to_owned()),
+                    realized_pnl: dec!(-0.5),
+                    unrealized_pnl: Decimal::ZERO,
+                    status: TradeCohortStatus::Closed,
+                    remaining_size: Decimal::ZERO,
+                    cost_basis: Decimal::ZERO,
+                },
             ],
             ..ExecutionAnalyticsState::default()
         };
@@ -7244,6 +7598,133 @@ mod tests {
                 .round_dp(4),
             dec!(4.5)
         );
+    }
+
+    #[test]
+    fn wallet_realized_report_summarizes_closed_cohorts_per_wallet() {
+        let now = Utc::now();
+        let mut state = ExecutionAnalyticsState {
+            cohorts: vec![
+                TradeCohort {
+                    source_wallet: "0xwallet-a".to_owned(),
+                    asset: "asset-a".to_owned(),
+                    condition_id: "condition-a".to_owned(),
+                    outcome: "YES".to_owned(),
+                    market_type: models::MarketType::Medium,
+                    side: "BUY".to_owned(),
+                    source_trade_timestamp_unix: now.timestamp_millis(),
+                    source_price: dec!(0.5),
+                    filled_price: dec!(0.5),
+                    entry_slippage_pct: dec!(0.01),
+                    conviction_score: dec!(0.90),
+                    wallet_alpha_score: dec!(0.82),
+                    entry_notional: dec!(8),
+                    sizing_bucket: "high_conviction".to_owned(),
+                    filled_size: dec!(16),
+                    execution_mode: "paper".to_owned(),
+                    open_time: now - chrono::TimeDelta::minutes(30),
+                    close_time: Some(now - chrono::TimeDelta::minutes(5)),
+                    close_reason: Some("PROFIT_PROTECTION".to_owned()),
+                    realized_pnl: dec!(2),
+                    unrealized_pnl: Decimal::ZERO,
+                    status: TradeCohortStatus::Closed,
+                    remaining_size: Decimal::ZERO,
+                    cost_basis: Decimal::ZERO,
+                },
+                TradeCohort {
+                    source_wallet: "0xwallet-b".to_owned(),
+                    asset: "asset-b".to_owned(),
+                    condition_id: "condition-b".to_owned(),
+                    outcome: "NO".to_owned(),
+                    market_type: models::MarketType::Short,
+                    side: "BUY".to_owned(),
+                    source_trade_timestamp_unix: now.timestamp_millis(),
+                    source_price: dec!(0.5),
+                    filled_price: dec!(0.5),
+                    entry_slippage_pct: dec!(0.02),
+                    conviction_score: dec!(0.55),
+                    wallet_alpha_score: dec!(0.50),
+                    entry_notional: dec!(5),
+                    sizing_bucket: "reduced".to_owned(),
+                    filled_size: dec!(10),
+                    execution_mode: "paper".to_owned(),
+                    open_time: now - chrono::TimeDelta::minutes(20),
+                    close_time: Some(now - chrono::TimeDelta::minutes(2)),
+                    close_reason: Some("TIME_EXIT".to_owned()),
+                    realized_pnl: dec!(-1),
+                    unrealized_pnl: Decimal::ZERO,
+                    status: TradeCohortStatus::Closed,
+                    remaining_size: Decimal::ZERO,
+                    cost_basis: Decimal::ZERO,
+                },
+                TradeCohort {
+                    source_wallet: "0xwallet-b".to_owned(),
+                    asset: "asset-c".to_owned(),
+                    condition_id: "condition-c".to_owned(),
+                    outcome: "YES".to_owned(),
+                    market_type: models::MarketType::UltraShort,
+                    side: "BUY".to_owned(),
+                    source_trade_timestamp_unix: now.timestamp_millis(),
+                    source_price: dec!(0.5),
+                    filled_price: dec!(0.5),
+                    entry_slippage_pct: dec!(0.02),
+                    conviction_score: dec!(0.58),
+                    wallet_alpha_score: dec!(0.48),
+                    entry_notional: dec!(4),
+                    sizing_bucket: "micro".to_owned(),
+                    filled_size: dec!(8),
+                    execution_mode: "paper".to_owned(),
+                    open_time: now - chrono::TimeDelta::minutes(10),
+                    close_time: Some(now),
+                    close_reason: Some("STOP_LOSS".to_owned()),
+                    realized_pnl: dec!(-0.5),
+                    unrealized_pnl: Decimal::ZERO,
+                    status: TradeCohortStatus::Closed,
+                    remaining_size: Decimal::ZERO,
+                    cost_basis: Decimal::ZERO,
+                },
+            ],
+            ..ExecutionAnalyticsState::default()
+        };
+        let portfolio = models::PortfolioSnapshot {
+            fetched_at: now,
+            total_value: dec!(200.5),
+            current_equity: dec!(200.5),
+            starting_equity: dec!(200),
+            peak_equity: dec!(200.5),
+            ..models::PortfolioSnapshot::default()
+        };
+
+        refresh_analytics_from_portfolio(&mut state, &portfolio, dec!(200));
+        let report = build_wallet_realized_win_rate_report(&state);
+
+        assert_eq!(report.total_closed_trades, 3);
+        assert_eq!(report.wallet_count, 2);
+
+        let wallet_a = report
+            .entries
+            .iter()
+            .find(|entry| entry.wallet == "0xwallet-a")
+            .expect("wallet a entry");
+        assert_eq!(wallet_a.closed_trades, 1);
+        assert_eq!(wallet_a.wins, 1);
+        assert_eq!(wallet_a.losses, 0);
+        assert_eq!(wallet_a.realized_win_rate, Decimal::ONE);
+        assert_eq!(wallet_a.total_realized_pnl, dec!(2));
+
+        let wallet_b = report
+            .entries
+            .iter()
+            .find(|entry| entry.wallet == "0xwallet-b")
+            .expect("wallet b entry");
+        assert_eq!(wallet_b.closed_trades, 2);
+        assert_eq!(wallet_b.wins, 0);
+        assert_eq!(wallet_b.losses, 2);
+        assert_eq!(wallet_b.realized_win_rate, Decimal::ZERO);
+        assert_eq!(wallet_b.total_realized_pnl, dec!(-1.5));
+        assert_eq!(wallet_b.time_exit_share, dec!(0.5));
+        assert_eq!(wallet_b.stop_exit_share, dec!(0.5));
+        assert!(wallet_a.alpha_score > wallet_b.alpha_score);
     }
 
     #[test]

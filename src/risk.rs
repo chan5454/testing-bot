@@ -838,7 +838,7 @@ impl RiskEngine {
             }),
             PriceBand::High => {
                 if source_price > dec!(0.92) {
-                    tracing::info!(
+                    tracing::debug!(
                         reason_code = "high_price_blocked",
                         source_price = %source_price.round_dp(4),
                         "high_price_blocked"
@@ -946,7 +946,7 @@ impl RiskEngine {
 
         self.enforce_entry_risk_limits(entry, portfolio, context)?;
         let price_band_rules = self.price_band_rules(source_price, price_band)?;
-        tracing::info!(
+        tracing::debug!(
             price_band = price_band.as_str(),
             source_price = %source_price.round_dp(4),
             source_wallet = %entry.proxy_wallet,
@@ -956,7 +956,7 @@ impl RiskEngine {
         if let Some(delay_ms) = copy_delay_ms(entry.timestamp)
             && delay_ms > self.settings.max_copy_delay_ms
         {
-            tracing::info!(
+            tracing::debug!(
                 reason_code = "late_entry_rejected",
                 delay_ms,
                 max_copy_delay_ms = self.settings.max_copy_delay_ms,
@@ -976,7 +976,7 @@ impl RiskEngine {
         if portfolio.has_stale_position_key(&requested_key)
             || portfolio.has_stale_position_for_condition(&entry.condition_id)
         {
-            tracing::info!(
+            tracing::debug!(
                 reason_code = "stale_position_ignored",
                 condition_id = %entry.condition_id,
                 outcome = %entry.outcome,
@@ -1004,7 +1004,7 @@ impl RiskEngine {
             && let Some(existing) =
                 portfolio.opposite_side_position(&entry.condition_id, &entry.outcome)
         {
-            tracing::info!(
+            tracing::debug!(
                 reason_code = "opposite_side_blocked",
                 condition_id = %entry.condition_id,
                 requested_outcome = %entry.outcome,
@@ -1289,7 +1289,7 @@ impl RiskEngine {
             )
         })?;
         if resolved_position.used_fallback {
-            tracing::info!(
+            tracing::debug!(
                 event = "fallback_exit_resolution",
                 reason_code = "fallback_exit_used",
                 requested_condition_id = %entry.condition_id,

@@ -13,7 +13,7 @@ use crate::position_registry::PositionRegistry;
 use crate::wallet::wallet_filter::normalize_wallet;
 use crate::wallet::wallet_matching::MatchedTrackedTrade;
 use crate::wallet_registry::WalletRegistry;
-use crate::wallet_score::{TrackedWallet, WalletStats, compute_wallet_score};
+use crate::wallet_score::{TrackedWallet, WalletScore, compute_wallet_score};
 
 const MAX_RECENT_MARKET_OBSERVATIONS: usize = 16;
 const MAX_MARKET_PROFILES: usize = 512;
@@ -323,7 +323,7 @@ impl PredictionEngine {
                 .cloned()
         else {
             if let Some((quality, _, _, _, candidate_rank)) = wallet_candidates.first() {
-                tracing::info!(
+                tracing::debug!(
                     reason_code = "wallet_score_rejected",
                     wallet = %quality.wallet,
                     wallet_score = %quality.wallet_score.round_dp(4),
@@ -504,7 +504,7 @@ impl PredictionEngine {
         let sample_score = (profile.observations.min(8) as f64 / 8.0).clamp(0.0, 1.0);
         let reliability_score =
             (win_rate * 0.55 + profitability_score * 0.20 + sample_score * 0.25).clamp(0.0, 1.0);
-        let wallet_stats = WalletStats {
+        let wallet_stats = WalletScore {
             avg_entry_price: decimal_from_f64(average_entry_price),
             win_rate: decimal_from_f64(win_rate),
             avg_trade_size: decimal_from_f64(average_trade_size),
@@ -544,16 +544,19 @@ impl PredictionEngine {
     fn candidate_wallets_for_signal(&self, signal: &ConfirmedTradeSignal) -> Vec<String> {
         match signal.side {
             ExecutionSide::Buy => {
-                if let Some(wallet_registry) = &self.wallet_registry {
-                    let active_wallets = wallet_registry.active_wallets();
-                    if !active_wallets.is_empty() {
-                        return active_wallets;
-                    }
-                }
-                self.tracked_wallets
+                let mut wallets = self
+                    .tracked_wallets
                     .iter()
                     .map(|tracked| tracked.address.clone())
-                    .collect()
+                    .collect::<Vec<_>>();
+                if let Some(wallet_registry) = &self.wallet_registry {
+                    for wallet in wallet_registry.active_wallets() {
+                        if !wallets.iter().any(|tracked| tracked == &wallet) {
+                            wallets.push(wallet);
+                        }
+                    }
+                }
+                wallets
             }
             ExecutionSide::Sell => {
                 if let Some(position_registry) = &self.position_registry {
@@ -582,19 +585,33 @@ impl PredictionEngine {
                 .is_some_and(|registry| registry.has_open_position_for_wallet(wallet))
     }
 
+    fn is_seeded_tracked_wallet(&self, wallet: &str) -> bool {
+        let wallet = normalize_wallet(wallet);
+        !wallet.is_empty()
+            && self
+                .tracked_wallets
+                .iter()
+                .any(|tracked| tracked.address == wallet)
+    }
+
     fn registry_backed_wallet_quality(&self, wallet: &str) -> Option<WalletQuality> {
+        if !self.is_seeded_tracked_wallet(wallet) {
+            return None;
+        }
         self.wallet_registry
             .as_ref()
             .and_then(|registry| registry.get_wallet_meta(wallet))
             .map(|meta| WalletQuality {
                 wallet: meta.address,
-                win_rate: meta.score.clamp(0.0, 1.0),
-                average_trade_size: 1.0,
+                // Registry membership alone is not enough to treat a wallet as proven alpha.
+                // We require observed trade history before it can clear the predictor gate.
+                win_rate: 0.5,
+                average_trade_size: 0.0,
                 average_entry_price: 0.5,
-                early_entry_ratio: 0.5,
+                early_entry_ratio: 0.0,
                 profit_per_trade: 0.0,
-                reliability_score: meta.score.clamp(0.0, 1.0),
-                wallet_score: decimal_from_f64(meta.score.clamp(0.0, 1.0)),
+                reliability_score: 0.25,
+                wallet_score: Decimal::ZERO,
                 evaluated_trades: 0,
             })
     }
@@ -831,6 +848,8 @@ mod tests {
     use super::*;
     use crate::config::Settings;
     use crate::models::TradeStageTimestamps;
+    use crate::position_registry::PositionRegistry;
+    use crate::wallet_registry::{WalletMeta, WalletRegistry};
     use rust_decimal_macros::dec;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
@@ -845,6 +864,12 @@ mod tests {
         settings.market_cache_ttl = Duration::from_secs(3);
         settings.min_source_trade_usdc = dec!(3);
         settings.prediction_validation_timeout = Duration::from_millis(500);
+        settings
+    }
+
+    fn sample_settings_for_dir(data_dir: PathBuf) -> Settings {
+        let mut settings = sample_settings();
+        settings.data_dir = data_dir;
         settings
     }
 
@@ -938,6 +963,37 @@ mod tests {
         assert_eq!(decision.tier, PredictionTier::Full);
         assert!(decision.confidence >= FULL_EXECUTION_CONFIDENCE);
         assert_eq!(decision.predicted_wallet.as_deref(), Some(wallet));
+    }
+
+    #[test]
+    fn registry_membership_does_not_bootstrap_quality_without_history() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let settings = sample_settings_for_dir(temp_dir.path().to_path_buf());
+        let wallet_registry = WalletRegistry::load(&settings).expect("wallet registry");
+        let position_registry = PositionRegistry::load(&settings).expect("position registry");
+        wallet_registry
+            .update_wallets(vec![WalletMeta {
+                address: "0x2222222222222222222222222222222222222222".to_owned(),
+                score: 1.0,
+                last_seen: Utc::now().timestamp_millis(),
+                active: true,
+                inactive_since: None,
+            }])
+            .expect("registry update");
+        let engine =
+            PredictionEngine::with_registries(&settings, wallet_registry, position_registry);
+
+        let seeded_quality = engine
+            .registry_backed_wallet_quality("0x03e8a544e97eeff5753bc1e90d46e5ef22af1697")
+            .expect("seeded fallback quality");
+        assert_eq!(seeded_quality.wallet_score, Decimal::ZERO);
+        assert_eq!(seeded_quality.win_rate, 0.5);
+        assert_eq!(seeded_quality.reliability_score, 0.25);
+        assert!(
+            engine
+                .registry_backed_wallet_quality("0x2222222222222222222222222222222222222222")
+                .is_none()
+        );
     }
 
     #[test]
