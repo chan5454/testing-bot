@@ -170,6 +170,7 @@ pub struct Settings {
     pub min_wallet_score: Decimal,
     pub min_wallet_avg_hold_ms: u64,
     pub max_wallet_trades_per_min: u32,
+    pub max_active_wallets: u32,
     pub market_cooldown: Duration,
     pub min_trade_quality_score: Decimal,
     pub min_wallet_alpha_score: Decimal,
@@ -342,6 +343,7 @@ impl Settings {
             min_wallet_score: Decimal::new(6, 1),
             min_wallet_avg_hold_ms: 15_000,
             max_wallet_trades_per_min: 6,
+            max_active_wallets: 64,
             market_cooldown: Duration::from_secs(15),
             min_trade_quality_score: Decimal::new(65, 2),
             min_wallet_alpha_score: Decimal::new(52, 2),
@@ -640,6 +642,7 @@ impl Settings {
             min_wallet_score: parse_or_default_decimal("MIN_WALLET_SCORE", Decimal::new(6, 1))?,
             min_wallet_avg_hold_ms: parse_or_default("MIN_WALLET_AVG_HOLD_MS", 15_000_u64)?,
             max_wallet_trades_per_min: parse_or_default("MAX_WALLET_TRADES_PER_MIN", 6_u32)?,
+            max_active_wallets: parse_or_default("MAX_ACTIVE_WALLETS", 64_u32)?,
             market_cooldown: Duration::from_millis(parse_or_default(
                 "MARKET_COOLDOWN_MS",
                 15_000_u64,

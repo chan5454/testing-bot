@@ -20,6 +20,7 @@ use crate::wallet_registry::{WalletMeta, WalletRegistry};
 const WALLET_SCANNER_INTERVAL: Duration = Duration::from_secs(180);
 const WALLET_SCANNER_LOOKBACK_MINUTES: i64 = 60;
 const MIN_TRADES_PER_HOUR: usize = 5;
+const SCANNER_TARGET_TRADES_PER_HOUR: f64 = 18.0;
 
 #[derive(Clone)]
 pub struct WalletActivityLogger {
@@ -259,8 +260,7 @@ async fn scan_recent_wallet_activity(settings: &Settings) -> anyhow::Result<Vec<
                 && avg_trade_size >= min_avg_trade_size
                 && trades_per_hour <= max_trades_per_hour;
             let score = if active {
-                ((trades_per_hour / 10.0).min(1.0) * 0.6 + (avg_trade_size / 10.0).min(1.0) * 0.4)
-                    .clamp(0.0, 1.0)
+                scanner_wallet_score(trades_per_hour, avg_trade_size, min_avg_trade_size)
             } else {
                 0.0
             } * wallet_feedback
@@ -284,7 +284,50 @@ async fn scan_recent_wallet_activity(settings: &Settings) -> anyhow::Result<Vec<
             .total_cmp(&left.score)
             .then_with(|| right.last_seen.cmp(&left.last_seen))
     });
+    limit_active_wallets(&mut wallets, settings.max_active_wallets as usize);
     Ok(wallets)
+}
+
+fn scanner_wallet_score(
+    trades_per_hour: f64,
+    avg_trade_size: f64,
+    min_avg_trade_size: f64,
+) -> f64 {
+    let trade_rate_score = scanner_trade_rate_score(trades_per_hour);
+    let size_target = (min_avg_trade_size * 4.0).max(8.0);
+    let size_score = (avg_trade_size / size_target).clamp(0.0, 1.0);
+    (trade_rate_score * 0.70 + size_score * 0.30).clamp(0.0, 1.0)
+}
+
+fn scanner_trade_rate_score(trades_per_hour: f64) -> f64 {
+    let minimum = MIN_TRADES_PER_HOUR as f64;
+    if trades_per_hour <= minimum {
+        return 0.0;
+    }
+
+    if trades_per_hour <= SCANNER_TARGET_TRADES_PER_HOUR {
+        return ((trades_per_hour - minimum) / (SCANNER_TARGET_TRADES_PER_HOUR - minimum))
+            .clamp(0.0, 1.0);
+    }
+
+    (SCANNER_TARGET_TRADES_PER_HOUR / trades_per_hour).clamp(0.0, 1.0)
+}
+
+fn limit_active_wallets(wallets: &mut [ScannedWallet], max_active_wallets: usize) {
+    if max_active_wallets == 0 {
+        return;
+    }
+
+    let mut active_count = 0usize;
+    for wallet in wallets {
+        if !wallet.active {
+            continue;
+        }
+        active_count += 1;
+        if active_count > max_active_wallets {
+            wallet.active = false;
+        }
+    }
 }
 
 async fn load_wallet_close_feedback(data_dir: &Path) -> HashMap<String, WalletCloseFeedback> {
@@ -502,6 +545,68 @@ mod tests {
 
         assert!(!hyper.active);
         assert!(steady.active);
+    }
+
+    #[tokio::test]
+    async fn scan_recent_wallet_activity_limits_active_wallet_count() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut settings = Settings::default_for_tests(PathBuf::from(temp_dir.path()));
+        settings.min_source_trade_usdc = dec!(5);
+        settings.max_active_wallets = 3;
+
+        let now = Utc::now();
+        let path = temp_dir.path().join("wallet-activity.jsonl");
+        let mut lines = Vec::new();
+        for wallet_index in 0..5 {
+            for trade_index in 0..8 {
+                lines.push(
+                    serde_json::to_string(&WalletActivityLogEntry {
+                        logged_at: now,
+                        wallet: format!("0xwallet-{wallet_index}"),
+                        market_id: format!("market-{wallet_index}-{trade_index}"),
+                        transaction_hash: format!("0xtx-{wallet_index}-{trade_index}"),
+                        price: 0.4,
+                        size: 20.0 - wallet_index as f64 * 2.0,
+                        timestamp_ms: now.timestamp_millis() - trade_index as i64,
+                        source: "activity_ws".to_owned(),
+                        tracked: false,
+                        exit_eligible: false,
+                    })
+                    .expect("wallet json"),
+                );
+            }
+        }
+        tokio::fs::write(&path, lines.join("\n"))
+            .await
+            .expect("write wallet activity");
+
+        let scan_result = scan_recent_wallet_activity(&settings)
+            .await
+            .expect("scan succeeds");
+        let active_wallets = scan_result
+            .into_iter()
+            .filter(|wallet| wallet.active)
+            .map(|wallet| wallet.address)
+            .collect::<Vec<_>>();
+
+        assert_eq!(active_wallets.len(), 3);
+        assert_eq!(
+            active_wallets,
+            vec![
+                "0xwallet-0".to_owned(),
+                "0xwallet-1".to_owned(),
+                "0xwallet-2".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn scanner_score_penalizes_overactive_wallets() {
+        let moderate = scanner_wallet_score(12.0, 12.0, 1.0);
+        let hyperactive = scanner_wallet_score(96.0, 12.0, 1.0);
+
+        assert!(moderate > hyperactive);
+        assert!(hyperactive < 0.5);
     }
 
     fn sample_closed_cohort(

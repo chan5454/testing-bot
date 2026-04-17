@@ -136,6 +136,16 @@ struct WalletQuality {
     evaluated_trades: u32,
 }
 
+impl WalletQuality {
+    fn gate_score(&self) -> Decimal {
+        (self.wallet_score.max(Decimal::ZERO)
+            * decimal_from_f64(self.reliability_score.clamp(0.0, 1.0)))
+        .round_dp(4)
+        .min(Decimal::ONE)
+        .max(Decimal::ZERO)
+    }
+}
+
 impl PredictionEngine {
     pub fn new(settings: &Settings) -> Self {
         Self {
@@ -291,8 +301,8 @@ impl PredictionEngine {
                     SIZE_SIMILARITY_TOLERANCE_RATIO,
                 );
                 let timing_component = timing_score(signal, market_profile, wallet, now_ms);
-                let wallet_score_component =
-                    decimal_to_f64(quality.wallet_score, 0.0).clamp(0.0, 1.0);
+                let gate_score = quality.gate_score();
+                let wallet_score_component = decimal_to_f64(gate_score, 0.0).clamp(0.0, 1.0);
                 let candidate_rank = (market_match * 0.45
                     + timing_component * 0.25
                     + size_score * 0.15
@@ -319,7 +329,7 @@ impl PredictionEngine {
         let Some((quality, market_match, size_score, timing_component, candidate_rank)) =
             wallet_candidates
                 .iter()
-                .find(|(quality, _, _, _, _)| quality.wallet_score >= self.min_wallet_score)
+                .find(|(quality, _, _, _, _)| quality.gate_score() >= self.min_wallet_score)
                 .cloned()
         else {
             if let Some((quality, _, _, _, candidate_rank)) = wallet_candidates.first() {
@@ -327,6 +337,7 @@ impl PredictionEngine {
                     reason_code = "wallet_score_rejected",
                     wallet = %quality.wallet,
                     wallet_score = %quality.wallet_score.round_dp(4),
+                    wallet_gate_score = %quality.gate_score().round_dp(4),
                     min_wallet_score = %self.min_wallet_score.round_dp(4),
                     candidate_rank = %format!("{candidate_rank:.2}"),
                     "wallet_score_rejected"
@@ -338,9 +349,10 @@ impl PredictionEngine {
                 .filter_map(|wallet| self.wallet_quality(wallet))
                 .map(|quality| {
                     format!(
-                        "wallet={} wallet_score_rejected score={} win_rate={:.2} evaluated={} reliability={:.2}",
+                        "wallet={} wallet_score_rejected score={} gate_score={} win_rate={:.2} evaluated={} reliability={:.2}",
                         quality.wallet,
                         quality.wallet_score.round_dp(4),
+                        quality.gate_score().round_dp(4),
                         quality.win_rate,
                         quality.evaluated_trades,
                         quality.reliability_score
@@ -385,6 +397,7 @@ impl PredictionEngine {
                 format!("tier={}", tier.as_str()),
                 format!("wallet={}", quality.wallet),
                 format!("wallet_score={}", quality.wallet_score.round_dp(4)),
+                format!("wallet_gate_score={}", quality.gate_score().round_dp(4)),
                 format!("wallet_avg_entry_price={:.4}", quality.average_entry_price),
                 format!("wallet_early_entry_ratio={:.2}", quality.early_entry_ratio),
                 format!("candidate_rank={candidate_rank:.2}"),
@@ -992,8 +1005,26 @@ mod tests {
         assert!(
             engine
                 .registry_backed_wallet_quality("0x2222222222222222222222222222222222222222")
-                .is_none()
+            .is_none()
         );
+    }
+
+    #[test]
+    fn unevaluated_wallet_history_does_not_clear_gate_score() {
+        let mut engine = PredictionEngine::new(&sample_settings());
+        let wallet = "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697";
+        engine.record_confirmed_trade(&sample_entry(
+            wallet,
+            0.43,
+            Utc::now().timestamp_millis() - 1_000,
+        ));
+
+        let quality = engine.wallet_quality(wallet).expect("wallet quality");
+        assert!(quality.wallet_score >= dec!(0.60));
+        assert!(quality.gate_score() < dec!(0.60));
+
+        let decision = engine.predict(&sample_signal(), Some(&sample_market_snapshot()));
+        assert_eq!(decision.tier, PredictionTier::Skip);
     }
 
     #[test]
