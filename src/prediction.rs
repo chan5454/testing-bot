@@ -13,7 +13,9 @@ use crate::position_registry::PositionRegistry;
 use crate::wallet::wallet_filter::normalize_wallet;
 use crate::wallet::wallet_matching::MatchedTrackedTrade;
 use crate::wallet_registry::WalletRegistry;
-use crate::wallet_score::{TrackedWallet, WalletScore, compute_wallet_score};
+use crate::wallet_score::{
+    TrackedWallet, WalletCopyabilityClass, WalletScore, compute_wallet_score,
+};
 
 const MAX_RECENT_MARKET_OBSERVATIONS: usize = 16;
 const MAX_MARKET_PROFILES: usize = 512;
@@ -134,12 +136,15 @@ struct WalletQuality {
     reliability_score: f64,
     wallet_score: Decimal,
     evaluated_trades: u32,
+    copyability_class: Option<WalletCopyabilityClass>,
+    copyability_multiplier: f64,
 }
 
 impl WalletQuality {
     fn gate_score(&self) -> Decimal {
         (self.wallet_score.max(Decimal::ZERO)
             * decimal_from_f64(self.reliability_score.clamp(0.0, 1.0)))
+            * decimal_from_f64(self.copyability_multiplier.clamp(0.25, 1.20))
         .round_dp(4)
         .min(Decimal::ONE)
         .max(Decimal::ZERO)
@@ -338,6 +343,8 @@ impl PredictionEngine {
                     wallet = %quality.wallet,
                     wallet_score = %quality.wallet_score.round_dp(4),
                     wallet_gate_score = %quality.gate_score().round_dp(4),
+                    wallet_copyability = %quality.copyability_class.map(|class| class.as_str()).unwrap_or("unknown"),
+                    wallet_copyability_multiplier = %format!("{:.2}", quality.copyability_multiplier),
                     min_wallet_score = %self.min_wallet_score.round_dp(4),
                     candidate_rank = %format!("{candidate_rank:.2}"),
                     "wallet_score_rejected"
@@ -349,13 +356,18 @@ impl PredictionEngine {
                 .filter_map(|wallet| self.wallet_quality(wallet))
                 .map(|quality| {
                     format!(
-                        "wallet={} wallet_score_rejected score={} gate_score={} win_rate={:.2} evaluated={} reliability={:.2}",
+                        "wallet={} wallet_score_rejected score={} gate_score={} win_rate={:.2} evaluated={} reliability={:.2} copyability={} copyability_multiplier={:.2}",
                         quality.wallet,
                         quality.wallet_score.round_dp(4),
                         quality.gate_score().round_dp(4),
                         quality.win_rate,
                         quality.evaluated_trades,
-                        quality.reliability_score
+                        quality.reliability_score,
+                        quality
+                            .copyability_class
+                            .map(|class| class.as_str())
+                            .unwrap_or("unknown"),
+                        quality.copyability_multiplier
                     )
                 })
                 .collect::<Vec<_>>();
@@ -405,6 +417,17 @@ impl PredictionEngine {
                 format!("wallet_profit_per_trade={:.4}", quality.profit_per_trade),
                 format!("wallet_avg_size={:.2}", quality.average_trade_size),
                 format!("wallet_reliability={:.2}", quality.reliability_score),
+                format!(
+                    "wallet_copyability={}",
+                    quality
+                        .copyability_class
+                        .map(|class| class.as_str())
+                        .unwrap_or("unknown")
+                ),
+                format!(
+                    "wallet_copyability_multiplier={:.2}",
+                    quality.copyability_multiplier
+                ),
                 format!("size_score={size_score:.2}"),
                 format!("market_match={market_match:.2}"),
                 format!("price_behavior={price_behavior:.2}"),
@@ -524,6 +547,8 @@ impl PredictionEngine {
             early_entry_ratio: decimal_from_f64(early_entry_ratio),
         };
         let wallet_score = compute_wallet_score(&wallet_stats);
+        let (copyability_class, copyability_multiplier) =
+            self.registry_copyability_feedback(wallet);
 
         Some(WalletQuality {
             wallet: wallet.to_owned(),
@@ -535,6 +560,8 @@ impl PredictionEngine {
             reliability_score,
             wallet_score,
             evaluated_trades: profile.evaluated_trades,
+            copyability_class,
+            copyability_multiplier,
         })
     }
 
@@ -626,7 +653,25 @@ impl PredictionEngine {
                 reliability_score: 0.25,
                 wallet_score: Decimal::ZERO,
                 evaluated_trades: 0,
+                copyability_class: meta.copyability_class,
+                copyability_multiplier: meta.copyability_multiplier.unwrap_or(1.0),
             })
+    }
+
+    fn registry_copyability_feedback(
+        &self,
+        wallet: &str,
+    ) -> (Option<WalletCopyabilityClass>, f64) {
+        self.wallet_registry
+            .as_ref()
+            .and_then(|registry| registry.get_wallet_meta(wallet))
+            .map(|meta| {
+                (
+                    meta.copyability_class,
+                    meta.copyability_multiplier.unwrap_or(1.0).clamp(0.25, 1.20),
+                )
+            })
+            .unwrap_or((None, 1.0))
     }
 }
 
@@ -991,6 +1036,8 @@ mod tests {
                 last_seen: Utc::now().timestamp_millis(),
                 active: true,
                 inactive_since: None,
+                copyability_class: Some(WalletCopyabilityClass::HighConviction),
+                copyability_multiplier: Some(1.15),
             }])
             .expect("registry update");
         let engine =
@@ -1002,11 +1049,52 @@ mod tests {
         assert_eq!(seeded_quality.wallet_score, Decimal::ZERO);
         assert_eq!(seeded_quality.win_rate, 0.5);
         assert_eq!(seeded_quality.reliability_score, 0.25);
+        assert_eq!(seeded_quality.copyability_class, None);
         assert!(
             engine
                 .registry_backed_wallet_quality("0x2222222222222222222222222222222222222222")
             .is_none()
         );
+    }
+
+    #[test]
+    fn copyability_feedback_penalizes_micro_scalper_wallets() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let settings = sample_settings_for_dir(temp_dir.path().to_path_buf());
+        let wallet_registry = WalletRegistry::load(&settings).expect("wallet registry");
+        let position_registry = PositionRegistry::load(&settings).expect("position registry");
+        let wallet = "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697";
+        wallet_registry
+            .update_wallets(vec![WalletMeta {
+                address: wallet.to_owned(),
+                score: 0.9,
+                last_seen: Utc::now().timestamp_millis(),
+                active: true,
+                inactive_since: None,
+                copyability_class: Some(WalletCopyabilityClass::MicroScalper),
+                copyability_multiplier: Some(0.35),
+            }])
+            .expect("registry update");
+        let mut engine =
+            PredictionEngine::with_registries(&settings, wallet_registry, position_registry);
+        let base_ms = Utc::now().timestamp_millis() - 60_000;
+
+        for offset in 0..4 {
+            engine.record_confirmed_trade(&sample_entry(
+                wallet,
+                0.40 + offset as f64 * 0.01,
+                base_ms + offset * 1_000,
+            ));
+        }
+
+        let quality = engine.wallet_quality(wallet).expect("wallet quality");
+
+        assert_eq!(
+            quality.copyability_class,
+            Some(WalletCopyabilityClass::MicroScalper)
+        );
+        assert!(quality.wallet_score >= dec!(0.60));
+        assert!(quality.gate_score() < dec!(0.60));
     }
 
     #[test]

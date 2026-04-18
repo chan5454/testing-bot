@@ -16,7 +16,8 @@ const COMPLEMENTARY_PRICE_SUM_TOLERANCE: f64 = 0.03;
 
 pub fn effective_fallback_match_window(settings: &Settings) -> std::time::Duration {
     settings
-        .activity_match_window
+        .slow_validation_window
+        .max(settings.activity_match_window)
         .max(settings.activity_cache_ttl)
         .max(settings.activity_correlation_window)
         .max(MIN_FALLBACK_MATCH_WINDOW)
@@ -598,5 +599,16 @@ mod tests {
             panic!("expected tx-hash validation match");
         };
         assert!(activity_match.tx_hash_matched);
+    }
+
+    #[test]
+    fn fallback_match_window_expands_to_slow_validation_window() {
+        let mut settings = sample_settings();
+        settings.slow_validation_window = std::time::Duration::from_secs(6);
+
+        assert_eq!(
+            effective_fallback_match_window(&settings),
+            std::time::Duration::from_secs(6)
+        );
     }
 }

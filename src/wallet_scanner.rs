@@ -16,6 +16,7 @@ use crate::rolling_jsonl::RollingJsonlLogger;
 use crate::wallet::wallet_filter::normalize_wallet;
 use crate::wallet::wallet_matching::ActivityTradeEvent;
 use crate::wallet_registry::{WalletMeta, WalletRegistry};
+use crate::wallet_score::{WalletCopyabilityClass, classify_wallet_copyability};
 
 const WALLET_SCANNER_INTERVAL: Duration = Duration::from_secs(180);
 const WALLET_SCANNER_LOOKBACK_MINUTES: i64 = 60;
@@ -56,6 +57,10 @@ struct WalletScoreEvent<'a> {
     avg_trade_size: f64,
     score: f64,
     active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    copyability_class: Option<WalletCopyabilityClass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    copyability_multiplier: Option<f64>,
 }
 
 #[derive(Default)]
@@ -73,11 +78,26 @@ struct ScannedWallet {
     avg_trade_size: f64,
     trades_per_hour: f64,
     active: bool,
+    copyability_class: WalletCopyabilityClass,
+    copyability_multiplier: f64,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct WalletCloseFeedback {
     multiplier: f64,
+    copyability_class: WalletCopyabilityClass,
+    copyability_multiplier: f64,
+}
+
+impl Default for WalletCloseFeedback {
+    fn default() -> Self {
+        let copyability_class = WalletCopyabilityClass::Unproven;
+        Self {
+            multiplier: copyability_class.multiplier(),
+            copyability_class,
+            copyability_multiplier: copyability_class.multiplier(),
+        }
+    }
 }
 
 impl WalletActivityLogger {
@@ -136,6 +156,8 @@ impl WalletScoreLogger {
         avg_trade_size: f64,
         score: f64,
         active: bool,
+        copyability_class: WalletCopyabilityClass,
+        copyability_multiplier: f64,
     ) {
         if let Err(error) = self
             .logger
@@ -148,6 +170,8 @@ impl WalletScoreLogger {
                 avg_trade_size,
                 score,
                 active,
+                copyability_class: Some(copyability_class),
+                copyability_multiplier: Some(copyability_multiplier),
             })
             .await
         {
@@ -183,6 +207,8 @@ pub fn spawn_wallet_scanner(
                                 scanned_wallet.avg_trade_size,
                                 scanned_wallet.score,
                                 scanned_wallet.active,
+                                scanned_wallet.copyability_class,
+                                scanned_wallet.copyability_multiplier,
                             )
                             .await;
                     }
@@ -195,6 +221,8 @@ pub fn spawn_wallet_scanner(
                             last_seen: wallet.last_seen,
                             active: true,
                             inactive_since: None,
+                            copyability_class: Some(wallet.copyability_class),
+                            copyability_multiplier: Some(wallet.copyability_multiplier),
                         })
                         .collect::<Vec<_>>();
                     if let Err(error) = wallet_registry.update_wallets(wallet_updates) {
@@ -263,11 +291,12 @@ async fn scan_recent_wallet_activity(settings: &Settings) -> anyhow::Result<Vec<
                 scanner_wallet_score(trades_per_hour, avg_trade_size, min_avg_trade_size)
             } else {
                 0.0
-            } * wallet_feedback
+            };
+            let feedback = wallet_feedback
                 .get(&wallet)
                 .copied()
-                .unwrap_or(WalletCloseFeedback { multiplier: 1.0 })
-                .multiplier;
+                .unwrap_or_default();
+            let score = score * feedback.multiplier;
             ScannedWallet {
                 address: wallet,
                 score: score.clamp(0.0, 1.0),
@@ -275,6 +304,8 @@ async fn scan_recent_wallet_activity(settings: &Settings) -> anyhow::Result<Vec<
                 avg_trade_size,
                 trades_per_hour,
                 active,
+                copyability_class: feedback.copyability_class,
+                copyability_multiplier: feedback.copyability_multiplier,
             }
         })
         .collect::<Vec<_>>();
@@ -341,20 +372,19 @@ async fn load_wallet_close_feedback(data_dir: &Path) -> HashMap<String, WalletCl
         Err(_) => return HashMap::new(),
     };
 
-    let mut by_wallet = HashMap::<String, (u32, u32, u32, f64)>::new();
-    let mut from_summary_alpha = HashMap::<String, WalletCloseFeedback>::new();
-    for (wallet, alpha_score) in &state.wallet_alpha_scores {
-        let normalized = normalize_wallet(wallet);
-        if normalized.is_empty() {
-            continue;
-        }
-        let alpha = alpha_score
-            .to_string()
-            .parse::<f64>()
-            .unwrap_or(0.65)
-            .clamp(0.25, 1.20);
-        from_summary_alpha.insert(normalized, WalletCloseFeedback { multiplier: alpha });
+    #[derive(Default)]
+    struct WalletRealizedStats {
+        count: u32,
+        wins: u32,
+        favorable_exits: u32,
+        time_exits: u32,
+        stop_exits: u32,
+        pnl_total: rust_decimal::Decimal,
+        hold_total_ms: u128,
+        hold_count: u32,
     }
+
+    let mut by_wallet = HashMap::<String, WalletRealizedStats>::new();
     for cohort in state
         .cohorts
         .iter()
@@ -365,48 +395,98 @@ async fn load_wallet_close_feedback(data_dir: &Path) -> HashMap<String, WalletCl
             continue;
         }
         let close_reason = cohort.close_reason.as_deref().unwrap_or("UNKNOWN");
-        let entry = by_wallet.entry(wallet).or_insert((0, 0, 0, 0.0));
-        entry.0 = entry.0.saturating_add(1);
+        let entry = by_wallet.entry(wallet).or_default();
+        entry.count = entry.count.saturating_add(1);
+        if cohort.realized_pnl > rust_decimal::Decimal::ZERO {
+            entry.wins = entry.wins.saturating_add(1);
+        }
         if matches!(
             close_reason,
             "SOURCE_EXIT" | "TAKE_PROFIT" | "PROFIT_PROTECTION"
         ) {
-            entry.1 = entry.1.saturating_add(1);
+            entry.favorable_exits = entry.favorable_exits.saturating_add(1);
         }
-        if matches!(close_reason, "TIME_EXIT" | "STOP_LOSS" | "HARD_STOP") {
-            entry.2 = entry.2.saturating_add(1);
+        if matches!(close_reason, "TIME_EXIT") {
+            entry.time_exits = entry.time_exits.saturating_add(1);
         }
-        entry.3 += cohort
-            .realized_pnl
-            .to_string()
-            .parse::<f64>()
-            .unwrap_or(0.0);
+        if matches!(close_reason, "STOP_LOSS" | "HARD_STOP") {
+            entry.stop_exits = entry.stop_exits.saturating_add(1);
+        }
+        entry.pnl_total += cohort.realized_pnl;
+        if let Some(close_time) = cohort.close_time {
+            let hold_ms = close_time
+                .signed_duration_since(cohort.open_time)
+                .num_milliseconds()
+                .max(0) as u64;
+            entry.hold_total_ms = entry.hold_total_ms.saturating_add(u128::from(hold_ms));
+            entry.hold_count = entry.hold_count.saturating_add(1);
+        }
     }
 
-    let mut feedback = by_wallet
+    let feedback = by_wallet
         .into_iter()
-        .map(|(wallet, (count, good, bad, pnl))| {
-            let multiplier = if count < 3 {
+        .map(|(wallet, stats)| {
+            let count = u64::from(stats.count);
+            let count_decimal = rust_decimal::Decimal::from(count.max(1));
+            let favorable_exit_share =
+                rust_decimal::Decimal::from(stats.favorable_exits) / count_decimal;
+            let time_exit_share = rust_decimal::Decimal::from(stats.time_exits) / count_decimal;
+            let stop_exit_share = rust_decimal::Decimal::from(stats.stop_exits) / count_decimal;
+            let win_rate = rust_decimal::Decimal::from(stats.wins) / count_decimal;
+            let avg_pnl_per_trade = (stats.pnl_total / count_decimal).round_dp(4);
+            let avg_hold_ms = if stats.hold_count == 0 {
+                0
+            } else {
+                (stats.hold_total_ms / u128::from(stats.hold_count)) as u64
+            };
+            let alpha_score = state
+                .wallet_alpha_scores
+                .get(&wallet)
+                .copied()
+                .unwrap_or(rust_decimal_macros::dec!(0.65));
+            let copyability_class = classify_wallet_copyability(
+                count,
+                win_rate,
+                favorable_exit_share,
+                time_exit_share,
+                stop_exit_share,
+                avg_hold_ms,
+                avg_pnl_per_trade,
+                alpha_score,
+            );
+            let alpha_multiplier = state
+                .wallet_alpha_scores
+                .get(&wallet)
+                .and_then(|score| score.to_string().parse::<f64>().ok())
+                .map(|alpha| (0.75 + alpha.clamp(0.0, 1.0) * 0.45).clamp(0.75, 1.20))
+                .unwrap_or(1.0);
+            let performance_multiplier = if count < 3 {
                 1.0
             } else {
                 let count_f = count as f64;
-                let good_share = good as f64 / count_f;
-                let bad_share = bad as f64 / count_f;
-                let pnl_penalty = if pnl < 0.0 { 0.15 } else { 0.0 };
+                let good_share = stats.favorable_exits as f64 / count_f;
+                let bad_share = (stats.time_exits + stats.stop_exits) as f64 / count_f;
+                let pnl_penalty = if stats.pnl_total < rust_decimal::Decimal::ZERO {
+                    0.15
+                } else {
+                    0.0
+                };
                 (1.0 + good_share * 0.15 - bad_share * 0.35 - pnl_penalty).clamp(0.25, 1.2)
             };
-            (wallet, WalletCloseFeedback { multiplier })
+            let copyability_multiplier = copyability_class.multiplier();
+            (
+                wallet,
+                WalletCloseFeedback {
+                    multiplier: (performance_multiplier
+                        * alpha_multiplier
+                        * copyability_multiplier)
+                        .clamp(0.20, 1.20),
+                    copyability_class,
+                    copyability_multiplier,
+                },
+            )
         })
         .collect::<HashMap<_, _>>();
-    for (wallet, alpha_feedback) in from_summary_alpha {
-        feedback
-            .entry(wallet)
-            .and_modify(|feedback| {
-                feedback.multiplier =
-                    (feedback.multiplier * alpha_feedback.multiplier).clamp(0.25, 1.20);
-            })
-            .or_insert(alpha_feedback);
-    }
     feedback
 }
 
@@ -479,7 +559,15 @@ mod tests {
         let feedback = load_wallet_close_feedback(&PathBuf::from(temp_dir.path())).await;
 
         assert!(feedback.get("0xwallet-a").expect("wallet a").multiplier < 1.0);
+        assert_eq!(
+            feedback.get("0xwallet-a").expect("wallet a").copyability_class,
+            WalletCopyabilityClass::TimeExitHeavy
+        );
         assert!(feedback.get("0xwallet-b").expect("wallet b").multiplier >= 1.0);
+        assert_eq!(
+            feedback.get("0xwallet-b").expect("wallet b").copyability_class,
+            WalletCopyabilityClass::Copyable
+        );
     }
 
     #[tokio::test]

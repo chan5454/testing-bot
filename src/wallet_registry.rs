@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Settings;
 use crate::wallet::wallet_filter::normalize_wallet;
+use crate::wallet_score::WalletCopyabilityClass;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WalletMeta {
@@ -17,6 +18,10 @@ pub struct WalletMeta {
     pub active: bool,
     #[serde(default)]
     pub inactive_since: Option<i64>,
+    #[serde(default)]
+    pub copyability_class: Option<WalletCopyabilityClass>,
+    #[serde(default)]
+    pub copyability_multiplier: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -37,6 +42,8 @@ impl WalletRegistry {
                 last_seen: 0,
                 active: true,
                 inactive_since: None,
+                copyability_class: None,
+                copyability_multiplier: None,
             });
         }
 
@@ -107,12 +114,16 @@ impl WalletRegistry {
                 last_seen: wallet.last_seen,
                 active: true,
                 inactive_since: None,
+                copyability_class: wallet.copyability_class,
+                copyability_multiplier: wallet.copyability_multiplier,
             });
             entry.address = normalized;
             entry.score = wallet.score;
             entry.last_seen = wallet.last_seen;
             entry.active = true;
             entry.inactive_since = None;
+            entry.copyability_class = wallet.copyability_class;
+            entry.copyability_multiplier = wallet.copyability_multiplier;
         }
 
         for wallet in state.values_mut() {

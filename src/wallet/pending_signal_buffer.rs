@@ -356,7 +356,7 @@ mod tests {
         let buffer = PendingSignalBuffer::new(&settings);
 
         assert_eq!(buffer.pending_signal_ttl(), Duration::from_millis(500));
-        assert!(buffer.late_validation_ttl() >= Duration::from_secs(3));
+        assert!(buffer.late_validation_ttl() >= settings.slow_validation_window);
     }
 
     #[test]
@@ -366,6 +366,6 @@ mod tests {
         let buffer = PendingSignalBuffer::new(&settings);
 
         assert_eq!(buffer.pending_signal_ttl(), Duration::from_millis(500));
-        assert!(buffer.late_validation_ttl() >= Duration::from_secs(3));
+        assert!(buffer.late_validation_ttl() >= settings.slow_validation_window);
     }
 }

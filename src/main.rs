@@ -65,9 +65,10 @@ use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 use tracing::{debug, error, info, warn};
 use wallet::activity_stream::{ActivityCommand, WalletActivityStream};
 use wallet::wallet_filter::normalize_wallet;
-use wallet::wallet_matching::MatchedTrackedTrade;
+use wallet::wallet_matching::{MatchWindow, MatchedTrackedTrade};
 use wallet_registry::WalletRegistry;
 use wallet_scanner::{WalletActivityLogger, WalletScoreLogger, spawn_wallet_scanner};
+use wallet_score::{WalletCopyabilityClass, classify_wallet_copyability};
 use websocket::market_stream::{MarketStreamHandle, load_active_asset_catalog};
 use websocket::stream_router::StreamRouterHandle;
 
@@ -171,6 +172,8 @@ struct WalletRealizedWinRateEntry {
     average_loser: Decimal,
     payoff_ratio: Decimal,
     alpha_score: Decimal,
+    copyability_class: WalletCopyabilityClass,
+    copyability_multiplier: Decimal,
     favorable_exit_share: Decimal,
     time_exit_share: Decimal,
     stop_exit_share: Decimal,
@@ -1134,29 +1137,51 @@ fn build_wallet_realized_win_rate_report(
             } else {
                 (entry.hold_total_ms / u128::from(entry.hold_count)) as u64
             };
+            let alpha_score = state
+                .wallet_alpha_scores
+                .get(&wallet)
+                .copied()
+                .unwrap_or(Decimal::ZERO)
+                .round_dp(4);
+            let realized_win_rate = ratio_decimal(entry.wins, entry.closed_trades).round_dp(4);
+            let expectancy_per_trade = mean_decimal(entry.total_realized_pnl, entry.closed_trades);
+            let favorable_exit_share =
+                ratio_decimal(entry.favorable_exits, entry.closed_trades).round_dp(4);
+            let time_exit_share = ratio_decimal(entry.time_exits, entry.closed_trades).round_dp(4);
+            let stop_exit_share = ratio_decimal(entry.stop_exits, entry.closed_trades).round_dp(4);
+            let copyability_class = classify_wallet_copyability(
+                entry.closed_trades,
+                realized_win_rate,
+                favorable_exit_share,
+                time_exit_share,
+                stop_exit_share,
+                average_hold_ms,
+                expectancy_per_trade,
+                alpha_score,
+            );
 
             WalletRealizedWinRateEntry {
-                alpha_score: state
-                    .wallet_alpha_scores
-                    .get(&wallet)
-                    .copied()
-                    .unwrap_or(Decimal::ZERO)
-                    .round_dp(4),
+                alpha_score,
                 wallet: wallet.clone(),
                 closed_trades: entry.closed_trades,
                 wins: entry.wins,
                 losses: entry.losses,
                 breakeven: entry.breakeven,
-                realized_win_rate: ratio_decimal(entry.wins, entry.closed_trades).round_dp(4),
+                realized_win_rate,
                 total_realized_pnl: entry.total_realized_pnl.round_dp(4),
-                expectancy_per_trade: mean_decimal(entry.total_realized_pnl, entry.closed_trades),
+                expectancy_per_trade,
                 average_winner,
                 average_loser,
                 payoff_ratio,
-                favorable_exit_share: ratio_decimal(entry.favorable_exits, entry.closed_trades)
-                    .round_dp(4),
-                time_exit_share: ratio_decimal(entry.time_exits, entry.closed_trades).round_dp(4),
-                stop_exit_share: ratio_decimal(entry.stop_exits, entry.closed_trades).round_dp(4),
+                copyability_class,
+                copyability_multiplier: Decimal::from_f64_retain(
+                    copyability_class.multiplier(),
+                )
+                .unwrap_or(Decimal::ONE)
+                .round_dp(4),
+                favorable_exit_share,
+                time_exit_share,
+                stop_exit_share,
                 average_hold_ms,
                 average_entry_slippage_pct: mean_decimal(
                     entry.slippage_total,
@@ -1209,11 +1234,11 @@ fn render_wallet_realized_win_rate_report_markdown(report: &WalletRealizedWinRat
 
     let _ = writeln!(
         output,
-        "| Wallet | Closed | Wins | Losses | Win Rate | Realized PnL | Expectancy | Avg Winner | Avg Loser | Payoff | Alpha | Favorable Exit % | Time Exit % | Stop Exit % | Avg Hold (min) | Avg Slippage % | Last Close |"
+        "| Wallet | Closed | Wins | Losses | Win Rate | Realized PnL | Expectancy | Avg Winner | Avg Loser | Payoff | Alpha | Copyability | Favorable Exit % | Time Exit % | Stop Exit % | Avg Hold (min) | Avg Slippage % | Last Close |"
     );
     let _ = writeln!(
         output,
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |"
     );
 
     for entry in &report.entries {
@@ -1221,7 +1246,7 @@ fn render_wallet_realized_win_rate_report_markdown(report: &WalletRealizedWinRat
             (Decimal::from(entry.average_hold_ms) / Decimal::from(60_000_u64)).round_dp(2);
         let _ = writeln!(
             output,
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} ({}) | {} | {} | {} | {} | {} | {} |",
             entry.wallet,
             entry.closed_trades,
             entry.wins,
@@ -1233,6 +1258,8 @@ fn render_wallet_realized_win_rate_report_markdown(report: &WalletRealizedWinRat
             entry.average_loser.round_dp(4),
             entry.payoff_ratio.round_dp(4),
             entry.alpha_score.round_dp(4),
+            entry.copyability_class.as_str(),
+            entry.copyability_multiplier.round_dp(2),
             percent_display(entry.favorable_exit_share),
             percent_display(entry.time_exit_share),
             percent_display(entry.stop_exit_share),
@@ -1458,6 +1485,7 @@ async fn main() -> Result<()> {
     let (released_hot_task_tx, mut released_hot_task_rx) = mpsc::unbounded_channel();
     let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
     let (matched_trade_tx, mut matched_trade_rx) = mpsc::unbounded_channel();
+    let delayed_matched_trade_tx = matched_trade_tx.clone();
     let activity_stream = WalletActivityStream::spawn(
         settings.clone(),
         catalog.clone(),
@@ -1947,6 +1975,33 @@ async fn main() -> Result<()> {
                             .await;
                         persist_confirmed_trade_seen(&state_store, &matched_trade.entry, &health)
                             .await;
+                    } else if let Some(remaining_hold) =
+                        slow_lane_source_hold_delay(&settings, &matched_trade)
+                    {
+                        let observed_hold_ms =
+                            observed_source_hold_elapsed(&matched_trade).as_millis() as u64;
+                        matched_trade_deduper.release(&matched_trade);
+                        let delayed_trade = matched_trade.clone();
+                        let delayed_sender = delayed_matched_trade_tx.clone();
+                        attribution_logger
+                            .record_signal_event(
+                                "wallet_confirmation_delayed_for_source_hold",
+                                validation_signal,
+                                pending_validations.len(),
+                                0,
+                                Some(format!(
+                                    "{} action=delayed_for_source_hold required_hold_ms={} observed_hold_ms={} delay_ms={}",
+                                    confirmation_detail,
+                                    settings.slow_lane_min_source_hold.as_millis(),
+                                    observed_hold_ms,
+                                    remaining_hold.as_millis()
+                                )),
+                            )
+                            .await;
+                        tokio::spawn(async move {
+                            sleep(remaining_hold).await;
+                            let _ = delayed_sender.send(delayed_trade);
+                        });
                     } else {
                         let hot_task = HotPathTradeTask {
                             matched_trade: matched_trade.clone(),
@@ -6497,6 +6552,45 @@ fn can_execute_unvalidated_direct_buy(settings: &Settings, wallet: &str) -> bool
             .any(|target| !target.is_empty() && target == wallet)
 }
 
+fn is_fast_lane_direct_buy(settings: &Settings, matched_trade: &MatchedTrackedTrade) -> bool {
+    if !matched_trade.entry.side.eq_ignore_ascii_case("BUY") {
+        return true;
+    }
+    if can_execute_unvalidated_direct_buy(settings, &matched_trade.entry.proxy_wallet) {
+        return true;
+    }
+    matched_trade.tx_hash_matched
+        || matches!(
+            matched_trade.validation_match_window,
+            Some(MatchWindow::Primary)
+        )
+}
+
+fn observed_source_hold_elapsed(matched_trade: &MatchedTrackedTrade) -> Duration {
+    matched_trade
+        .validation_signal
+        .as_ref()
+        .map(|signal| signal.stage_timestamps.websocket_event_received_at.elapsed())
+        .unwrap_or_default()
+}
+
+fn slow_lane_source_hold_delay(
+    settings: &Settings,
+    matched_trade: &MatchedTrackedTrade,
+) -> Option<Duration> {
+    if settings.slow_lane_min_source_hold.is_zero()
+        || !matched_trade.entry.side.eq_ignore_ascii_case("BUY")
+        || is_fast_lane_direct_buy(settings, matched_trade)
+        || matched_trade.validation_signal.is_none()
+    {
+        return None;
+    }
+
+    let observed_hold = observed_source_hold_elapsed(matched_trade);
+    (observed_hold < settings.slow_lane_min_source_hold)
+        .then_some(settings.slow_lane_min_source_hold - observed_hold)
+}
+
 #[derive(Default)]
 struct ExecutionSignalDeduper {
     seen: HashSet<String>,
@@ -6542,6 +6636,10 @@ impl MatchedTradeDeduper {
             }
         }
         true
+    }
+
+    fn release(&mut self, matched_trade: &MatchedTrackedTrade) {
+        self.seen.remove(&matched_trade.entry.dedupe_key());
     }
 }
 
@@ -6741,6 +6839,55 @@ mod tests {
         }
     }
 
+    fn sample_matched_trade(
+        wallet: &str,
+        side: ExecutionSide,
+        validation_match_window: Option<MatchWindow>,
+        tx_hash_matched: bool,
+        observed_hold_ms: u64,
+    ) -> MatchedTrackedTrade {
+        let mut entry = sample_entry(signal_side_label(side), 0.5);
+        entry.proxy_wallet = wallet.to_owned();
+        let signal = sample_signal(side);
+        let validation_signal = validation_match_window.map(|_| {
+            let now = Utc::now();
+            let received_at = Instant::now() - Duration::from_millis(observed_hold_ms);
+            ConfirmedTradeSignal {
+                asset_id: signal.asset_id.clone(),
+                condition_id: signal.condition_id.clone(),
+                transaction_hash: signal.transaction_hash.clone(),
+                side,
+                price: signal.price,
+                estimated_size: signal.estimated_size,
+                stage_timestamps: models::TradeStageTimestamps {
+                    websocket_event_received_at: received_at,
+                    websocket_event_received_at_utc: now,
+                    parse_completed_at: received_at,
+                    parse_completed_at_utc: now,
+                    detection_triggered_at: received_at,
+                    detection_triggered_at_utc: now,
+                    attribution_completed_at: Some(received_at),
+                    attribution_completed_at_utc: Some(now),
+                    fast_risk_completed_at: Some(received_at),
+                    fast_risk_completed_at_utc: Some(now),
+                },
+                confirmed_at: now,
+                generation: signal.generation,
+            }
+        });
+
+        MatchedTrackedTrade {
+            entry,
+            signal,
+            source: "activity_ws",
+            validation_correlation_kind: validation_match_window
+                .map(|_| crate::wallet::wallet_matching::TradeCorrelationKind::Direct),
+            validation_match_window,
+            tx_hash_matched,
+            validation_signal,
+        }
+    }
+
     #[test]
     fn unvalidated_direct_buy_bypass_is_limited_to_configured_target_wallets() {
         let settings = sample_settings(std::env::temp_dir().join("direct-buy-wallet-gate-test"));
@@ -6749,6 +6896,43 @@ mod tests {
         assert!(can_execute_unvalidated_direct_buy(&settings, "0xSOURCE"));
         assert!(!can_execute_unvalidated_direct_buy(&settings, "0xother"));
         assert!(!can_execute_unvalidated_direct_buy(&settings, ""));
+    }
+
+    #[test]
+    fn fallback_validated_non_target_buy_waits_for_source_hold() {
+        let mut settings = sample_settings(std::env::temp_dir().join("slow-lane-hold-test"));
+        settings.slow_lane_min_source_hold = Duration::from_millis(1_500);
+        let matched_trade =
+            sample_matched_trade("0xscanner", ExecutionSide::Buy, Some(MatchWindow::Fallback), false, 250);
+
+        let delay =
+            slow_lane_source_hold_delay(&settings, &matched_trade).expect("slow-lane hold delay");
+
+        assert!(delay >= Duration::from_millis(1_000));
+        assert!(delay <= Duration::from_millis(1_300));
+    }
+
+    #[test]
+    fn primary_validated_buy_stays_on_fast_lane() {
+        let mut settings = sample_settings(std::env::temp_dir().join("fast-lane-primary-test"));
+        settings.slow_lane_min_source_hold = Duration::from_millis(1_500);
+        let matched_trade =
+            sample_matched_trade("0xscanner", ExecutionSide::Buy, Some(MatchWindow::Primary), false, 50);
+
+        assert!(is_fast_lane_direct_buy(&settings, &matched_trade));
+        assert_eq!(slow_lane_source_hold_delay(&settings, &matched_trade), None);
+    }
+
+    #[test]
+    fn configured_target_wallet_buy_bypasses_slow_lane_hold() {
+        let mut settings =
+            sample_settings(std::env::temp_dir().join("fast-lane-target-wallet-test"));
+        settings.slow_lane_min_source_hold = Duration::from_millis(1_500);
+        let matched_trade =
+            sample_matched_trade("0xsource", ExecutionSide::Buy, Some(MatchWindow::Fallback), false, 50);
+
+        assert!(is_fast_lane_direct_buy(&settings, &matched_trade));
+        assert_eq!(slow_lane_source_hold_delay(&settings, &matched_trade), None);
     }
 
     #[test]
@@ -7711,6 +7895,7 @@ mod tests {
         assert_eq!(wallet_a.losses, 0);
         assert_eq!(wallet_a.realized_win_rate, Decimal::ONE);
         assert_eq!(wallet_a.total_realized_pnl, dec!(2));
+        assert_eq!(wallet_a.copyability_class, WalletCopyabilityClass::Unproven);
 
         let wallet_b = report
             .entries
@@ -7724,6 +7909,7 @@ mod tests {
         assert_eq!(wallet_b.total_realized_pnl, dec!(-1.5));
         assert_eq!(wallet_b.time_exit_share, dec!(0.5));
         assert_eq!(wallet_b.stop_exit_share, dec!(0.5));
+        assert_eq!(wallet_b.copyability_class, WalletCopyabilityClass::Unproven);
         assert!(wallet_a.alpha_score > wallet_b.alpha_score);
     }
 

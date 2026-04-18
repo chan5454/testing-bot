@@ -9,6 +9,7 @@ use rust_decimal::Decimal;
 
 pub const MIN_PREDICTION_VALIDATION_TIMEOUT: Duration = Duration::from_millis(300);
 pub const MAX_PREDICTION_VALIDATION_TIMEOUT: Duration = Duration::from_millis(500);
+pub const DEFAULT_SLOW_VALIDATION_WINDOW: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum ExecutionMode {
@@ -172,6 +173,8 @@ pub struct Settings {
     pub max_wallet_trades_per_min: u32,
     pub max_active_wallets: u32,
     pub market_cooldown: Duration,
+    pub slow_validation_window: Duration,
+    pub slow_lane_min_source_hold: Duration,
     pub min_trade_quality_score: Decimal,
     pub min_wallet_alpha_score: Decimal,
     pub high_conviction_size_multiplier: Decimal,
@@ -345,6 +348,8 @@ impl Settings {
             max_wallet_trades_per_min: 6,
             max_active_wallets: 64,
             market_cooldown: Duration::from_secs(15),
+            slow_validation_window: DEFAULT_SLOW_VALIDATION_WINDOW,
+            slow_lane_min_source_hold: Duration::from_millis(1_500),
             min_trade_quality_score: Decimal::new(65, 2),
             min_wallet_alpha_score: Decimal::new(52, 2),
             high_conviction_size_multiplier: Decimal::new(12, 1),
@@ -646,6 +651,14 @@ impl Settings {
             market_cooldown: Duration::from_millis(parse_or_default(
                 "MARKET_COOLDOWN_MS",
                 15_000_u64,
+            )?),
+            slow_validation_window: Duration::from_millis(parse_or_default(
+                "SLOW_VALIDATION_WINDOW_MS",
+                DEFAULT_SLOW_VALIDATION_WINDOW.as_millis() as u64,
+            )?),
+            slow_lane_min_source_hold: Duration::from_millis(parse_or_default(
+                "SLOW_LANE_MIN_SOURCE_HOLD_MS",
+                1_500_u64,
             )?),
             min_trade_quality_score: parse_or_default_decimal(
                 "MIN_TRADE_QUALITY_SCORE",
